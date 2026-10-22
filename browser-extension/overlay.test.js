@@ -37,8 +37,17 @@ test('hidden audio, blob audio and tiny video previews do not get new bars',()=>
 });
 test('a reused player removes an old bar when its new source was already dismissed',()=>{
   const v=player(),h=harness([v]);h.refresh();const old=h.pills[0];
+  let menuRemoved=false;old.__dcFbPanel={remove(){menuRemoved=true;}};
   v.src='https://example.com/other.mp3';h.context.dismissedVideos.add(v.src);h.refresh();
   assert.equal(old.isConnected,false);assert.equal(v.__dcBtn,null);
+  assert.equal(menuRemoved,true);
+});
+
+test('changing a reused player source closes the old quality menu before creating the new bar',()=>{
+  const v=player(),h=harness([v]);h.refresh();const old=h.pills[0];
+  let removed=false;old.__dcFbPanel={remove(){removed=true;}};
+  v.src='https://example.com/new.mp3';h.refresh();
+  assert.equal(removed,true);assert.equal(old.isConnected,false);assert.equal(h.pills.length,2);
 });
 test('audio MP4 never borrows video duration or audio expectations from a different player',()=>{
   const result=R.playerEvidence([{src:'https://example.com/other.mp4',duration:800,mozHasAudio:true}],

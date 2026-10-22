@@ -1928,7 +1928,10 @@
     document.querySelectorAll("button[data-dc-dismiss]").forEach(el=>el.remove());
     document.querySelectorAll("[data-dc-pill]").forEach(host=>{
       const video=host.__dcVideo;
-      if (!video || !video.isConnected) { host.remove(); return; }
+      if (!video || !video.isConnected) {
+        if(host.__dcFbPanel)host.__dcFbPanel.remove();
+        host.remove();return;
+      }
       const fullscreen=document.fullscreenElement;
       const parent=fullscreen && fullscreen.contains(video) ? fullscreen : document.documentElement;
       if(host.parentNode!==parent)parent.appendChild(host);
@@ -2279,13 +2282,13 @@
         const audio = v.tagName === "AUDIO";
         const key = dismissalKey(v,null);
         if (dismissedVideos.has(key)) {
-          if(v.__dcBtn){v.__dcBtn.remove();v.__dcBtn=null;}
+          if(v.__dcBtn){if(v.__dcBtn.__dcFbPanel)v.__dcBtn.__dcFbPanel.remove();v.__dcBtn.remove();v.__dcBtn=null;}
           continue;
         }
         if (v.__dcBtn) {
           if (!v.__dcBtn.isConnected) v.__dcBtn = null;
           else if (v.__dcKey === key) continue;
-          else { if(v.__dcBtn.__dcClose)v.__dcBtn.__dcClose.remove(); v.__dcBtn.remove();v.__dcBtn=null; }
+          else { if(v.__dcBtn.__dcClose)v.__dcBtn.__dcClose.remove(); if(v.__dcBtn.__dcFbPanel)v.__dcBtn.__dcFbPanel.remove(); v.__dcBtn.remove();v.__dcBtn=null; }
         }
         // Skip anything inside YouTube's player (covered by its own button).
         try { if (v.closest && v.closest("#movie_player")) continue; } catch (e) {}
