@@ -692,10 +692,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       markSeen(msg.url, msg.filename);
       try {
         const pageUrl = msg.pageUrl || (sender && sender.tab && sender.tab.url) || null;
+        const fromPage = /^https?:\/\//i.test(sender && sender.url || "");
         const ok = await sendToHost(msg.url, msg.filename, {
-          _tabId:sender && sender.tab && sender.tab.id,
-          _frameId:sender && sender.frameId,
-          _documentId:sender && sender.documentId,
+          _tabId:fromPage ? sender && sender.tab && sender.tab.id : undefined,
+          _frameId:fromPage ? sender && sender.frameId : undefined,
+          _documentId:fromPage ? sender && sender.documentId : undefined,
           pageUrl,
           referer: msg.referer || pageUrl,
           mime: msg.mime || null,
@@ -737,7 +738,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     }
     if (msg.type === "getMedia") {      // Popup passes its tab; content scripts arrive with sender.tab.
-      const ownTab = sender && sender.tab && sender.tab.id;
+      // Extension pages can also have sender.tab/documentId. Their explicit
+      // selected-tab query is different from a website content-script query.
+      const ownTab = /^https?:\/\//i.test(sender && sender.url || "")
+        ? sender && sender.tab && sender.tab.id : undefined;
       const tabId = ownTab !== undefined ? ownTab : msg.tabId;
       const list = (tabId !== undefined && tabMedia.get(tabId)) || [];
       const page = ownTab !== undefined ? sender.url || msg.pageUrl : msg.pageUrl;
@@ -745,7 +749,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // player's streams onto a blob player, or revive a previous SPA page.
       const full = list.slice(-25).filter(m=>
         (ownTab===undefined || sender.frameId===undefined || m.frameId===sender.frameId)
-        && (!sender.documentId || !m.documentId || sender.documentId===m.documentId)
+        && (ownTab===undefined || !sender.documentId || !m.documentId || sender.documentId===m.documentId)
         && (!page || !m.pageUrl || m.pageUrl===page));
       // P4 cross-tab hint: how many tabs have seen the same file.
       const annotated = full.map((m) => {

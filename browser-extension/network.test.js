@@ -85,6 +85,7 @@ test('content queries are scoped to the actual sender tab/frame/document and nev
   assert.equal((await h.send({type:'getMedia'},{...sender,documentId:'doc-b'})).items.length,0);
   assert.equal((await h.send({type:'getMedia'},{...sender,url:'https://player.example.test/new'})).items.length,0);
   assert.equal((await h.send({type:'getMedia',tabId:7})).items.length,2);
+  assert.equal((await h.send({type:'getMedia',tabId:7},{tab:{id:99},frameId:0,documentId:'extension-doc',url:'chrome-extension://test/popup.html'})).items.length,2);
 });
 
 module.exports={harness,response};
