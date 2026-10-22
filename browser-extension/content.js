@@ -331,6 +331,7 @@
       || (v.audioTracks && v.audioTracks.length > 0)));
   }
 
+  const pendingDownloads = new Set();
   function sendDownload(url, filename, mime, size, pair, quality, dur) {
     // Use only the matching video or an unambiguous sole video. Subtitle,
     // audio-only and ordinary file links do not borrow video expectations.
@@ -372,8 +373,15 @@
       const ext = mimeExt(mime) || outExtFor(sendUrl);
       filename = base.toLowerCase().endsWith(ext.toLowerCase()) ? base : base + ext;
     }
+    const message = { type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null, quality: quality || null, dur: dur || null, audioExpected };
+    const key = JSON.stringify(message);
+    // Suppress double clicks only while this exact handoff is awaiting a
+    // response. A different quality/track and an explicit later retry work.
+    if (pendingDownloads.has(key)) return;
+    pendingDownloads.add(key);
     try {
-      chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null, quality: quality || null, dur: dur || null, audioExpected }, (res) => {
+      chrome.runtime.sendMessage(message, (res) => {
+      pendingDownloads.delete(key);
       if (chrome.runtime.lastError) {
         if (ctxInvalidated(chrome.runtime.lastError)) markDead();
         toast("Download Craft: " + chrome.runtime.lastError.message);
@@ -384,6 +392,7 @@
       }
       });
     } catch (e) {
+      pendingDownloads.delete(key);
       if (ctxInvalidated(e)) markDead();
       toast("Download Craft: " + (e && e.message ? e.message : e));
     }
@@ -2525,6 +2534,7 @@
   // bypass the browser downloader entirely. Preserve modified clicks and
   // fall back to the original link if the app declines capture.
   const bypassDownloadLinks = new WeakSet();
+  const pendingDownloadLinks = new Set();
   document.addEventListener("click", ev => {
     if (!alive() || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
     const a = ev.target && ev.target.closest && ev.target.closest("a[href]");
@@ -2532,13 +2542,17 @@
     if (bypassDownloadLinks.has(a)) { bypassDownloadLinks.delete(a); return; }
     if (!DCRank.directDownloadLink(a.href,a.hasAttribute("download"))) return;
     ev.preventDefault(); ev.stopImmediatePropagation();
+    const key = a.href;
+    if (pendingDownloadLinks.has(key)) return;
+    pendingDownloadLinks.add(key);
     const fallback = () => { bypassDownloadLinks.add(a); a.click(); };
     try {
       chrome.runtime.sendMessage({type:"captureLink",url:a.href,
         filename:a.getAttribute("download") || null,pageUrl:location.href}, res => {
+        pendingDownloadLinks.delete(key);
         if (chrome.runtime.lastError || !res || !res.ok) fallback();
       });
-    } catch (e) { fallback(); }
+    } catch (e) { pendingDownloadLinks.delete(key); fallback(); }
   },true);
 
   loadBarPosition();
