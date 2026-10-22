@@ -221,7 +221,14 @@ async function sendToHost(url, filename, extra) {
       dur: (extra && extra.dur) || null,
       audioExpected: !!(extra && extra.audioExpected),
     });
-    return !!res && (res.type === "ok" || res.type === "pong");
+    // A ping proves availability, not acceptance of this download. Never
+    // discard the browser's request on an unrelated or rejected response.
+    if (!res || res.type !== "ok" || res.queued === false) {
+      lastHostError = (res && res.error) || "native host did not accept the download";
+      return false;
+    }
+    lastHostError = "";
+    return true;
   } catch (e) {
     // Console-visible: this is the first thing to look at when clicks seem to
     // do nothing (browser console: "No such native application", etc.).
@@ -528,7 +535,14 @@ async function performBrowserCapture(item) {
     // re-sending would deliver a SECOND copy — leave the browser's file.
     return;
   }
-  const ok = await sendToHost(url, item.filename, {pageUrl:item.referrer || null,referer:item.referrer || null});
+  let ok = false;
+  try {
+    ok = await sendToHost(url, item.filename, {pageUrl:item.referrer || null,referer:item.referrer || null});
+  } catch (e) {
+    // Cancellation already succeeded: even an unexpected messaging failure
+    // must reach browser fallback rather than leaving a cancelled transfer.
+    lastHostError = (e && e.message) || "native host handoff failed";
+  }
   // Erase the browser entry only once the app confirmed receipt.
   if (ok) {
     try {
@@ -540,7 +554,7 @@ async function performBrowserCapture(item) {
   hostOk = ok;
   setBadge();
   if (!ok) {
-    await syncBrowserDownloadUI();
+    try { await syncBrowserDownloadUI(); } catch (e) { /* UI state cannot block recovery */ }
     // Native host missing: hand the file back to the browser so nothing is lost.
     markSeen(url, null);
     chrome.downloads.download({ url, saveAs: false }, () => {

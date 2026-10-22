@@ -38,6 +38,26 @@ test('missing host releases filename callback and returns transfer to browser',a
   assert.equal(released,1);assert.equal(h.calls.filter(x=>x[0]==='fallback').length,1);
   assert.equal(h.calls.filter(x=>x[0]==='erase').length,0);
 });
+
+test('unexpected host rejection still restores a cancelled browser transfer',async()=>{
+  const h=harness();
+  h.context.sendToHost=async()=>{throw Error('messaging unavailable');};
+  let released=0;
+  h.handlers.filename(item,()=>released++);
+  await vm.runInContext('captureBrowserDownload({id:5})',h.context);
+  assert.equal(released,1);
+  assert.equal(h.calls.filter(x=>x[0]==='cancel').length,1);
+  assert.equal(h.calls.filter(x=>x[0]==='fallback').length,1);
+  assert.equal(h.calls.filter(x=>x[0]==='erase').length,0);
+});
+
+test('download UI failure cannot prevent browser fallback after cancellation',async()=>{
+  const h=harness(false);
+  h.context.syncBrowserDownloadUI=async()=>{throw Error('storage unavailable');};
+  await vm.runInContext('captureBrowserDownload('+JSON.stringify(item)+')',h.context);
+  assert.equal(h.calls.filter(x=>x[0]==='fallback').length,1);
+  assert.equal(h.calls.filter(x=>x[0]==='erase').length,0);
+});
 test('completed browser download is not duplicated',async()=>{
   const h=harness(true,true);
   await vm.runInContext('captureBrowserDownload('+JSON.stringify(item)+')',h.context);

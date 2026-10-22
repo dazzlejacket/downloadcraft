@@ -8,14 +8,14 @@ const source = fs.readFileSync(path.join(__dirname, 'background.js'), 'utf8');
 const block = source.slice(source.indexOf('async function sendToHost('), source.indexOf('// ---- IDM-style network sniffer'));
 const fragment = 'https://vod.vimeocdn.com/v2/range/prot/token/video.mp4?range=3938712-4982381';
 const player = 'https://player.vimeo.com/video/123?h=unlisted';
-function harness(capture, framePage, capturedUrl = fragment) {
+function harness(capture, framePage, capturedUrl = fragment, reply = {type:'ok'}) {
   const calls = [], cookies = [];
   const api = {
     tabs: { sendMessage: async (tab, msg, opts) => {
       assert.equal(tab, 7); assert.equal(opts.frameId, 4);
       return { pageUrl: framePage };
     } },
-    runtime: { sendNativeMessage: async (host, msg) => { calls.push(msg); return {type:'ok'}; } },
+    runtime: { sendNativeMessage: async (host, msg) => { calls.push(msg); return reply; } },
   };
   const make = new Function('DCRank', 'tabMedia', 'api', 'cookiesFor', 'stripFbSlice', 'HOST', 'console',
     `let lastHostError=''; ${block}; return { sendToHost, error: () => lastHostError };`);
@@ -49,6 +49,15 @@ it('leaves ordinary full-file MP4 handoffs unchanged', async () => {
   assert.equal(await h.sendToHost(url, 'video.mp4', {size:12345}), true);
   assert.equal(h.calls[0].url, url);
   assert.equal(h.calls[0].size, 12345);
+});
+
+it('requires download acceptance rather than a ping or malformed response', async () => {
+  for (const reply of [null, {}, {type:'pong'}, {type:'error',error:'queue write failed'}, {type:'ok',queued:false}]) {
+    const h = harness(null, null, fragment, reply);
+    assert.equal(await h.sendToHost('https://example.com/file.mp4', 'file.mp4', {}), false);
+    assert.ok(h.error());
+    if (reply && reply.error) assert.equal(h.error(), reply.error);
+  }
 });
 
 it('routes captured Vimeo HLS manifests through the player, not video-only HLS assembly', async () => {
