@@ -100,9 +100,9 @@
 
 
   function playerEvidence(videos, url, mime, pageUrl, suppliedDuration) {
-    const isVideo = String(url) === String(pageUrl) || /^blob:/i.test(String(url))
+    const isVideo = !/^audio\//i.test(String(mime || "")) && (String(url) === String(pageUrl) || /^blob:/i.test(String(url))
       || /^video\//i.test(String(mime || "")) || isPlaylistUrl(url)
-      || /\.(?:mp4|webm|mkv|mov|m4v|avi|ts|m4s|cmfv)(?:[?#]|$)/i.test(String(url));
+      || /\.(?:mp4|webm|mkv|mov|m4v|avi|ts|m4s|cmfv)(?:[?#]|$)/i.test(String(url)));
     const list = isVideo ? [...(videos || [])] : [];
     const matches = list.filter(v => v.currentSrc === url || v.src === url);
     const player = matches.length === 1 ? matches[0] : list.length === 1 ? list[0] : null;

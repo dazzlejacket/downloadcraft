@@ -1387,7 +1387,7 @@
 
   // One isolated toolbar: the primary action and dismiss button never overlap.
   // Shadow DOM keeps player/site button and SVG rules out of these controls.
-  function videoDownloadBar(title) {
+  function videoDownloadBar(title, kind = "video") {
     const host = document.createElement("div");
     host.title = title;
     host.style.cssText = "all:initial;display:block;width:240px;height:28px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
@@ -1413,19 +1413,20 @@
     `;
     const bar = document.createElement("div");bar.className="bar";
     const main = document.createElement("button");main.type="button";main.className="download";
-    main.title=title;main.setAttribute("aria-label","Download this video");
+    const action = "Download this " + kind;
+    main.title=title;main.setAttribute("aria-label",action);
     const arrow=svgIcon(14,ICON_DOWN,2.5);arrow.style.color="#168047";
     main.appendChild(arrow);
-    const label=document.createElement("span");label.className="label";label.textContent="Download this video";
+    const label=document.createElement("span");label.className="label";label.textContent=action;
     main.appendChild(label);
     const close=document.createElement("button");close.type="button";close.className="close";close.hidden=true;
     close.setAttribute("data-dc-dismiss","1");
-    close.setAttribute("aria-label","Hide download bar for this video");
-    close.title="Hide for this video — restore from the extension toolbar";
+    close.setAttribute("aria-label","Hide download bar for this " + kind);
+    close.title="Hide for this " + kind + " — restore from the extension toolbar";
     close.appendChild(svgIcon(12,ICON_CLOSE,2));
     const grip=document.createElement("button");grip.type="button";grip.className="grip";
     grip.title="Drag to move · arrow keys move when focused";
-    grip.setAttribute("aria-label","Move video download bar");
+    grip.setAttribute("aria-label","Move " + kind + " download bar");
     grip.appendChild(svgIcon(12,"M8 5h.01M8 12h.01M8 19h.01M16 5h.01M16 12h.01M16 19h.01",3));
     bar.append(grip,main,close);root.append(style,bar);
     installBarDrag(host,main,grip);
@@ -1934,12 +1935,18 @@
       const r=video.getBoundingClientRect();
       const vw=window.innerWidth, vh=window.innerHeight;
       const width=Math.min(240,r.width-16,vw-16);
-      host.style.display=r.width>=120 && r.height>=70 && r.bottom>0 && r.top<vh && r.right>0 && r.left<vw ? "block" : "none";
+      const audio=video.tagName === "AUDIO";
+      if(audio && !video.controls){host.remove();return;}
+      const visible=(!window.getComputedStyle || !["hidden","collapse"].includes(window.getComputedStyle(video).visibility));
+      host.style.display=visible && r.width>=120 && r.height>=(audio?24:70) && r.bottom>0 && r.top<vh && r.right>0 && r.left<vw ? "block" : "none";
+      // An unrelated fullscreen element must not acquire this media's bar.
+      if(fullscreen && !fullscreen.contains(video)){host.style.display="none";return;}
       if(activeBarDrag===host || applySavedBarPosition(host))return;
       host.style.position="fixed";host.style.right="auto";host.style.bottom="auto";
       host.style.width=Math.max(0,width)+"px";
       host.style.left=Math.max(8,Math.min(vw-width-8,r.right-width-8))+"px";
-      host.style.top=Math.max(8,Math.min(vh-36,r.top+8))+"px";
+      const top=audio ? (r.top>=40?r.top-32:r.bottom+4) : r.top+8;
+      host.style.top=Math.max(8,Math.min(vh-36,top))+"px";
     });
     const yt=document.getElementById && document.getElementById("dc-yt-btn");
     if(yt)placeInPlayer(yt,document.getElementById("dc-yt-panel"));
@@ -2240,7 +2247,7 @@
     return true;
   }
 
-  // ---------- Universal video overlay (IDM-style) ----------
+  // ---------- Universal media overlay (IDM-style) ----------
   // Floating "Download this video" pill on EVERY playable <video>, not just
   // YouTube. Uses the element's currentSrc when it is http(s), otherwise
   // falls back to network-sniffed candidates from the background worker or
@@ -2267,10 +2274,14 @@
       document.querySelectorAll("[data-dc-pill]").forEach((el) => {
         if (el.dataset.gen !== String(GEN)) el.remove();
       });
-      const vids = [...document.querySelectorAll("video")].slice(0, 10);
+      const vids = [...document.querySelectorAll("video, audio[controls]")].slice(0, 10);
       for (const v of vids) {
+        const audio = v.tagName === "AUDIO";
         const key = dismissalKey(v,null);
-        if (dismissedVideos.has(key)) continue;
+        if (dismissedVideos.has(key)) {
+          if(v.__dcBtn){v.__dcBtn.remove();v.__dcBtn=null;}
+          continue;
+        }
         if (v.__dcBtn) {
           if (!v.__dcBtn.isConnected) v.__dcBtn = null;
           else if (v.__dcKey === key) continue;
@@ -2280,8 +2291,13 @@
         try { if (v.closest && v.closest("#movie_player")) continue; } catch (e) {}
         // Skip tiny preview thumbnails.
         const r = v.getBoundingClientRect ? v.getBoundingClientRect() : null;
-        if (r && (r.width < 120 || r.height < 70)) continue;
-        const pill = videoDownloadBar("Download this video with Download Craft");
+        if (r && (r.width < 120 || r.height < (audio?24:70))) continue;
+        if(window.getComputedStyle && ["hidden","collapse"].includes(window.getComputedStyle(v).visibility))continue;
+        // Hidden/background audio is deliberately excluded. Only a visible
+        // native audio player with a replayable file receives a control.
+        if(audio && (!mediaUrlOf(v) || /\.(m3u8|mpd)(?:[?#]|$)/i.test(mediaUrlOf(v))))continue;
+        const kind=audio?"audio":"video";
+        const pill = videoDownloadBar("Download this " + kind + " with Download Craft",kind);
         pill.setAttribute("data-dc-pill", "1");
         pill.dataset.gen = String(GEN);
         pill.style.position = "absolute";
@@ -2293,20 +2309,23 @@
           // Facebook reels: open the IDM-style quality menu (title + HD/SD
           // rows with sizes) instead of firing one mystery download — the
           // player only holds a blob: URL and every reel needs no reload.
-          if (isFacebookPage()) {
+          if (!audio && isFacebookPage()) {
             handleFbPill(pill);
             return;
           }
           const direct = mediaUrlOf(v);
           if (direct) {
             const base = mediaBase(direct);
-            const ext = /\.mp3|\.m4a|\.wav|\.ogg/i.test(direct) ? "" : ".mp4";
+            const source=audio && v.querySelectorAll && [...v.querySelectorAll("source[type]")].find(s=>s.src===direct);
+            const audioMimes={".mp3":"audio/mpeg",".m4a":"audio/mp4",".mp4":"audio/mp4",".aac":"audio/aac",".ogg":"audio/ogg",".opus":"audio/ogg",".wav":"audio/wav",".flac":"audio/flac",".webm":"audio/webm"};
+            const mime=(v.getAttribute && v.getAttribute("type")) || (source && source.getAttribute("type")) || (audio?audioMimes[outExtFor(direct)] || null:null);
+            const ext=audio ? (outExtFor(direct) || mimeExt(mime)) : (/\.mp3|\.m4a|\.wav|\.ogg/i.test(direct) ? "" : ".mp4");
             let vdur = null;
             try {
               const d = Math.round(v.duration);
               if (Number.isFinite(d) && d > 0 && d < 86400) vdur = d;
             } catch (e) { /* duration unknown */ }
-            sendDownload(direct, base + ext, v.getAttribute && v.getAttribute("type"), null, null, null, vdur);
+            sendDownload(direct, base + ext, mime, null, null, null, vdur);
           } else {
             // Ask background for sniffed media URLs for this tab first.
             // (Facebook reels render as blob: players — the real fbcdn/mp4

@@ -6,6 +6,10 @@ The last position is saved in local extension storage. It survives reloads, new 
 
 Restore a dismissed bar through the extension popup's Show video download buttons again command. Reload existing video tabs after updating the extension.
 
+Visible native audio players with an HTTP(S) file now get a **Download this audio** bar, placed above or below the native controls. Hidden/background audio and blob/adaptive audio do not receive a new bar. The same grip and close control work for audio. Bars hide when unrelated content enters fullscreen, and dismissed sources stay dismissed when a dynamic page reuses its player.
+
+Repeated identical link or media clicks are ignored while a handoff is awaiting its response. Different quality selections and later retries remain available. This guard prevents accidental concurrent prompts; it does not automatically approve downloading an existing file again.
+
 > Version 0.9.6.1: automatic takeover and the video-dismiss X are shared by
 > Chrome/Brave and Firefox on Windows, macOS and Linux. Portable packages now
 > include a ready-to-load `browser-extension-firefox` folder and Firefox XPI.
