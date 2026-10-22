@@ -642,14 +642,24 @@ try {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     if (!msg || typeof msg !== "object") return { ok: false };
+    const validPosition = p => p && Number.isFinite(p.x) && Number.isFinite(p.y)
+      && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
     if (msg.type === "getVideoBarPosition") {
-      const data=await api.storage.session.get("videoBarPosition");
-      return {ok:true,position:data.videoBarPosition || null};
+      const data=await api.storage.local.get("videoBarPosition");
+      if (validPosition(data.videoBarPosition)) return {ok:true,position:data.videoBarPosition};
+      // Adopt an existing session preference once; new saves survive a full
+      // browser restart, without website storage or cross-device syncing.
+      const legacy=api.storage.session ? await api.storage.session.get("videoBarPosition") : {};
+      if (validPosition(legacy.videoBarPosition)) {
+        await api.storage.local.set({videoBarPosition:legacy.videoBarPosition});
+        return {ok:true,position:legacy.videoBarPosition};
+      }
+      return {ok:true,position:null};
     }
     if (msg.type === "setVideoBarPosition") {
       const p=msg.position;
-      if(!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) || p.x<0 || p.x>1 || p.y<0 || p.y>1)return {ok:false};
-      await api.storage.session.set({videoBarPosition:{x:p.x,y:p.y}});
+      if(!validPosition(p))return {ok:false};
+      await api.storage.local.set({videoBarPosition:{x:p.x,y:p.y}});
       return {ok:true};
     }
     if (msg.type === "download" && msg.url) {

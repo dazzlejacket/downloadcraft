@@ -2,7 +2,7 @@
 
 Drag the grip at the left or drag the Download this video button to reposition it. A normal click still downloads or opens the quality menu; the small X dismisses the bar. Focus the grip and use arrow keys for keyboard movement (Shift moves farther).
 
-The last position is shared through browser-session extension storage. It survives reloads, new pages and background-worker restarts, and resets when the browser fully exits. Extension reload/disable/update also resets session storage. Nothing is stored in website storage or synced between devices. Positions stay within the viewport when resizing. In embedded players, movement is bounded by the frame.
+The last position is saved in local extension storage. It survives reloads, new pages, background-worker restarts and full browser restarts. An existing session position migrates automatically. Removing the extension or clearing its local storage resets the preference. Nothing is stored in website storage or synced between devices. Positions stay within the viewport when resizing. In embedded players, movement is bounded by the frame.
 
 Restore a dismissed bar through the extension popup's Show video download buttons again command. Reload existing video tabs after updating the extension.
 

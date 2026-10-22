@@ -1102,7 +1102,7 @@
     return base.endsWith(".mp4") ? base : base + ".mp4";
   }
 
-  // A browser-session preference, shared through the worker (not website storage).
+  // A browser-profile preference, shared through the worker (not website storage).
   let barPosition = null;
   let positionRevision = 0;
   let activeBarDrag = null;
