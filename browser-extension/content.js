@@ -2618,16 +2618,27 @@
     // instead of fighting the new one, and mutation storms (infinite
     // scroll) collapse into one pass per 400 ms.
     let moTimer = 0;
-    const mo = new MutationObserver(() => {
-      if (!alive()) { try { mo.disconnect(); } catch (e) {} return; }
+    const scheduleMediaRefresh = () => {
+      if (!alive()) return;
       clearTimeout(moTimer);
       moTimer = setTimeout(() => {
         if (!alive()) return;
         collectLinks();
         ensureUniversalButtons();
       }, 400);
+    };
+    const isMediaTarget = target => target && /^(VIDEO|AUDIO|SOURCE)$/.test(target.tagName);
+    const mo = new MutationObserver(records => {
+      if (!alive()) { try { mo.disconnect(); } catch (e) {} return; }
+      if(records.some(record=>record.type==="childList" || isMediaTarget(record.target)))scheduleMediaRefresh();
     });
-    mo.observe(document.documentElement, { childList: true, subtree: true });
+    mo.observe(document.documentElement, { childList:true, subtree:true, attributes:true,
+      attributeFilter:["src","poster","type","controls"] });
+    // Source-property updates and selected <source> changes need not insert
+    // a DOM node. Metadata events cover a newly selected currentSrc too.
+    document.addEventListener("loadedmetadata",event=>{
+      if(isMediaTarget(event.target))scheduleMediaRefresh();
+    },true);
     __dcObservers.push(mo);
   } catch (e) { /* observer optional */ }
   __dcTimers.push(setInterval(() => { if (__dcDead || !alive()) return; try { pullNetworkMedia(); } catch (x) { if (ctxInvalidated(x)) markDead(); } }, 8000));
