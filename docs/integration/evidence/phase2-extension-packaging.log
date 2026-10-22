@@ -1,0 +1,2 @@
+PASS: Chromium/Firefox manifests, exact source script bytes, XPI contents and test exclusion
+Firefox XPI SHA-256: 214eaea9ee08a1bb63dd4cff78a51947844160267a94f50298ffc1507983d581
