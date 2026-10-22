@@ -39,7 +39,7 @@ function harness(items,frame={pageUrl:context.pageUrl,videoCount:1,durationSecs:
  return {...make(R,new Map([[7,items]]),api,cookiesFor,u=>u,'test',{error(){}}),calls};
 }
 it('hands a generic fragment to its complete playlist, preserving player expectations',async()=>{
- const h=harness([{...context,url:fragment},{...context,url:root,master:true}]);
+ const h=harness([{...context,url:fragment},{...context,url:root,master:true,children:[fragment]}]);
  assert.equal(await h.sendToHost(fragment,'movie.mp4',{size:512}),true);
  assert.equal(h.calls[0].url,root);assert.equal(h.calls[0].size,null);
  assert.equal(h.calls[0].dur,2700);assert.equal(h.calls[0].audioExpected,true);

@@ -102,16 +102,19 @@
   }
 
   function playlistReferences(text, base) {
+    if (!/^\s*#EXTM3U(?:\s|$)/.test(String(text || ""))) return [];
     const refs = [];
     for (const line of String(text || "").split(/\r?\n/)) {
       const t = line.trim();
-      const raw = t && !t.startsWith("#") && !t.startsWith("<") ? [t]
-        : [...t.matchAll(/(?:^|[, :])URI="([^"]+)"/g)].map(m => m[1]);
+      const raw = t && !t.startsWith("#") ? [t]
+        : /^#EXT-X-(?:MEDIA|I-FRAME-STREAM-INF|MAP):/.test(t)
+          ? [...t.matchAll(/(?:^|[,:])URI="([^"]+)"/g)].map(m => m[1]) : [];
       for (const r of raw) {
-        try { const u = new URL(r, base); if (/^https?:$/.test(u.protocol)) refs.push(u.href); } catch (e) {}
+        try { const u = new URL(r, base); if (/^https?:$/.test(u.protocol) && !u.username && !u.password && !refs.includes(u.href)) refs.push(u.href); } catch (e) {}
+        if(refs.length>=512)return refs;
       }
     }
-    return [...new Set(refs)];
+    return refs;
   }
 
   function completePlaylist(entry, items) {
@@ -123,12 +126,12 @@
         || pool.some(child => child.url === u && reaches(child, target, seen)));
     };
     const linked = pool.filter(m => m.url !== entry.url && reaches(m, entry.url));
-    if (linked.length) return linked.sort((a,b) => Number(!!b.master)-Number(!!a.master))[0];
-    const masters = pool.filter(m => m.master);
-    // With ambiguous roots, retain a selected complete manifest, or let a
-    // fragment fall back to its exact single-player page. Never guess.
-    if (kindOf(entry) === "playlist") return entry;
-    return masters.length === 1 ? masters[0] : pool.length === 1 ? pool[0] : null;
+    // Only an explicit manifest-reference path proves this association.
+    // Prefer its unique outer root; two players may share a CDN directory
+    // or a segment URL, even in the same frame.
+    const roots=linked.filter(node=>!linked.some(parent=>parent!==node && reaches(parent,node.url)));
+    if(roots.length===1)return roots[0];
+    return kindOf(entry) === "playlist" ? entry : null;
   }
 
 
