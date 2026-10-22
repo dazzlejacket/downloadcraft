@@ -113,16 +113,25 @@ function stripFbSlice(url) {
 
 async function sendToHost(url, filename, extra) {
   try {
+    const capturesFor = target => {
+      const matches=[];
+      for(const [tabId,items] of tabMedia)for(const item of items){
+        if(item.url!==target)continue;
+        if(extra && extra._tabId!==undefined && tabId!==extra._tabId)continue;
+        if(extra && extra._frameId!==undefined && item.frameId!==extra._frameId)continue;
+        if(extra && extra._documentId && item.documentId && item.documentId!==extra._documentId)continue;
+        matches.push({item,items,tabId});
+      }
+      return matches;
+    };
     url = stripFbSlice(url);
     if (typeof DCRank !== "undefined" && DCRank.isVimeoAdaptive(url)) {
       // The captured document is the exact iframe which requested this
       // asset, unlike the popup's top-level page (possibly several videos).
       let capture = null;
       let captureTab = null;
-      for (const [tabId, items] of tabMedia) {
-        const hit = items.find((m) => m.url === url);
-        if (hit) { capture = hit; captureTab = tabId; break; }
-      }
+      const matches=capturesFor(url);
+      if(matches.length===1){capture=matches[0].item;captureTab=matches[0].tabId;}
       let framePage = capture && capture.pageUrl;
       // Chromium omits documentUrl on webRequest events. Ask the content
       // script in the requesting frame instead; do not guess from a feed.
@@ -144,13 +153,11 @@ async function sendToHost(url, filename, extra) {
       extra = { ...extra, size: null, pairUrl: null, pairMime: null,
         cookie: null, mime: null };
     }
-    const observedPart = [...tabMedia.values()].some(items => items.some(m => m.url === url && m.segment));
+    const observedPart = capturesFor(url).some(hit=>hit.item.segment);
     if (typeof DCRank !== "undefined" && (DCRank.isSegmentUrl(url) || observedPart) && !DCRank.isPlaylistUrl(url)) {
       let capture = null, items = [], tab = null;
-      for (const [tabId, list] of tabMedia) {
-        const hit = list.find(m => m.url === url);
-        if (hit) { capture = hit; items = list; tab = tabId; break; }
-      }
+      const matches=capturesFor(url);
+      if(matches.length===1){capture=matches[0].item;items=matches[0].items;tab=matches[0].tabId;}
       let frameInfo = null;
       if (capture && capture.frameId >= 0) {
         try { frameInfo = await api.tabs.sendMessage(tab,
@@ -171,15 +178,13 @@ async function sendToHost(url, filename, extra) {
         audioExpected:!!((frameInfo && frameInfo.audioExpected) || (extra && extra.audioExpected))};
     }
     if (typeof DCRank !== "undefined") {
-      for (const items of tabMedia.values()) {
-        const selected = items.find(m => m.url === url);
-        if (!selected || DCRank.kindOf(selected) !== "playlist") continue;
-        const root = DCRank.completePlaylist(selected, items);
+      const matches=capturesFor(url);
+      if(matches.length===1 && DCRank.kindOf(matches[0].item)==="playlist") {
+        const root = DCRank.completePlaylist(matches[0].item, matches[0].items);
         if (root && root.url !== url) {
           url = root.url;
           extra = {...extra, size:null, pairUrl:null, pairMime:null};
         }
-        break;
       }
     }
     let cookie = (extra && extra.cookie) || null;
@@ -688,6 +693,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const pageUrl = msg.pageUrl || (sender && sender.tab && sender.tab.url) || null;
         const ok = await sendToHost(msg.url, msg.filename, {
+          _tabId:sender && sender.tab && sender.tab.id,
+          _frameId:sender && sender.frameId,
+          _documentId:sender && sender.documentId,
           pageUrl,
           referer: msg.referer || pageUrl,
           mime: msg.mime || null,
@@ -729,17 +737,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     }
     if (msg.type === "getMedia") {      // Popup passes its tab; content scripts arrive with sender.tab.
-      const tabId = (msg.tabId !== undefined)
-        ? msg.tabId
-        : (sender && sender.tab && sender.tab.id);
+      const ownTab = sender && sender.tab && sender.tab.id;
+      const tabId = ownTab !== undefined ? ownTab : msg.tabId;
       const list = (tabId !== undefined && tabMedia.get(tabId)) || [];
-      const page = msg.pageUrl || null;
-      // SPA pages report a fresh pageUrl while the sniffer's documentUrl may
-      // lag one navigation behind — prefer exact matches but fall back to
-      // the tab's recent items instead of answering empty (empty = the pill
-      // silently sends the unresolvable page URL and the user must reload).
-      const items = list.slice(-25).filter((m) => !page || !m.pageUrl || m.pageUrl === page);
-      const full = items.length ? items : list.slice(-25);
+      const page = ownTab !== undefined ? sender.url || msg.pageUrl : msg.pageUrl;
+      // A content script may read its own frame only. Do not graft another
+      // player's streams onto a blob player, or revive a previous SPA page.
+      const full = list.slice(-25).filter(m=>
+        (ownTab===undefined || sender.frameId===undefined || m.frameId===sender.frameId)
+        && (!sender.documentId || !m.documentId || sender.documentId===m.documentId)
+        && (!page || !m.pageUrl || m.pageUrl===page));
       // P4 cross-tab hint: how many tabs have seen the same file.
       const annotated = full.map((m) => {
         let tabs = 1;

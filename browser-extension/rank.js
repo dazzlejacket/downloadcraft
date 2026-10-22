@@ -95,6 +95,7 @@
   function samePlayer(a, b) {
     if (a.tabId !== undefined && b.tabId !== undefined && a.tabId !== b.tabId) return false;
     if (a.frameId !== undefined && b.frameId !== undefined && a.frameId !== b.frameId) return false;
+    if (a.documentId && b.documentId && a.documentId !== b.documentId) return false;
     if (a.pageUrl && b.pageUrl && a.pageUrl !== b.pageUrl) return false;
     return (a.frameId !== undefined && b.frameId !== undefined)
       || !!(a.pageUrl && b.pageUrl && a.pageUrl === b.pageUrl);

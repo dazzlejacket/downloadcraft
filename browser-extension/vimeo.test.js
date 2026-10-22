@@ -79,3 +79,16 @@ it('rejects standalone adaptive MP4 legs without an exact player', async () => {
   assert.equal(await h.sendToHost('https://vod-adaptive-ak.vimeocdn.com/video.mp4', 'video.mp4', {}), false);
   assert.equal(h.calls.length, 0);
 });
+
+it('ambiguous shared fragment URLs do not borrow an arbitrary iframe player',async()=>{
+  const calls=[];
+  const make=new Function('DCRank','tabMedia','api','cookiesFor','stripFbSlice','HOST','console',
+    `let lastHostError=''; ${block}; return sendToHost;`);
+  const send=make(R,new Map([[7,[{url:fragment,frameId:1,pageUrl:'https://player.vimeo.com/video/111'},
+    {url:fragment,frameId:2,pageUrl:'https://player.vimeo.com/video/222'}]]]),
+    {runtime:{sendNativeMessage:async(h,m)=>{calls.push(m);return {type:'ok'};}}},async()=>null,u=>u,'test',{error(){}});
+  assert.equal(await send(fragment,'video.mp4',{}),false);assert.equal(calls.length,0);
+  assert.equal(await send(fragment,'video.mp4',{_tabId:7,_frameId:2}),true);
+  assert.equal(calls[0].url,'https://player.vimeo.com/video/222');
+  assert.equal(calls[0]._frameId,undefined);
+});

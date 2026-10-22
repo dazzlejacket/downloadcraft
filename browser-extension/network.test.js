@@ -8,12 +8,14 @@ function harness(options={}) {
   const context={Map,Set,URL,Date,Number,Promise,TextDecoder,AbortSignal,DCRank:R,
     stripFbSlice:u=>u,hostBlocked:()=>false,settings:options.settings || (async()=>({minSizeKB:0})),
     fetch:options.fetch || (async url=>{requests.push(url);return new Response('#EXTM3U\n');}),
-    chrome:{storage:{local:{set(){}}},webRequest:{onHeadersReceived:event('headers')},
+    chrome:{runtime:{onMessage:event('message')},storage:{local:{set(){}}},webRequest:{onHeadersReceived:event('headers')},
       tabs:{onUpdated:event('updated'),onRemoved:event('removed')}},
     api:{action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}}};
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('const tabSessions ='),source.indexOf('function setBadge()')),context);
+  vm.runInContext(source.slice(source.indexOf('// ---- popup / content-script messages ----')),context);
   return {context,listeners,requests,list:()=>vm.runInContext('tabMedia.get(7) || []',context),
+    send:(msg,sender={})=>new Promise(resolve=>listeners.message(msg,sender,resolve)),
     run:async details=>{listeners.headers(details);await new Promise(setImmediate);}};
 }
 function response(url='https://cdn.example.test/movie.mp4',changes={}) {
@@ -73,6 +75,16 @@ test('oversized and failed metadata probes retain the candidate and never invent
 test('identical resource URLs in separate frames retain separate provenance',async()=>{
   const h=harness();await h.run(response());await h.run(response(undefined,{frameId:3}));
   assert.equal(h.list().length,2);assert.notEqual(h.list()[0].frameId,h.list()[1].frameId);
+});
+
+test('content queries are scoped to the actual sender tab/frame/document and never fall back to a stale page',async()=>{
+  const h=harness();await h.run(response(undefined,{documentId:'doc-a'}));
+  await h.run(response('https://cdn.example.test/other.mp4',{frameId:3,documentUrl:'https://player.example.test/other'}));
+  const sender={tab:{id:7},frameId:2,documentId:'doc-a',url:'https://player.example.test/embed'};
+  assert.equal((await h.send({type:'getMedia',tabId:999},sender)).items.length,1);
+  assert.equal((await h.send({type:'getMedia'},{...sender,documentId:'doc-b'})).items.length,0);
+  assert.equal((await h.send({type:'getMedia'},{...sender,url:'https://player.example.test/new'})).items.length,0);
+  assert.equal((await h.send({type:'getMedia',tabId:7})).items.length,2);
 });
 
 module.exports={harness,response};
