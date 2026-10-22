@@ -24,6 +24,38 @@
     } catch (e) { return false; }
   }
 
+  // Response evidence, not a URL substring or an arbitrary binary payload.
+  // This observer never cancels requests; takeover has its own controller.
+  function mediaResponse(details, minSizeKB = 100) {
+    if (!details || !/^https?:\/\//i.test(details.url || "")
+        || !["media", "xmlhttprequest", "other", "main_frame", "sub_frame", "object"].includes(details.type)
+        || details.statusCode < 200 || details.statusCode >= 300
+        || !Number.isFinite(details.statusCode)
+        || (details.method && details.method !== "GET")) return null;
+    const headers = new Map((details.responseHeaders || []).map(h =>
+      [String(h.name || "").toLowerCase(), String(h.value || "")]));
+    const mime = (headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    const manifestMime = /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/(?:x-)?mpegurl)$/i.test(mime);
+    const playlist = isPlaylistUrl(details.url) || manifestMime;
+    let parsed;
+    try { parsed = new URL(details.url); } catch (e) { return null; }
+    if(parsed.username || parsed.password)return null;
+    const mediaPath = /\.(?:mp4|webm|mkv|mov|avi|m4v|mp3|m4a|aac|flac|ogg|opus|wav|m4s|ts|cmfv|cmfa)$/i.test(parsed.pathname);
+    const strongMime = /^(?:video|audio)\//i.test(mime) || mime === "application/mp4" || manifestMime;
+    const neutralMime = !mime || mime === "application/octet-stream" || (playlist && mime === "text/plain");
+    if (!strongMime && !(neutralMime && (playlist || mediaPath))) return null;
+    // Explicit HTML/JSON/image errors win over a misleading .mp4 filename.
+    const number = text => /^\d+$/.test(text || "") && Number.isSafeInteger(Number(text)) ? Number(text) : 0;
+    let size = number(headers.get("content-length"));
+    const range = /^bytes\s+\d+-\d+\/(\d+)$/i.exec((headers.get("content-range") || "").trim());
+    if (details.statusCode === 206 && range) size = number(range[1]);
+    const kind = playlist ? "playlist" : isSegmentUrl(details.url) ? "segment" : "file";
+    const threshold = Number(minSizeKB);
+    const minBytes = (Number.isFinite(threshold) && threshold >= 0 ? threshold : 100) * 1024;
+    if (kind === "file" && size > 0 && size < minBytes) return null;
+    return {url:details.url, mime, size, kind};
+  }
+
   // Manifests and adaptive MP4 legs must resolve together with audio.
   function isVimeoAdaptive(u) {
     try {
@@ -168,7 +200,7 @@
   // 'playlist' | 'segment' | 'file'
   function kindOf(entry) {
     const u = (entry && entry.url) || "";
-    if (isPlaylistUrl(u) || /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/mpegurl)(?:;|$)/i.test(String(entry && entry.mime || ""))) return "playlist";
+    if (isPlaylistUrl(u) || /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/(?:x-)?mpegurl)(?:;|$)/i.test(String(entry && entry.mime || ""))) return "playlist";
     if ((entry && entry.segment) || isSegmentUrl(u)) return "segment";
     return "file";
   }
@@ -336,7 +368,7 @@
     } catch (e) {}
   }
 
-  const DCRank = { attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  const DCRank = { mediaResponse, attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

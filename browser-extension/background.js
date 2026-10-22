@@ -247,8 +247,6 @@ const tabMedia = new Map(); // tabId -> [{url, mime, size, pageUrl, seenAt}]
 const tabPlaylist = new Map(); // tabId -> playlist url (P4: demotes loose segments)
 const seenTabs = new Map(); // canonical url -> Set(tabId), for the "×N tabs" hint
 const sizeCache = new Map(); // url -> bytes (quality-menu sizes)
-const MEDIA_MIME = /^(video\/|audio\/|application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml|mp4|octet-stream))/i;
-const MEDIA_URL = /\.(mp4|webm|mkv|mov|avi|m4v|mp3|m4a|aac|flac|ogg|wav|m3u8|mpd|m4s|ts|cmfv|cmfa)(\?|#|$)/i;
 
 function rankKind(url, mime) {
   if (typeof DCRank !== "undefined") return DCRank.kindOf({url, mime});
@@ -347,34 +345,12 @@ try {
         (async () => {
         try {
           if (details.tabId === undefined || details.tabId < 0) return;
-          if (details.type !== "media" && details.type !== "xmlhttprequest" && details.type !== "other") return;
           const cfg = await settings().catch(() => ({ blockHosts: "", minSizeKB: 100 }));
           if (hostBlocked(details.url, cfg.blockHosts)) return;
-          const headers = details.responseHeaders || [];
-          let ctype = "";
-          let clen = 0;
-          let crange = "";
-          for (const h of headers) {
-            const n = String(h.name || "").toLowerCase();
-            if (n === "content-type") ctype = String(h.value || "");
-            if (n === "content-length") clen = parseInt(h.value || "0", 10) || 0;
-            if (n === "content-range") crange = String(h.value || "");
-          }
-          // Range chunks (206) report the CHUNK size in content-length, not
-          // the file size — judge the size filter by the Content-Range total
-          // (`bytes 0-0/12345`), or a throttled CDN's drips get skipped and
-          // Facebook reels never produce a pill without a reload.
-          let totalForFilter = clen;
-          const crm = crange.match(/\/(\d+)\s*$/);
-          if (crm) totalForFilter = parseInt(crm[1], 10) || clen;
-          const mime = ctype.split(";")[0].trim();
-          const looksMedia = MEDIA_MIME.test(ctype) || MEDIA_URL.test(details.url.split("?")[0]);
-          if (!looksMedia) return;
-          // Skip tiny chunks unless HLS/DASH playlist (threshold configurable).
-          const minB = Math.max(0, (parseInt(cfg.minSizeKB, 10) || 100)) * 1024;
-          const isPlaylist = /m3u8|mpd|mpegurl|dash/i.test(details.url) || /m3u8|mpd|mpegurl|dash/i.test(ctype);
-          const fragment = typeof DCRank !== "undefined" && DCRank.isSegmentUrl(details.url);
-          if (!isPlaylist && !fragment && totalForFilter > 0 && totalForFilter < minB) return;
+          const candidate = typeof DCRank !== "undefined" && DCRank.mediaResponse(details, cfg.minSizeKB);
+          if (!candidate) return;
+          const {mime, size:totalForFilter} = candidate;
+          const isPlaylist = candidate.kind === "playlist";
           let master = false, children = [];
           if (isPlaylist) {
             try {
