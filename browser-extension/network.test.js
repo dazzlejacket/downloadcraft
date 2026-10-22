@@ -12,7 +12,7 @@ function harness(options={}) {
       tabs:{onUpdated:event('updated'),onRemoved:event('removed')}},
     api:{action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}}};
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('const tabMedia ='),source.indexOf('function setBadge()')),context);
+  vm.runInContext(source.slice(source.indexOf('const tabSessions ='),source.indexOf('function setBadge()')),context);
   return {context,listeners,requests,list:()=>vm.runInContext('tabMedia.get(7) || []',context),
     run:async details=>{listeners.headers(details);await new Promise(setImmediate);}};
 }
@@ -32,6 +32,47 @@ test('opaque HLS MIME reaches optional manifest enrichment and retains the exact
   const h=harness(),url='https://cdn.example.test/stream?token=exact';
   await h.run(response(url,{responseHeaders:[{name:'content-type',value:'audio/x-mpegurl'}]}));
   assert.deepEqual(h.requests,[url]);assert.equal(h.list()[0].url,url);assert.equal(h.list()[0].kind,'playlist');
+});
+
+test('navigation during settings or manifest reads cannot restore old media',async()=>{
+  let releaseSettings;const h=harness({settings:()=>new Promise(resolve=>{releaseSettings=resolve;})});
+  const pending=h.context.observeMediaResponse(response());
+  h.listeners.updated(7,{status:'loading'});releaseSettings({minSizeKB:0});await pending;
+  assert.equal(h.list().length,0);
+  let releaseFetch;const next=harness({fetch:()=>new Promise(resolve=>{releaseFetch=resolve;})});
+  const task=next.context.observeMediaResponse(response('https://cdn.example.test/master.m3u8'));
+  await new Promise(setImmediate);assert.equal(next.list().length,1);
+  next.listeners.removed(7);releaseFetch(new Response('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n'));
+  await task;assert.equal(next.list().length,0);
+});
+
+test('repeated responses share one probe and refresh enriched metadata without duplicate rows',async()=>{
+  const h=harness();const item=response('https://cdn.example.test/master.m3u8');
+  await Promise.all([h.context.observeMediaResponse(item),h.context.observeMediaResponse(item)]);
+  assert.equal(h.requests.length,1);assert.equal(h.list().length,1);
+  await h.context.observeMediaResponse({...item,responseHeaders:[{name:'content-type',value:'application/vnd.apple.mpegurl'},{name:'content-length',value:'999'}]});
+  assert.equal(h.requests.length,1);assert.equal(h.list()[0].size,999);assert.equal(h.list()[0].kind,'playlist');
+});
+
+test('manifest probes are limited while all original candidates remain visible',async()=>{
+  const requests=[],release=[];
+  const h=harness({fetch:url=>{requests.push(url);return new Promise(resolve=>release.push(resolve));}});
+  const tasks=[1,2,3].map(n=>h.context.observeMediaResponse(response(`https://cdn.example.test/${n}.m3u8`)));
+  await new Promise(setImmediate);assert.equal(requests.length,2);assert.equal(h.list().length,3);
+  for(const resolve of release)resolve(new Response('#EXTM3U\n'));
+  await Promise.all(tasks);
+});
+
+test('oversized and failed metadata probes retain the candidate and never invent children',async()=>{
+  for(const make of [()=>new Response('x'.repeat(1024*1024+1)),()=>new Response('#EXTM3U',{status:403}),()=>Promise.reject(Error('expired'))]){
+    const h=harness({fetch:make});await h.context.observeMediaResponse(response('https://cdn.example.test/master.m3u8?token=exact'));
+    assert.equal(h.list().length,1);assert.equal(h.list()[0].children,undefined);
+  }
+});
+
+test('identical resource URLs in separate frames retain separate provenance',async()=>{
+  const h=harness();await h.run(response());await h.run(response(undefined,{frameId:3}));
+  assert.equal(h.list().length,2);assert.notEqual(h.list()[0].frameId,h.list()[1].frameId);
 });
 
 module.exports={harness,response};

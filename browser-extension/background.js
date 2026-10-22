@@ -243,6 +243,8 @@ async function sendToHost(url, filename, extra) {
 // HLS playlists, DASH manifests). Candidates are stored per-tab so the
 // popup + content overlay can offer them even when the DOM only holds a
 // blob: URL (un-downloadable directly). Clean-room behavior, no IDM code.
+const tabSessions = new Map(); // object identity rejects async work from an old navigation
+let activePlaylistProbes = 0;
 const tabMedia = new Map(); // tabId -> [{url, mime, size, pageUrl, seenAt}]
 const tabPlaylist = new Map(); // tabId -> playlist url (P4: demotes loose segments)
 const seenTabs = new Map(); // canonical url -> Set(tabId), for the "×N tabs" hint
@@ -273,11 +275,17 @@ function noteMedia(tabId, entry) {
   // the engine fetches itself (ad slivers hide among them), so menus must
   // offer the whole, and the badge must not count parts as downloads.
   if (kind === "playlist") tabPlaylist.set(tabId, entry.url);
-  if (kind === "segment" && tabPlaylist.get(tabId)) entry.child = true;
   let list = tabMedia.get(tabId);
   if (!list) { list = []; tabMedia.set(tabId, list); }
-  if (list.some((e) => e.url === entry.url)) return;
-  list.push({ ...entry, kind, seenAt: Date.now() });
+  if (kind === "segment" && list.some(m=>rankKind(m.url,m.mime)==="playlist" && DCRank.samePlayer(m,entry))) entry.child = true;
+  const existing=list.find(e=>e.url===entry.url && e.frameId===entry.frameId
+    && (!e.pageUrl || !entry.pageUrl || e.pageUrl===entry.pageUrl)
+    && (!e.documentId || !entry.documentId || e.documentId===entry.documentId));
+  if (existing) {
+    Object.assign(existing,entry,{kind,seenAt:Date.now(),mime:entry.mime || existing.mime,
+      size:entry.size || existing.size || 0, pageUrl:entry.pageUrl || existing.pageUrl,
+      master:!!(entry.master || existing.master), children:entry.children || existing.children});
+  } else list.push({ ...entry, kind, seenAt: Date.now() });
   // An observed playlist reference is stronger evidence than a filename:
   // some sites name every individual segment .mp4.
   if (typeof DCRank !== "undefined") {
@@ -327,6 +335,7 @@ function pruneSeen(url, tabId) {
 }
 
 function forgetTab(tabId) {
+  tabSessions.delete(tabId);
   tabMedia.delete(tabId);
   tabPlaylist.delete(tabId);
   try {
@@ -338,55 +347,65 @@ function forgetTab(tabId) {
   try { api.action.setBadgeText({ text: "", tabId }).catch(() => {}); } catch (e) {}
 }
 
+// Optional playlist metadata has a small per-tab budget. The candidate is
+// available immediately even when a signed URL cannot be fetched again.
+async function readPlaylistMetadata(url) {
+  const res = await fetch(url, {credentials:"include", redirect:"error", signal:AbortSignal.timeout(8000)});
+  if (!res.ok || !res.body) return null;
+  const reader = res.body.getReader();
+  try {
+    if (Number(res.headers.get("content-length")) > 1024 * 1024) return null;
+    let body = "", size = 0;
+    const decoder = new TextDecoder();
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 1024 * 1024) return null;
+      body += decoder.decode(value, {stream:true});
+    }
+    body += decoder.decode();
+    if (!/^\s*#EXTM3U(?:\s|$)/.test(body) && !/<(?:\w+:)?MPD[\s>]/.test(body)) return null;
+    return {master:/#EXT-X-STREAM-INF:|<(?:\w+:)?MPD[\s>]/.test(body),
+      children:DCRank.playlistReferences(body, url)};
+  } finally { await reader.cancel(); }
+}
+function playlistMetadata(session, details) {
+  const now = Date.now(), key = JSON.stringify([details.frameId, details.url]);
+  for (const [k, value] of session.probes) if (now-value.at >= 15000) session.probes.delete(k);
+  if (session.probes.has(key)) return session.probes.get(key).promise;
+  if (session.active >= 2 || activePlaylistProbes >= 4 || session.probes.size >= 32) return Promise.resolve(null);
+  session.active++;
+  activePlaylistProbes++;
+  const promise = readPlaylistMetadata(details.url).catch(()=>null).finally(()=>{session.active--;activePlaylistProbes--;});
+  session.probes.set(key, {at:now,promise});
+  return promise;
+}
+async function observeMediaResponse(details) {
+  try {
+    if (details.tabId === undefined || details.tabId < 0 || typeof DCRank === "undefined"
+        || !DCRank.mediaResponse(details, 0)) return;
+    let session = tabSessions.get(details.tabId);
+    if (!session) { session = {probes:new Map(),active:0}; tabSessions.set(details.tabId,session); }
+    const cfg = await settings().catch(() => ({ blockHosts:"", minSizeKB:100 }));
+    if (tabSessions.get(details.tabId) !== session || hostBlocked(details.url,cfg.blockHosts)) return;
+    const candidate = DCRank.mediaResponse(details,cfg.minSizeKB);
+    if (!candidate) return;
+    const entry = {...candidate, pageUrl:details.documentUrl || null, frameId:details.frameId,
+      documentId:details.documentId || null};
+    noteMedia(details.tabId,entry);
+    if (candidate.kind === "playlist") {
+      const metadata = await playlistMetadata(session,details);
+      if (metadata && tabSessions.get(details.tabId) === session) noteMedia(details.tabId,{...entry,...metadata});
+    }
+  } catch (e) { /* observation must never break navigation or takeover */ }
+}
 try {
   if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
-    chrome.webRequest.onHeadersReceived.addListener(
-      (details) => {
-        (async () => {
-        try {
-          if (details.tabId === undefined || details.tabId < 0) return;
-          const cfg = await settings().catch(() => ({ blockHosts: "", minSizeKB: 100 }));
-          if (hostBlocked(details.url, cfg.blockHosts)) return;
-          const candidate = typeof DCRank !== "undefined" && DCRank.mediaResponse(details, cfg.minSizeKB);
-          if (!candidate) return;
-          const {mime, size:totalForFilter} = candidate;
-          const isPlaylist = candidate.kind === "playlist";
-          let master = false, children = [];
-          if (isPlaylist) {
-            try {
-              const res = await fetch(details.url, {credentials:"include", signal:AbortSignal.timeout(8000)});
-              if (res.ok && (!res.headers.get("content-length") || Number(res.headers.get("content-length")) <= 1024 * 1024)) {
-                const reader = res.body.getReader();
-                let body = "", size = 0;
-                const decoder = new TextDecoder();
-                try {
-                  while (size <= 1024 * 1024) {
-                    const {value, done} = await reader.read();
-                    if (done) break;
-                    size += value.length; body += decoder.decode(value, {stream:true});
-                    if (/#EXT-X-STREAM-INF|<MPD[\s>]/i.test(body)) master = true;
-                  }
-                  if (typeof DCRank !== "undefined") children = DCRank.playlistReferences(body, details.url);
-                } finally { await reader.cancel(); }
-              }
-            } catch (e) { /* metadata optional; keep the original signed URL */ }
-          }
-          noteMedia(details.tabId, {
-            master, children,
-            url: details.url,
-            mime,
-            size: totalForFilter || 0,
-            pageUrl: details.documentUrl || null,
-            frameId: details.frameId,
-          });
-        } catch (e) { /* never break navigation */ }
-        })();
-      },
-      { urls: ["http://*/*", "https://*/*"] },
-      ["responseHeaders"]
-    );
+    chrome.webRequest.onHeadersReceived.addListener(details=>{void observeMediaResponse(details);},
+      {urls:["http://*/*", "https://*/*"]}, ["responseHeaders"]);
   }
-} catch (e) { /* webRequest unavailable (Firefox MV3 w/o permission) */ }
+} catch (e) { /* observation unavailable; ordinary download takeover remains */ }
 
 try {
   if (chrome.tabs && chrome.tabs.onRemoved) {
@@ -401,7 +420,7 @@ try {
   // offer the previous reel's fbcdn link.
   if (chrome.tabs && chrome.tabs.onUpdated) {
     chrome.tabs.onUpdated.addListener((tabId, info) => {
-      if ((info.status === "loading" && info.url !== undefined) || info.url !== undefined) {
+      if (info.status === "loading" || info.url !== undefined) {
         forgetTab(tabId);
       }
     });
