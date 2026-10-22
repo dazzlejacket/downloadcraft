@@ -32,10 +32,10 @@ test('corrupt stored positions are ignored and older browsers may omit session s
  assert.equal((await worker(local,{videoBarPosition:{x:'bad',y:0}})({type:'getVideoBarPosition'})).position,null);
  assert.equal((await worker({},null)({type:'getVideoBarPosition'})).position,null);
 });
-test('invalid video-bar coordinates never overwrite session position',async()=>{
- const session={videoBarPosition:{x:.5,y:.5}},send=worker(session);
+test('invalid video-bar coordinates never overwrite the saved profile position',async()=>{
+ const local={videoBarPosition:{x:.5,y:.5}},send=worker(local);
  for(const p of [null,{}, {x:-1,y:0}, {x:1,y:Infinity},{x:NaN,y:0},{x:2,y:.2},{x:'0',y:.2}]){
   assert.equal((await send({type:'setVideoBarPosition',position:p})).ok,false);
  }
- assert.deepEqual(session.videoBarPosition,{x:.5,y:.5});
+ assert.deepEqual(local.videoBarPosition,{x:.5,y:.5});
 });

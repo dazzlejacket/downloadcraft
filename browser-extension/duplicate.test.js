@@ -5,7 +5,7 @@ const content=fs.readFileSync(__dirname+'/content.js','utf8');
 function mediaHarness() {
   const calls=[], replies=[];
   const context={Set,JSON,Number,location:{href:'https://example.com/watch'},
-    document:{querySelectorAll:()=>[]},EXT_VER:'0.9.7.1',
+    document:{querySelectorAll:()=>[]},EXT_VER:JSON.parse(fs.readFileSync(__dirname+'/manifest.json')).version,
     stripFbSlice:u=>u,unwrapMediaUrl:()=>null,ctxInvalidated:()=>false,toast(){},
     chrome:{runtime:{id:'test',sendMessage:(m,cb)=>{calls.push(m);replies.push(cb);}}}};
   vm.createContext(context);

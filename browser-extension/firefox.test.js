@@ -4,6 +4,14 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const R=require('./rank.js');
 const source=fs.readFileSync(__dirname+'/background.js','utf8');
+test('both manifests and communicating scripts use one extension version',()=>{
+ const version=JSON.parse(fs.readFileSync(__dirname+'/manifest.json')).version;
+ assert.equal(JSON.parse(fs.readFileSync(__dirname+'/manifest-firefox.json')).version,version);
+ for(const file of ['background.js','content.js']){
+  const script=fs.readFileSync(__dirname+'/'+file,'utf8');
+  assert.equal(/const EXT_VER = "([^"]+)"/.exec(script)[1],version);
+ }
+});
 const response={url:'https://h/export?id=1',method:'GET',type:'main_frame',statusCode:200,originUrl:'https://h/page',responseHeaders:[
  {name:'Content-Disposition',value:"attachment; filename=report.zip; filename*=UTF-8''report%20full.zip"},
  {name:'Content-Length',value:'2097152'},{name:'Content-Type',value:'application/zip'}]};
