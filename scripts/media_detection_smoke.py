@@ -1,8 +1,8 @@
-"""Generate original test media and probe an isolated Edge extension profile.
+"""Generate original test media and probe an isolated Chromium extension profile.
 
 No reference archive code is loaded. All network resources are loopback.
 The test-only manifest omits nativeMessaging, so the desktop is not invoked.
-Run: python scripts/media_detection_smoke.py --edge <path-to-msedge.exe>
+Run: python scripts/media_detection_smoke.py --browser <path-to-browser.exe>
 """
 import argparse
 import functools
@@ -19,7 +19,7 @@ from package_extensions import stage_extensions
 
 def run():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--edge", type=pathlib.Path, required=True)
+    parser.add_argument("--browser", "--edge", dest="browser", type=pathlib.Path, required=True)
     args = parser.parse_args()
     repo = pathlib.Path(__file__).resolve().parents[1]
     output = repo / "dist" / ("phase3-edge-smoke-" + str(time.time_ns()))
@@ -105,12 +105,12 @@ document.body.dataset.step="complete";
     extension_id = "".join(chr(ord("a") + int(c, 16)) for c in digest)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    result = {"browser":str(args.edge), "output":str(output), "sampleProbe":probe,
+    result = {"browser":str(args.browser), "output":str(output), "sampleProbe":probe,
               "scope":"isolated native extension detection; native messaging disabled"}
     try:
         stderr_path = output / "browser-stderr.log"
         with stderr_path.open("w", encoding="utf-8") as stderr:
-            proc = subprocess.Popen([str(args.edge), "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+            proc = subprocess.Popen([str(args.browser), "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
             "--disable-background-networking", "--disable-component-update", "--disable-sync", "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding", f"--user-data-dir={output / 'profile'}", f"--disable-extensions-except={chrome}",
             f"--load-extension={chrome}", "--remote-debugging-port=0", f"chrome-extension://{extension_id}/smoke.html"],
