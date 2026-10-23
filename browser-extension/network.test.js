@@ -65,6 +65,28 @@ test('manifest probes are limited while all original candidates remain visible',
   await Promise.all(tasks);
 });
 
+test('metadata concurrency is bounded across tabs and navigation sessions',async()=>{
+  const requests=[],release=[];
+  const h=harness({fetch:url=>{requests.push(url);return new Promise(resolve=>release.push(resolve));}});
+  const tasks=Array.from({length:6},(_,n)=>h.context.observeMediaResponse(response(`https://cdn.example.test/${n}.m3u8`,{tabId:n+1})));
+  await new Promise(setImmediate);assert.equal(requests.length,4);
+  assert.equal(vm.runInContext('[...tabMedia.values()].flat().length',h.context),6);
+  for(const resolve of release)resolve(new Response('#EXTM3U\n'));
+  await Promise.all(tasks);
+});
+
+test('re-observation preserves learned master/audio references and reuses the probe cache',async()=>{
+  let calls=0;
+  const text=fs.readFileSync(__dirname+'/fixtures/multitrack-master.m3u8','utf8');
+  const h=harness({fetch:async()=>{calls++;return new Response(text);}});
+  const item=response('https://cdn.example.test/master.m3u8?token=exact');
+  await h.context.observeMediaResponse(item);
+  const first=h.list()[0];assert.equal(first.master,true);assert.equal(first.children.length,4);
+  await h.context.observeMediaResponse({...item,responseHeaders:[{name:'content-type',value:'application/vnd.apple.mpegurl'}]});
+  assert.equal(calls,1);assert.equal(h.list().length,1);assert.equal(h.list()[0].master,true);
+  assert.equal(h.list()[0].children.length,4);assert.ok(h.list()[0].children[0].includes('token=a%2Fb,c'));
+});
+
 test('oversized and failed metadata probes retain the candidate and never invent children',async()=>{
   for(const make of [()=>new Response('x'.repeat(1024*1024+1)),()=>new Response('#EXTM3U',{status:403}),()=>Promise.reject(Error('expired'))]){
     const h=harness({fetch:make});await h.context.observeMediaResponse(response('https://cdn.example.test/master.m3u8?token=exact'));
