@@ -18,6 +18,8 @@ Repeated identical link or media clicks are ignored while a handoff is awaiting 
 
 # Browser extension — "Send to Download Craft" (zero-config)
 
+Local development extension 0.9.7.3 adds conservative response detection in permitted media documents/frames, refreshed per-frame metadata, bounded optional manifest inspection, and source-attribute/metadata event refreshes. Binary installers, HTML errors and failed responses are not media candidates. Explicit HLS references connect quality/audio playlists to a complete master; unrelated streams are not paired just because they share a frame. Browser/desktop takeover and its failure replay are unchanged. Detection indicates a candidate, not a verified complete download. See `docs/research/` in the source repository for the evidence and remaining limitations.
+
 Every download is captured automatically — no pasting IDs,
 no per-file clicks.
 

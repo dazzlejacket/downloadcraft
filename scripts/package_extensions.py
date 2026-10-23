@@ -8,7 +8,7 @@ import zipfile
 
 def stage_extensions(repo, destination):
     source=repo/'browser-extension'
-    ignore=shutil.ignore_patterns('*.test.js','*.md')
+    ignore=shutil.ignore_patterns('*.test.js','*.md','fixtures')
     chrome=destination/'browser-extension'
     firefox=destination/'browser-extension-firefox'
     for folder in [chrome,firefox]:
