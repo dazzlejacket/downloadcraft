@@ -3,18 +3,18 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('nod
 const R=require('./rank.js');
 const source=fs.readFileSync(__dirname+'/background.js','utf8');
 function harness(options={}) {
-  const listeners={},requests=[];
+  const listeners={},requests=[],snapshots=[];
   const event=name=>({addListener:f=>{listeners[name]=f;}});
   const context={Map,Set,URL,Date,Number,Promise,TextDecoder,AbortSignal,DCRank:R,
     stripFbSlice:u=>u,hostBlocked:()=>false,settings:options.settings || (async()=>({minSizeKB:0})),
     fetch:options.fetch || (async url=>{requests.push(url);return new Response('#EXTM3U\n');}),
-    chrome:{runtime:{onMessage:event('message')},storage:{local:{set(){}}},webRequest:{onHeadersReceived:event('headers')},
+    chrome:{runtime:{onMessage:event('message')},storage:{local:{set:value=>snapshots.push(value)}},webRequest:{onHeadersReceived:event('headers')},
       tabs:{onUpdated:event('updated'),onRemoved:event('removed')}},
     api:{action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}}};
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('const tabSessions ='),source.indexOf('function setBadge()')),context);
   vm.runInContext(source.slice(source.indexOf('// ---- popup / content-script messages ----')),context);
-  return {context,listeners,requests,list:()=>vm.runInContext('tabMedia.get(7) || []',context),
+  return {context,listeners,requests,snapshots,list:()=>vm.runInContext('tabMedia.get(7) || []',context),
     send:(msg,sender={})=>new Promise(resolve=>listeners.message(msg,sender,resolve)),
     run:async details=>{listeners.headers(details);await new Promise(setImmediate);}};
 }
@@ -79,12 +79,23 @@ test('re-observation preserves learned master/audio references and reuses the pr
   let calls=0;
   const text=fs.readFileSync(__dirname+'/fixtures/multitrack-master.m3u8','utf8');
   const h=harness({fetch:async()=>{calls++;return new Response(text);}});
-  const item=response('https://cdn.example.test/master.m3u8?token=exact');
+  const item=response('https://cdn.example.test/master.m3u8?token=exact',{
+    responseHeaders:[{name:'Content-Type',value:'application/vnd.apple.mpegurl'},{name:'Content-Length',value:'2097152'}]});
   await h.context.observeMediaResponse(item);
   const first=h.list()[0];assert.equal(first.master,true);assert.equal(first.children.length,4);
   await h.context.observeMediaResponse({...item,responseHeaders:[{name:'content-type',value:'application/vnd.apple.mpegurl'}]});
   assert.equal(calls,1);assert.equal(h.list().length,1);assert.equal(h.list()[0].master,true);
   assert.equal(h.list()[0].children.length,4);assert.ok(h.list()[0].children[0].includes('token=a%2Fb,c'));
+  assert.equal(h.snapshots.length,2); // Candidate, then learned master metadata.
+});
+
+test('repeated unchanged range traffic updates freshness without rewriting snapshots',async()=>{
+  const h=harness();await h.context.observeMediaResponse(response());
+  h.list()[0].seenAt=1;
+  for(let n=0;n<20;n++)await h.context.observeMediaResponse(response());
+  assert.equal(h.snapshots.length,1);assert.ok(h.list()[0].seenAt>1);
+  await h.context.observeMediaResponse(response(undefined,{responseHeaders:[{name:'Content-Type',value:'video/mp4'},{name:'Content-Length',value:'4194304'}]}));
+  assert.equal(h.snapshots.length,2);assert.equal(h.list()[0].size,4194304);
 });
 
 test('oversized and failed metadata probes retain the candidate and never invent children',async()=>{

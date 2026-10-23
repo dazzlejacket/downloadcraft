@@ -287,7 +287,17 @@ function noteMedia(tabId, entry) {
     && (!e.pageUrl || !entry.pageUrl || e.pageUrl===entry.pageUrl)
     && (!e.documentId || !entry.documentId || e.documentId===entry.documentId));
   if (existing) {
-    Object.assign(existing,entry,{kind,seenAt:Date.now(),mime:entry.mime || existing.mime,
+    const effectiveKind=existing.segment ? "segment" : kind;
+    const changed = effectiveKind!==existing.kind || (entry.mime && entry.mime!==existing.mime)
+      || (entry.size>0 && entry.size!==existing.size) || (entry.pageUrl && entry.pageUrl!==existing.pageUrl)
+      || (entry.documentId && entry.documentId!==existing.documentId)
+      || (entry.master && !existing.master) || (entry.child && !existing.child)
+      || (entry.children && (entry.children.length!==(existing.children || []).length
+        || entry.children.some((url,i)=>url!==existing.children[i])));
+    // Range/playback traffic repeats the same URL frequently. Refresh its
+    // freshness in memory, but write storage/badges only for new evidence.
+    if(!changed){existing.seenAt=Date.now();return;}
+    Object.assign(existing,entry,{kind:effectiveKind,seenAt:Date.now(),mime:entry.mime || existing.mime,
       size:entry.size || existing.size || 0, pageUrl:entry.pageUrl || existing.pageUrl,
       master:!!(entry.master || existing.master), children:entry.children || existing.children});
   } else list.push({ ...entry, kind, seenAt: Date.now() });
@@ -319,7 +329,8 @@ function noteMedia(tabId, entry) {
   }
   // Legacy global snapshot: fallback only (popup prefers per-tab peek).
   try {
-    chrome.storage.local.set({ downloadCraftNet: list.slice(-25) });
+    const saved=chrome.storage.local.set({ downloadCraftNet: list.slice(-25) });
+    if(saved && typeof saved.catch==="function")saved.catch(()=>{});
   } catch (e) { /* ignore */ }
   // Badge counts downloadable candidates, never playlist children.
   const badgeN = list.filter((e) => !e.child).length;
