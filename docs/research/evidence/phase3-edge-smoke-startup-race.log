@@ -1,0 +1,21 @@
+{
+  "browser": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "output": "C:\\Users\\grego\\Documents\\Codex Projects\\DownloadCraft\\upstream-baseline\\dist\\phase3-edge-smoke-1792712321509431300",
+  "sampleProbe": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_type": "video"
+      },
+      {
+        "codec_type": "audio"
+      }
+    ]
+  },
+  "scope": "isolated native extension detection; native messaging disabled",
+  "passed": false,
+  "error": "Command '['C:\\\\Users\\\\grego\\\\.cache\\\\codex-runtimes\\\\codex-primary-runtime\\\\dependencies\\\\node\\\\bin\\\\node.EXE', 'C:\\\\Users\\\\grego\\\\Documents\\\\Codex Projects\\\\DownloadCraft\\\\upstream-baseline\\\\scripts\\\\media_detection_cdp.js', '58926', 'pgdhmfgefjnfijmlheboncdmfhcnoikk', 'C:\\\\Users\\\\grego\\\\Documents\\\\Codex Projects\\\\DownloadCraft\\\\upstream-baseline\\\\dist\\\\phase3-edge-smoke-1792712321509431300\\\\extensions\\\\browser-extension\\\\smoke.js']' returned non-zero exit status 1.",
+  "diagnostic": "Error: {\"exceptionId\":1,\"text\":\"Uncaught (in promise) TypeError: Cannot set properties of null (setting 'textContent')\",\"lineNumber\":0,\"columnNumber\":0,\"exception\":{\"type\":\"object\",\"subtype\":\"error\",\"className\":\"TypeError\",\"description\":\"TypeError: Cannot set properties of null (setting 'textContent')\\n    at <anonymous>:16:56\\n    at <anonymous>:17:3\",\"objectId\":\"-7727916365996757331.1.1\"}}\n",
+  "fixtureRequests": []
+}

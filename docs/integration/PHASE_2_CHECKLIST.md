@@ -1,5 +1,7 @@
 # Phase 2 selective integration checklist
 
+Phase 3 update: the historical results below remain the Phase 2 snapshot. The current extension is 0.9.7.3; see [media detection research and current validation](../research/MEDIA_DETECTION_ANALYSIS.md) for the subsequent implementation, 157-test suite and passing native Edge/Brave smoke results.
+
 Completed local implementation pass: 2026-10-22. Branch: `integration/phase-1-upstream-baseline` in the existing `upstream-baseline` checkout. Official master was fetched/rechecked and remained `c6ca86fa23bded14048aeb12c131d7e26fc80297`. Experimental reference remains `51b12f65883cde382ed36c6caca4439abc114b0c`.
 
 The Phase 1 reports in workspace-root `docs/integration/` were read before changes. Their native-build gate remains unresolved; this pass deliberately implements and validates extension JavaScript only. Desktop Rust application logic and Cargo dependencies are byte-for-byte unchanged relative to the official baseline. This is an unreleased local extension build, **0.9.7.2**, compatible with the existing native-message protocol; desktop version remains **0.9.7**.
