@@ -448,6 +448,10 @@ pub fn ext_for_mime(mime: &str) -> Option<&'static str> {
         "application/x-7z-compressed" => Some(".7z"),
         "application/gzip" | "application/x-gzip" => Some(".gz"),
         "application/x-msdownload" | "application/octet-stream" => None,
+        // Subtitle files: a caption is a file like any other, and it keeps
+        // its own suffix (a caption URL often names no file at all).
+        "text/vtt" => Some(".vtt"),
+        "application/x-subrip" | "text/srt" => Some(".srt"),
         _ => None,
     }
 }
@@ -1732,6 +1736,10 @@ mod tests {
         assert_eq!(ext_for_mime("audio/mpeg"), Some(".mp3"));
         assert_eq!(ext_for_mime("image/jpeg"), Some(".jpg"));
         assert_eq!(ext_for_mime("application/pdf"), Some(".pdf"));
+        // A caption file keeps its own suffix.
+        assert_eq!(ext_for_mime("text/vtt"), Some(".vtt"));
+        assert_eq!(ext_for_mime("text/vtt; charset=utf-8"), Some(".vtt"));
+        assert_eq!(ext_for_mime("application/x-subrip"), Some(".srt"));
         assert_eq!(ext_for_mime("application/octet-stream"), None);
         assert_eq!(ext_for_mime("text/html"), None);
         assert_eq!(ext_for_mime(""), None);
@@ -1760,6 +1768,13 @@ mod tests {
         assert_eq!(ytid, "aqz-KE-bpKQ.mp4");
         let disp = filename_from_url_with_mime("https://h/dl?id=7", Some("application/pdf"));
         assert_eq!(disp, "dl.pdf");
+        // A caption URL names no file: the MIME gives it its suffix, so the
+        // caption is saved as a caption and not as an unnamed blob.
+        let cap = filename_from_url_with_mime(
+            "https://www.youtube.com/api/timedtext?v=abc123&lang=en&fmt=vtt",
+            Some("text/vtt"),
+        );
+        assert!(cap.ends_with(".vtt"), "{cap}");
         // unknown mime: usable bare names stay, true fallbacks keep .bin
         let keep = filename_from_url_with_mime("https://h/nameless", Some("text/html"));
         assert_eq!(keep, "nameless");

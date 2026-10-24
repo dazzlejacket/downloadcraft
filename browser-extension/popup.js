@@ -495,9 +495,10 @@ function collectItems(peek, pageUrl) {
     // title and artist), else the page title. And the extension the MIME
     // really is: an mp3 is not an m4a.
     const audioExt = (R && R.audioExtForMime) ? (R.audioExtForMime(n.mime) || ".m4a") : ".m4a";
-    const ext = isAudio ? audioExt : ".mp4";
-    const rowTitle = n.title || pageTitle || (isAudio ? "Audio" : "Video");
-    const name = isStream || isSub ? undefined
+    // A caption is a file too: it keeps its own suffix, not the video's.
+    const ext = isAudio ? audioExt : isSub ? ".vtt" : ".mp4";
+    const rowTitle = n.title || pageTitle || (isAudio ? "Audio" : isSub ? "Subtitles" : "Video");
+    const name = isStream ? undefined
       : safeName(n.filename || rowTitle, ext);
     const streamName = safeName(pageTitle || "video", ".mp4");
     items.push({
