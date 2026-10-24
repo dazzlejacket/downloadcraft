@@ -8,10 +8,11 @@
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::time::Duration;
 
 /// The cloud provider a job belongs to.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Provider {
     #[default]
     RealDebrid,
@@ -37,7 +38,7 @@ impl Provider {
 }
 
 /// What the provider was asked to do.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     #[default]
     Torrent,
@@ -45,7 +46,7 @@ pub enum Kind {
 }
 
 /// A cloud task the provider runs on our behalf.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CloudJob {
     pub provider: Provider,
     pub id: String,
@@ -54,7 +55,7 @@ pub struct CloudJob {
 }
 
 /// One file inside a cloud task.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CloudFile {
     pub id: u64,
     pub name: String,
@@ -64,9 +65,13 @@ pub struct CloudFile {
 }
 
 /// The files of a cloud task plus its provider status.
+#[derive(Clone, Debug)]
 pub struct Listing {
     pub files: Vec<CloudFile>,
+    /// The provider's own status word, kept verbatim.
     pub status: String,
+    /// The same status normalized across providers.
+    pub state: CloudStatus,
 }
 
 /// A hosting link the provider resolved to a direct download.
@@ -82,12 +87,245 @@ pub struct HostedFile {
     pub connections: Option<usize>,
 }
 
+/// Whether the provider already holds a torrent.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum CacheState {
+    /// The provider holds every file it reported: an instant download.
+    Cached,
+    /// The provider holds only part of the torrent.
+    Partial,
+    /// The provider does not hold it and has to fetch it.
+    Uncached,
+    /// The provider did not answer the question.
+    #[default]
+    Unknown,
+}
+
+impl CacheState {
+    /// Short label for the (later) UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Partial => "partial",
+            Self::Uncached => "uncached",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A file the provider reports inside a cached torrent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedFile {
+    pub id: u64,
+    pub name: String,
+    pub bytes: u64,
+}
+
+/// What the provider says about a torrent hash.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheStatus {
+    pub hash: String,
+    pub state: CacheState,
+    /// The files the provider reported as available.
+    pub files: Vec<CachedFile>,
+    /// The summed size of the reported files.
+    pub bytes: u64,
+}
+
+/// The provider's job state, normalized across providers.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum CloudStatus {
+    /// Accepted by the provider, nothing fetched yet.
+    Queued,
+    /// The provider is fetching it.
+    Downloading,
+    /// The provider holds it; files can be selected and downloaded.
+    Ready,
+    /// Available in part, or waiting for the user to select files.
+    Partial,
+    /// The provider gave up on it.
+    Failed,
+    /// The provider could not be asked.
+    #[default]
+    Unknown,
+}
+
+impl CloudStatus {
+    /// Short label for the (later) UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Downloading => "downloading",
+            Self::Ready => "ready",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A provider refusal, carrying the provider's own code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderError {
+    pub provider: Provider,
+    /// The HTTP status, when the failure was a status.
+    pub status: Option<u16>,
+    /// The provider's code: a number for Real-Debrid, a word for TorBox.
+    pub code: Option<String>,
+    /// The provider's own message, when it sent one.
+    pub message: String,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} request failed", self.provider.label())?;
+        if let Some(status) = self.status {
+            write!(f, " (HTTP {status})")?;
+        }
+        if let Some(code) = &self.code {
+            write!(f, " Ã¢â‚¬â€ {code}")?;
+            if let Some(text) = realdebrid_error_text(code) {
+                write!(f, " ({text})")?;
+            }
+        }
+        if !self.message.is_empty() {
+            write!(f, ": {}", self.message)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+/// The provider's error code, when the failure carried one.
+pub fn provider_code(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<ProviderError>()
+        .and_then(|e| e.code.as_deref())
+}
+
+/// Real-Debrid's numeric error codes, with their documented meaning.
+///
+/// Source: the Real-Debrid API documentation ("List of numeric error
+/// codes"). The number is what an application should branch on; the text
+/// is only for the message shown to the user.
+fn realdebrid_error_text(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "-1" => "internal error",
+        "1" => "missing parameter",
+        "2" => "bad parameter value",
+        "3" => "unknown method",
+        "4" => "method not allowed",
+        "5" => "slow down",
+        "6" => "resource unreachable",
+        "7" => "resource not found",
+        "8" => "bad token",
+        "9" => "permission denied",
+        "10" => "two-factor authentication needed",
+        "11" => "two-factor authentication pending",
+        "12" => "invalid login",
+        "13" => "invalid password",
+        "14" => "account locked",
+        "15" => "account not activated",
+        "16" => "unsupported hoster",
+        "17" => "hoster in maintenance",
+        "18" => "hoster limit reached",
+        "19" => "hoster temporarily unavailable",
+        "20" => "hoster not available for free users",
+        "21" => "too many active downloads",
+        "22" => "IP address not allowed",
+        "23" => "traffic exhausted",
+        "24" => "file unavailable",
+        "25" => "service unavailable",
+        "26" => "upload too big",
+        "27" => "upload error",
+        "28" => "file not allowed",
+        "29" => "torrent too big",
+        "30" => "torrent file invalid",
+        "31" => "action already done",
+        "32" => "image resolution error",
+        "33" => "torrent already active",
+        "34" => "too many requests",
+        "35" => "infringing file",
+        "36" => "fair usage limit",
+        "37" => "disabled endpoint",
+        _ => return None,
+    })
+}
+
+/// A provider-generated direct link and the lifetime the provider gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectLink {
+    /// The direct HTTPS address. Never contains the API token.
+    pub url: String,
+    /// The provider's connection limit for this file, when it sent one.
+    pub connections: Option<usize>,
+    /// Unix seconds when the provider says the link stops working.
+    pub expires_at: Option<u64>,
+    /// Unix seconds when the link was requested.
+    pub generated_at: u64,
+    /// The lifetime used when the provider did not state one.
+    pub lifetime_s: u64,
+}
+
+impl DirectLink {
+    /// When the link stops working: the provider's own expiry when it
+    /// sent one, otherwise the provider's default lifetime.
+    pub fn effective_expiry(&self) -> u64 {
+        self.expires_at
+            .unwrap_or_else(|| self.generated_at.saturating_add(self.lifetime_s))
+    }
+
+    /// Did the provider state an expiry of its own?
+    pub fn expiry_known(&self) -> bool {
+        self.expires_at.is_some()
+    }
+
+    /// Is the link past its lifetime?
+    pub fn is_expired(&self, now: u64) -> bool {
+        now >= self.effective_expiry()
+    }
+
+    /// Seconds left before the link expires.
+    pub fn expires_in(&self, now: u64) -> u64 {
+        self.effective_expiry().saturating_sub(now)
+    }
+
+    /// Should the link be replaced? A refresh is always safe: it asks the
+    /// provider for a new address instead of reusing a stale one.
+    pub fn needs_refresh(&self, now: u64) -> bool {
+        self.is_expired(now)
+    }
+}
+
+/// TorBox opens a download link for three hours (TorBox API help:
+/// "This endpoint opens the link for 3 hours").
+const TORBOX_LINK_LIFETIME_S: u64 = 3 * 60 * 60;
+
+/// Real-Debrid publishes no lifetime for a generated link. Community
+/// measurements put one at about a week; the value only decides when a
+/// link is refreshed, and refreshing is always safe.
+const REALDEBRID_LINK_LIFETIME_S: u64 = 7 * 24 * 60 * 60;
+
+/// Bounded retries for a rate-limited request.
+const RATE_RETRIES: u32 = 3;
+/// First backoff step; every retry doubles it.
+const RATE_BACKOFF: Duration = Duration::from_millis(500);
+/// No provider may hold the app longer than this.
+const RATE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Largest provider answer we read.
+const RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+/// Largest error answer we read.
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
+
 /// A provider client. The token lives in memory only.
 #[derive(Clone)]
 pub struct Api {
     provider: Provider,
     token: String,
     client: reqwest::Client,
+    /// First backoff step for a rate-limited request.
+    backoff: Duration,
     #[cfg(test)]
     test_base: Option<String>,
 }
@@ -104,6 +342,7 @@ impl Api {
             test_base: None,
             provider,
             token: token.trim().into(),
+            backoff: RATE_BACKOFF,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
@@ -129,48 +368,85 @@ impl Api {
 
     /// Send a request and decode the JSON answer.
     ///
+    /// `build` is called again for every attempt, so a retried request
+    /// always carries a fresh body. A rate-limited answer (HTTP 429) is
+    /// retried a bounded number of times with an exponential backoff.
+    ///
     /// Errors never echo the request URL: the token is part of it.
-    async fn json(&self, request: reqwest::RequestBuilder) -> Result<Value> {
-        let mut response = request
-            .send()
-            .await
-            .map_err(|_| anyhow!("Provider request failed or timed out"))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Provider returned HTTP {}{}",
-                status.as_u16(),
-                if status.as_u16() == 429 {
-                    "; wait before retrying"
-                } else {
-                    "; check account access and token"
-                }
-            ));
-        }
-        if status == reqwest::StatusCode::NO_CONTENT {
-            return Ok(Value::Null);
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| anyhow!("Provider response interrupted"))?
-        {
-            if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
-                return Err(anyhow!("Provider response too large"));
+    async fn json(&self, build: impl Fn() -> reqwest::RequestBuilder) -> Result<Value> {
+        let mut attempt = 0u32;
+        loop {
+            let mut response = build()
+                .send()
+                .await
+                .map_err(|_| anyhow!("Provider request failed or timed out"))?;
+            let status = response.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < RATE_RETRIES {
+                let wait = self.backoff_for(attempt, response.headers());
+                attempt += 1;
+                tokio::time::sleep(wait).await;
+                continue;
             }
-            bytes.extend_from_slice(&chunk);
+            if !status.is_success() {
+                let bytes = read_body(&mut response, ERROR_BODY_LIMIT)
+                    .await
+                    .unwrap_or_default();
+                let value: Option<Value> = serde_json::from_slice(&bytes).ok();
+                return Err(anyhow::Error::new(self.provider_error(status, value.as_ref())));
+            }
+            if status == reqwest::StatusCode::NO_CONTENT {
+                return Ok(Value::Null);
+            }
+            let bytes = read_body(&mut response, RESPONSE_LIMIT).await?;
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|_| anyhow!("Invalid provider response"))?;
+            if value.get("success").and_then(Value::as_bool) == Some(false)
+                || value.get("error_code").is_some()
+            {
+                return Err(anyhow::Error::new(self.provider_error(status, Some(&value))));
+            }
+            return Ok(value);
         }
-        let value: Value =
-            serde_json::from_slice(&bytes).map_err(|_| anyhow!("Invalid provider response"))?;
-        if value.get("success").and_then(Value::as_bool) == Some(false)
-            || value.get("error_code").is_some()
+    }
+
+    /// How long to wait before the next attempt after a 429.
+    ///
+    /// A provider that says when to come back wins, but only up to the
+    /// cap: a broken header must not stall the app.
+    fn backoff_for(&self, attempt: u32, headers: &reqwest::header::HeaderMap) -> Duration {
+        if let Some(after) = headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
         {
-            return Err(anyhow!(
-                "Provider refused the request; check account limits and permissions"
-            ));
+            if after > 0 {
+                return Duration::from_secs(after).min(RATE_BACKOFF_MAX);
+            }
         }
-        Ok(value)
+        self.backoff
+            .saturating_mul(1u32 << attempt.min(5))
+            .min(RATE_BACKOFF_MAX)
+    }
+
+    /// Build the error for a provider refusal, keeping its own code.
+    fn provider_error(&self, status: reqwest::StatusCode, value: Option<&Value>) -> ProviderError {
+        let code = value.and_then(|v| {
+            v.get("error_code")
+                .and_then(Value::as_i64)
+                .map(|n| n.to_string())
+                .or_else(|| v.get("error").and_then(Value::as_str).map(str::to_string))
+        });
+        let message = value
+            .and_then(|v| v.get("detail").and_then(Value::as_str))
+            .or_else(|| value.and_then(|v| v.get("error").and_then(Value::as_str)))
+            .unwrap_or("")
+            .to_string();
+        ProviderError {
+            provider: self.provider,
+            status: Some(status.as_u16()),
+            code,
+            message,
+        }
     }
 
     /// Attach the bearer token.
@@ -181,7 +457,8 @@ impl Api {
     /// Hand a magnet link to the provider. The provider runs the swarm;
     /// this app has no local torrent engine.
     pub async fn add(&self, magnet: &str) -> Result<CloudJob> {
-        let u = url::Url::parse(magnet.trim())?;
+        let magnet = magnet.trim();
+        let u = url::Url::parse(magnet)?;
         if u.scheme() != "magnet"
             || !u
                 .query_pairs()
@@ -191,21 +468,21 @@ impl Api {
         }
         let value = match self.provider {
             Provider::RealDebrid => {
-                self.json(
+                self.json(|| {
                     self.auth(self.client.post(self.url("torrents/addMagnet")))
-                        .form(&[("magnet", magnet)]),
-                )
+                        .form(&[("magnet", magnet)])
+                })
                 .await?
             }
             Provider::TorBox => {
-                self.json(
+                self.json(|| {
                     self.auth(self.client.post(self.url("torrents/createtorrent")))
                         .multipart(
                             reqwest::multipart::Form::new()
                                 .text("magnet", magnet.to_string())
                                 .text("seed", "1"),
-                        ),
-                )
+                        )
+                })
                 .await?
             }
         };
@@ -230,32 +507,37 @@ impl Api {
 
     /// Upload `.torrent` metadata for the provider to fetch.
     pub async fn torrent_file(&self, name: String, bytes: Vec<u8>) -> Result<CloudJob> {
+        let name = name.trim().to_string();
         if bytes.is_empty() || bytes.len() > 16 * 1024 * 1024 {
             return Err(anyhow!("Choose a nonempty .torrent file under 16 MiB"));
         }
         let value = match self.provider {
             Provider::RealDebrid => {
-                self.json(
+                self.json(|| {
                     self.auth(self.client.put(self.url("torrents/addTorrent")))
                         .header("Content-Type", "application/x-bittorrent")
-                        .body(bytes),
-                )
+                        .body(bytes.clone())
+                })
                 .await?
             }
             Provider::TorBox => {
-                self.json(
+                self.json(|| {
                     self.auth(self.client.post(self.url("torrents/createtorrent")))
                         .multipart(
                             reqwest::multipart::Form::new()
                                 .part(
                                     "file",
-                                    reqwest::multipart::Part::bytes(bytes)
-                                        .file_name(name)
-                                        .mime_str("application/x-bittorrent")?,
+                                    reqwest::multipart::Part::bytes(bytes.clone())
+                                        .file_name(name.clone())
+                                        // A constant MIME type cannot fail,
+                                        // and its error type cannot cross
+                                        // the retry closure.
+                                        .mime_str("application/x-bittorrent")
+                                        .expect("constant MIME type"),
                                 )
                                 .text("seed", "1"),
-                        ),
-                )
+                        )
+                })
                 .await?
             }
         };
@@ -288,7 +570,8 @@ impl Api {
         link: &str,
         password: &str,
     ) -> Result<(Option<CloudJob>, Vec<HostedFile>)> {
-        let u = url::Url::parse(link.trim())?;
+        let link = link.trim();
+        let u = url::Url::parse(link)?;
         if !matches!(u.scheme(), "http" | "https")
             || !u.username().is_empty()
             || u.password().is_some()
@@ -298,10 +581,10 @@ impl Api {
         match self.provider {
             Provider::RealDebrid => {
                 let value = self
-                    .json(
+                    .json(|| {
                         self.auth(self.client.post(self.url("unrestrict/link")))
-                            .form(&[("link", link), ("password", password)]),
-                    )
+                            .form(&[("link", link), ("password", password)])
+                    })
                     .await?;
                 let values = if let Some(values) = value.as_array() {
                     values.clone()
@@ -327,10 +610,10 @@ impl Api {
             }
             Provider::TorBox => {
                 let value = self
-                    .json(
+                    .json(|| {
                         self.auth(self.client.post(self.url("webdl/createwebdownload")))
-                            .form(&[("link", link), ("password", password)]),
-                    )
+                            .form(&[("link", link), ("password", password)])
+                    })
                     .await?;
                 let id = value
                     .pointer("/data/webdownload_id")
@@ -363,7 +646,7 @@ impl Api {
             "webdl/hosters"
         };
         let value = self
-            .json(self.auth(self.client.get(self.url(path))))
+            .json(|| self.auth(self.client.get(self.url(path))))
             .await?;
         let value = if self.provider == Provider::TorBox {
             value.get("data").unwrap_or(&value)
@@ -396,7 +679,7 @@ impl Api {
                 .unwrap_or_default();
             let note = row["note"].as_str().unwrap_or("");
             lines.push(format!(
-                "{name} — {status}\n{domains}{}",
+                "{name} Ã¢â‚¬â€ {status}\n{domains}{}",
                 if note.is_empty() {
                     String::new()
                 } else {
@@ -426,13 +709,13 @@ impl Api {
     /// Select every file of a torrent job (Real-Debrid only).
     pub async fn select_all(&self, job: &CloudJob) -> Result<()> {
         if self.provider == Provider::RealDebrid && job.kind == Kind::Torrent {
-            self.json(
+            self.json(|| {
                 self.auth(
                     self.client
                         .post(self.url(&format!("torrents/selectFiles/{}", job.id))),
                 )
-                .form(&[("files", "all")]),
-            )
+                .form(&[("files", "all")])
+            })
             .await?;
         }
         Ok(())
@@ -440,25 +723,45 @@ impl Api {
 
     /// The current status and file list of a cloud task.
     pub async fn list(&self, job: &CloudJob) -> Result<Listing> {
+        self.list_with(job, false).await
+    }
+
+    /// The current status of a cloud task, bypassing the provider's own
+    /// cached answer.
+    ///
+    /// TorBox caches its torrent list; a status refresh must not read
+    /// that cache, or a finished job looks unchanged. Real-Debrid has no
+    /// such cache and answers the same either way.
+    pub async fn list_fresh(&self, job: &CloudJob) -> Result<Listing> {
+        self.list_with(job, true).await
+    }
+
+    async fn list_with(&self, job: &CloudJob, fresh: bool) -> Result<Listing> {
         let value = match self.provider {
             Provider::RealDebrid => {
-                self.json(
+                self.json(|| {
                     self.auth(
                         self.client
                             .get(self.url(&format!("torrents/info/{}", job.id))),
-                    ),
-                )
+                    )
+                })
                 .await?
             }
             Provider::TorBox => {
-                self.json(
-                    self.auth(self.client.get(self.url(if job.kind == Kind::Hosting {
-                        "webdl/mylist"
-                    } else {
-                        "torrents/mylist"
-                    })))
-                    .query(&[("id", job.id.as_str())]),
-                )
+                let path = if job.kind == Kind::Hosting {
+                    "webdl/mylist"
+                } else {
+                    "torrents/mylist"
+                };
+                self.json(|| {
+                    let mut request = self
+                        .auth(self.client.get(self.url(path)))
+                        .query(&[("id", job.id.as_str())]);
+                    if fresh {
+                        request = request.query(&[("bypass_cache", "true")]);
+                    }
+                    request
+                })
                 .await?
             }
         };
@@ -467,19 +770,29 @@ impl Api {
 
     /// The direct download address of one cloud file.
     pub async fn link(&self, job: &CloudJob, file: &CloudFile) -> Result<(String, Option<usize>)> {
+        let link = self.link_info(job, file).await?;
+        Ok((link.url, link.connections))
+    }
+
+    /// The direct download address of one cloud file, with its lifetime.
+    ///
+    /// The provider's own expiry is used when it sends one; otherwise the
+    /// provider's default lifetime applies. A link never contains the API
+    /// token.
+    pub async fn link_info(&self, job: &CloudJob, file: &CloudFile) -> Result<DirectLink> {
         let value = match self.provider {
             Provider::RealDebrid => {
                 if file.link.is_empty() {
                     return Err(anyhow!("Cloud file is not ready"));
                 }
-                self.json(
+                self.json(|| {
                     self.auth(self.client.post(self.url("unrestrict/link")))
-                        .form(&[("link", file.link.as_str())]),
-                )
+                        .form(&[("link", file.link.as_str())])
+                })
                 .await?
             }
             Provider::TorBox => {
-                self.json(
+                self.json(|| {
                     self.client
                         .get(self.url(if job.kind == Kind::Hosting {
                             "webdl/requestdl"
@@ -498,8 +811,8 @@ impl Api {
                             ),
                             ("file_id", file.id.to_string()),
                             ("redirect", "false".into()),
-                        ]),
-                )
+                        ])
+                })
                 .await?
             }
         };
@@ -509,13 +822,171 @@ impl Api {
         }
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Cloud file is not ready for download"))?;
-        let link = self.checked_link(text)?;
+        let url = self.checked_link(text)?;
         let connections = value["chunks"]
             .as_u64()
             .filter(|n| *n > 0)
             .map(|n| (n as usize).clamp(1, 16));
-        Ok((link, connections))
+        let now = now_seconds();
+        Ok(DirectLink {
+            url,
+            connections,
+            expires_at: link_expiry(&value),
+            generated_at: now,
+            lifetime_s: self.link_lifetime(),
+        })
     }
+
+    /// Ask the provider for a fresh address for one cloud file.
+    ///
+    /// This is the safe refresh: the provider is asked again for the
+    /// original file, and the stale address is never reused.
+    pub async fn refresh_link(&self, job: &CloudJob, file: &CloudFile) -> Result<DirectLink> {
+        self.link_info(job, file).await
+    }
+
+    /// Delete a cloud task at the provider.
+    ///
+    /// Real-Debrid removes a torrent from its list; TorBox controls the
+    /// torrent and the hosting task separately.
+    pub async fn delete_job(&self, job: &CloudJob) -> Result<()> {
+        match self.provider {
+            Provider::RealDebrid => match job.kind {
+                Kind::Torrent => {
+                    self.json(|| {
+                        self.auth(self.client.delete(self.url(&format!(
+                            "torrents/delete/{}",
+                            job.id
+                        ))))
+                    })
+                    .await?;
+                }
+                Kind::Hosting => {
+                    return Err(anyhow!(
+                        "Real-Debrid resolves hosting links directly; there is no hosting job to delete"
+                    ));
+                }
+            },
+            Provider::TorBox => {
+                let id = job
+                    .id
+                    .parse::<u64>()
+                    .map_err(|_| anyhow!("Provider task ID is not a number"))?;
+                match job.kind {
+                    Kind::Torrent => {
+                        self.json(|| {
+                            self.auth(self.client.post(self.url("torrents/controltorrent")))
+                                .json(&json!({ "operation": "delete", "torrent_id": id }))
+                        })
+                        .await?;
+                    }
+                    Kind::Hosting => {
+                        self.json(|| {
+                            self.auth(self.client.post(self.url("webdl/controlwebdownload")))
+                                .json(&json!({ "operation": "delete", "webdl_id": id }))
+                        })
+                        .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Ask the provider whether it already holds a torrent.
+    ///
+    /// `expected_files` is the number of files the torrent is known to
+    /// have: when the provider holds fewer, the torrent is only partly
+    /// cached. Real-Debrid answers `GET /torrents/instantAvailability/{hash}`,
+    /// TorBox answers `GET /torrents/checkcached`.
+    pub async fn cache_status(
+        &self,
+        hash: &str,
+        expected_files: Option<u64>,
+    ) -> Result<CacheStatus> {
+        let hash = hash.trim();
+        if !is_torrent_hash(hash) {
+            return Err(anyhow!("Enter a torrent info hash"));
+        }
+        let value = match self.provider {
+            Provider::RealDebrid => {
+                self.json(|| {
+                    self.auth(self.client.get(self.url(&format!(
+                        "torrents/instantAvailability/{hash}"
+                    ))))
+                })
+                .await?
+            }
+            Provider::TorBox => {
+                self.json(|| {
+                    self.auth(self.client.get(self.url("torrents/checkcached")))
+                        .query(&[
+                            ("hash", hash),
+                            ("format", "list"),
+                            ("list_files", "true"),
+                        ])
+                })
+                .await?
+            }
+        };
+        Ok(parse_cache(self.provider, hash, &value, expected_files))
+    }
+
+    /// The lifetime used when the provider does not state one.
+    fn link_lifetime(&self) -> u64 {
+        match self.provider {
+            Provider::RealDebrid => REALDEBRID_LINK_LIFETIME_S,
+            Provider::TorBox => TORBOX_LINK_LIFETIME_S,
+        }
+    }
+}
+
+/// Unix seconds, or 0 when the clock is before the epoch.
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A torrent info hash: hex only, so it can never change the request
+/// path or query.
+fn is_torrent_hash(hash: &str) -> bool {
+    (hash.len() == 40 || hash.len() == 64) && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Read a bounded response body.
+async fn read_body(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| anyhow!("Provider response interrupted"))?
+    {
+        if bytes.len() + chunk.len() > limit {
+            return Err(anyhow!("Provider response too large"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// The expiry a provider stated for a generated link, if any.
+fn link_expiry(value: &Value) -> Option<u64> {
+    for key in ["expires", "expiry", "expire"] {
+        if let Some(at) = value.get(key).and_then(Value::as_u64) {
+            // A provider may send seconds instead of an absolute time.
+            return Some(if at < 1_000_000_000 {
+                now_seconds().saturating_add(at)
+            } else {
+                at
+            });
+        }
+    }
+    value
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .map(|secs| now_seconds().saturating_add(secs))
 }
 
 /// Read the file list and status out of a provider answer.
@@ -582,13 +1053,168 @@ fn parse_listing(provider: Provider, value: &Value) -> Result<Listing> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(Listing { files, status })
+    Ok(Listing {
+        files,
+        state: normalize_status(provider, &status),
+        status,
+    })
+}
+
+/// Map a provider's own status word onto one normalized state.
+fn normalize_status(provider: Provider, raw: &str) -> CloudStatus {
+    let word = raw.trim().to_ascii_lowercase();
+    match (provider, word.as_str()) {
+        (Provider::RealDebrid, "downloaded" | "finished" | "uploading" | "seeding") => {
+            CloudStatus::Ready
+        }
+        (Provider::RealDebrid, "downloading" | "checking" | "checking_files") => {
+            CloudStatus::Downloading
+        }
+        (Provider::RealDebrid, "queued" | "starting" | "magnet_conversion" | "paused") => {
+            CloudStatus::Queued
+        }
+        (Provider::RealDebrid, "waiting_files_selection") => CloudStatus::Partial,
+        (Provider::RealDebrid, "magnet_error" | "error" | "virus" | "dead") => CloudStatus::Failed,
+        (Provider::TorBox, "cached" | "completed") => CloudStatus::Ready,
+        (Provider::TorBox, "downloading" | "checking" | "checking_formatted" | "uploading") => {
+            CloudStatus::Downloading
+        }
+        (Provider::TorBox, "queued" | "queued_wanted" | "magnet_processing" | "stalled") => {
+            CloudStatus::Queued
+        }
+        (Provider::TorBox, "failed" | "timed_out") => CloudStatus::Failed,
+        _ => CloudStatus::Unknown,
+    }
+}
+
+/// Read the provider's answer about a torrent hash.
+fn parse_cache(
+    provider: Provider,
+    hash: &str,
+    value: &Value,
+    expected_files: Option<u64>,
+) -> CacheStatus {
+    let (files, verdict) = match provider {
+        Provider::RealDebrid => {
+            let entry = value.get(hash);
+            match entry {
+                // The provider listed the hash but did not say whether it
+                // holds it: the answer is unusable.
+                Some(entry) if entry.get("rd").is_none() => (Vec::new(), None),
+                // The hash is not in the answer: the provider does not
+                // hold it.
+                None => (Vec::new(), Some(false)),
+                Some(entry) => {
+                    let variants = entry.get("rd").and_then(Value::as_array);
+                    let mut files = Vec::new();
+                    if let Some(variants) = variants {
+                        // Real-Debrid lists the available files in its
+                        // first variant; later variants are other seeds of
+                        // the same torrent.
+                        if let Some(first) = variants.first().and_then(Value::as_object) {
+                            for (id, file) in first {
+                                let id = id.parse::<u64>().ok();
+                                let name = file
+                                    .get("filename")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let bytes =
+                                    file.get("filesize").and_then(Value::as_u64).unwrap_or(0);
+                                if let Some(id) = id {
+                                    files.push(CachedFile { id, name, bytes });
+                                }
+                            }
+                        }
+                    }
+                    (files, Some(variants.map(|v| !v.is_empty()).unwrap_or(false)))
+                }
+            }
+        }
+        Provider::TorBox => {
+            let data = value.get("data").unwrap_or(value);
+            let entry = if data.is_array() {
+                data.get(0).unwrap_or(&Value::Null)
+            } else {
+                data
+            };
+            let mut files = Vec::new();
+            if let Some(rows) = entry.get("files").and_then(Value::as_array) {
+                for file in rows {
+                    let id = file.get("id").and_then(Value::as_u64).unwrap_or(0);
+                    let name = file
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let bytes = file.get("size").and_then(Value::as_u64).unwrap_or(0);
+                    files.push(CachedFile { id, name, bytes });
+                }
+            }
+            // The provider said nothing about the hash: the answer is
+            // unusable, which is not the same as "not cached".
+            if entry.get("cached").is_none() && entry.get("files").is_none() {
+                (Vec::new(), None)
+            } else {
+                let cached = entry.get("cached").and_then(Value::as_bool).unwrap_or(false);
+                (files, Some(cached))
+            }
+        }
+    };
+    let bytes = files.iter().map(|f| f.bytes).sum();
+    let state = match verdict {
+        Some(true) => {
+            // The provider holds it, but not every file of the torrent.
+            if let Some(expected) = expected_files {
+                if expected > 0 && (files.len() as u64) < expected {
+                    CacheState::Partial
+                } else {
+                    CacheState::Cached
+                }
+            } else {
+                CacheState::Cached
+            }
+        }
+        Some(false) => {
+            if files.is_empty() {
+                CacheState::Uncached
+            } else {
+                CacheState::Partial
+            }
+        }
+        None => CacheState::Unknown,
+    };
+    CacheStatus {
+        hash: hash.to_string(),
+        state,
+        files,
+        bytes,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The canned provider answer for a request line.
+    fn mock_payload(path: &str) -> &'static str {
+        if path.contains("unrestrict/link") {
+            r#"{"download":"https://cdn.example.test/file.bin","filename":"file.bin"}"#
+        } else if path.contains("createwebdownload") {
+            r#"{"success":true,"data":{"webdownload_id":42}}"#
+        } else if path.contains("webdl/mylist") {
+            r#"{"success":true,"data":{"download_state":"cached","files":[{"id":3,"name":"file.bin","size":123}]}}"#
+        } else if path.contains("requestdl") {
+            r#"{"success":true,"data":"https://cdn.example.test/file.bin"}"#
+        } else if path.contains("addMagnet") || path.contains("addTorrent") {
+            r#"{"id":"rd123"}"#
+        } else if path.contains("createtorrent") {
+            r#"{"success":true,"data":{"torrent_id":71}}"#
+        } else {
+            r#"{"success":true}"#
+        }
+    }
 
     /// A local provider fixture: records the raw requests and answers
     /// with canned provider payloads. No provider account is contacted.
@@ -599,16 +1225,32 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        let (api, requests, task) = mock_serving(provider, 0).await;
+        (api, requests, task)
+    }
+
+    /// The same fixture, but it answers `429 Too Many Requests` for the
+    /// first `limits` requests before serving normally.
+    async fn mock_serving(
+        provider: Provider,
+        limits: usize,
+    ) -> (
+        Api,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = requests.clone();
+        let limits = std::sync::Arc::new(std::sync::Mutex::new(limits));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 let record = record.clone();
+                let limits = limits.clone();
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
                     let mut b = [0; 1];
@@ -640,21 +1282,27 @@ mod tests {
                     let text = String::from_utf8_lossy(&bytes).into_owned();
                     record.lock().unwrap().push(text.clone());
                     let path = headers.lines().next().unwrap_or("");
-                    let payload = if path.contains("unrestrict/link") {
-                        r#"{"download":"https://cdn.example.test/file.bin","filename":"file.bin"}"#
-                    } else if path.contains("createwebdownload") {
-                        r#"{"success":true,"data":{"webdownload_id":42}}"#
-                    } else if path.contains("webdl/mylist") {
-                        r#"{"success":true,"data":{"download_state":"cached","files":[{"id":3,"name":"file.bin","size":123}]}}"#
-                    } else if path.contains("requestdl") {
-                        r#"{"success":true,"data":"https://cdn.example.test/file.bin"}"#
-                    } else if path.contains("addMagnet") || path.contains("addTorrent") {
-                        r#"{"id":"rd123"}"#
-                    } else if path.contains("createtorrent") {
-                        r#"{"success":true,"data":{"torrent_id":71}}"#
-                    } else {
-                        r#"{"success":true}"#
+                    let limited = {
+                        let mut remaining = limits.lock().unwrap();
+                        if *remaining > 0 {
+                            *remaining -= 1;
+                            true
+                        } else {
+                            false
+                        }
                     };
+                    if limited {
+                        let reply = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                        return;
+                    }
+                    // Real-Debrid answers a delete with 204 and no body.
+                    if headers.lines().next().unwrap_or("").starts_with("DELETE ") {
+                        let reply = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                        return;
+                    }
+                    let payload = mock_payload(path);
                     let reply=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",payload.len(),payload);
                     let _ = socket.write_all(reply.as_bytes()).await;
                 });
@@ -767,5 +1415,404 @@ mod tests {
             let l = parse_listing(Provider::TorBox, &serde_json::json!({"data":data})).unwrap();
             assert_eq!(l.files[0].bytes, 42);
         }
+    }
+
+    // ---- Phase B ------------------------------------------------------
+
+    #[test]
+    fn submitted_magnets_and_hosting_links_are_trimmed() {
+        let api = Api::new(Provider::RealDebrid, "private-api-token".into()).unwrap();
+        // A magnet with surrounding whitespace still parses, and the
+        // trimmed value is what goes to the provider.
+        let magnet = "  magnet:?xt=urn:btih:0123456789abcdef \n";
+        assert!(url::Url::parse(magnet.trim()).is_ok());
+        assert_eq!(magnet.trim(), "magnet:?xt=urn:btih:0123456789abcdef");
+        // A hosting link keeps its MEGA fragment, minus the whitespace.
+        let link = "  https://mega.nz/file/abc#decryption-key  ";
+        let parsed = url::Url::parse(link.trim()).unwrap();
+        assert_eq!(parsed.fragment(), Some("decryption-key"));
+        assert_eq!(api.provider, Provider::RealDebrid);
+    }
+
+    #[tokio::test]
+    async fn submitted_values_reach_the_provider_without_whitespace() {
+        let (api, requests, task) = mock(Provider::RealDebrid).await;
+        api.add("  magnet:?xt=urn:btih:0123456789abcdef  ")
+            .await
+            .unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        // The body is exactly the trimmed magnet: no padding, no stray
+        // space, no second field.
+        let body = request.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        assert_eq!(
+            body,
+            "magnet=magnet%3A%3Fxt%3Durn%3Abtih%3A0123456789abcdef"
+        );
+        task.abort();
+    }
+
+    #[test]
+    fn cache_states_cover_cached_uncached_partial_and_unknown() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        // Real-Debrid: the hash is listed with files -> cached.
+        let rd = serde_json::json!({
+            hash: {"rd": [{"1": {"filename": "a.mkv", "filesize": 10}, "2": {"filename": "b.mkv", "filesize": 20}}]}
+        });
+        let status = parse_cache(Provider::RealDebrid, hash, &rd, Some(2));
+        assert_eq!(status.state, CacheState::Cached);
+        assert_eq!(status.files.len(), 2);
+        assert_eq!(status.bytes, 30);
+        // Fewer files than expected -> only partly cached.
+        let status = parse_cache(Provider::RealDebrid, hash, &rd, Some(5));
+        assert_eq!(status.state, CacheState::Partial);
+        // The hash is not in the answer -> not cached.
+        let empty = serde_json::json!({});
+        let status = parse_cache(Provider::RealDebrid, hash, &empty, None);
+        assert_eq!(status.state, CacheState::Uncached);
+        // TorBox says so itself.
+        let tb = serde_json::json!({"data": {"cached": true, "files": [{"id": 1, "name": "a", "size": 5}]}});
+        let status = parse_cache(Provider::TorBox, hash, &tb, Some(1));
+        assert_eq!(status.state, CacheState::Cached);
+        let tb = serde_json::json!({"data": {"cached": false, "files": [{"id": 1, "name": "a", "size": 5}]}});
+        let status = parse_cache(Provider::TorBox, hash, &tb, None);
+        assert_eq!(status.state, CacheState::Partial);
+        let tb = serde_json::json!({"data": {"cached": false, "files": []}});
+        let status = parse_cache(Provider::TorBox, hash, &tb, None);
+        assert_eq!(status.state, CacheState::Uncached);
+        // A provider that does not answer the question is unknown, which is
+        // not the same as "not cached".
+        let silent = serde_json::json!({hash: {"other": []}});
+        let status = parse_cache(Provider::RealDebrid, hash, &silent, None);
+        assert_eq!(status.state, CacheState::Unknown);
+        let silent = serde_json::json!({"data": {}});
+        let status = parse_cache(Provider::TorBox, hash, &silent, None);
+        assert_eq!(status.state, CacheState::Unknown);
+        assert_eq!(status.state.label(), "unknown");
+        assert_eq!(CacheState::Unknown.label(), "unknown");
+        assert_eq!(CacheState::Partial.label(), "partial");
+    }
+
+    #[tokio::test]
+    async fn cache_checks_use_the_documented_provider_endpoints() {
+        for provider in [Provider::RealDebrid, Provider::TorBox] {
+            let (api, requests, task) = mock(provider).await;
+            let hash = "0123456789abcdef0123456789abcdef01234567";
+            // The mock answers a generic success payload, so the state is
+            // unknown, but the endpoint must be the provider's own.
+            let status = api.cache_status(hash, None).await.unwrap();
+            assert!(matches!(
+                status.state,
+                CacheState::Unknown | CacheState::Uncached | CacheState::Cached
+            ));
+            let request = requests.lock().unwrap()[0].clone();
+            match provider {
+                Provider::RealDebrid => assert!(
+                    request.starts_with("GET /torrents/instantAvailability/0123456789abcdef"),
+                    "wrong endpoint: {request}"
+                ),
+                Provider::TorBox => {
+                    assert!(request.starts_with("GET /torrents/checkcached?"), "wrong: {request}");
+                    assert!(request.contains("hash=0123456789abcdef"));
+                    assert!(request.contains("list_files=true"));
+                }
+            }
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_checks_refuse_a_hash_that_is_not_hex() {
+        let (api, _requests, task) = mock(Provider::RealDebrid).await;
+        // A hash with a path separator must never reach the request path.
+        let err = api
+            .cache_status("../../../torrents/delete/1", None)
+            .await
+            .expect_err("a non-hex hash must be refused");
+        assert!(err.to_string().contains("info hash"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn jobs_can_be_deleted_at_the_provider() {
+        let (api, requests, task) = mock(Provider::RealDebrid).await;
+        let job = CloudJob {
+            provider: Provider::RealDebrid,
+            id: "rd123".into(),
+            kind: Kind::Torrent,
+        };
+        api.delete_job(&job).await.unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("DELETE /torrents/delete/rd123 "),
+            "wrong endpoint: {request}"
+        );
+        task.abort();
+        let (api, requests, task) = mock(Provider::TorBox).await;
+        let job = CloudJob {
+            provider: Provider::TorBox,
+            id: "71".into(),
+            kind: Kind::Torrent,
+        };
+        api.delete_job(&job).await.unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /torrents/controltorrent "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("\"operation\":\"delete\""));
+        assert!(request.contains("\"torrent_id\":71"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn hosting_jobs_use_their_own_control_endpoint() {
+        let (api, requests, task) = mock(Provider::TorBox).await;
+        let job = CloudJob {
+            provider: Provider::TorBox,
+            id: "42".into(),
+            kind: Kind::Hosting,
+        };
+        api.delete_job(&job).await.unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /webdl/controlwebdownload "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("\"webdl_id\":42"));
+        task.abort();
+        // Real-Debrid resolves hosting links directly: there is no job.
+        let (api, _requests, task) = mock(Provider::RealDebrid).await;
+        let job = CloudJob {
+            provider: Provider::RealDebrid,
+            id: "rd123".into(),
+            kind: Kind::Hosting,
+        };
+        assert!(api.delete_job(&job).await.is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rate_limited_requests_are_retried_with_a_backoff() {
+        let (mut api, requests, task) = mock_serving(Provider::RealDebrid, 2).await;
+        api.backoff = Duration::from_millis(1);
+        let job = CloudJob {
+            provider: Provider::RealDebrid,
+            id: "rd123".into(),
+            kind: Kind::Torrent,
+        };
+        // Two rate-limited answers, then the real one: the call succeeds.
+        api.list(&job).await.expect("the request must be retried");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "expected two retries");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rate_limited_requests_give_up_after_a_bounded_number_of_retries() {
+        let (mut api, requests, task) = mock_serving(Provider::RealDebrid, 99).await;
+        api.backoff = Duration::from_millis(1);
+        let job = CloudJob {
+            provider: Provider::RealDebrid,
+            id: "rd123".into(),
+            kind: Kind::Torrent,
+        };
+        let err = api.list(&job).await.expect_err("the retries must be bounded");
+        assert!(err.to_string().contains("429"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4, "one attempt plus three retries");
+        task.abort();
+    }
+
+    #[test]
+    fn provider_errors_carry_their_own_code() {
+        let api = Api::new(Provider::RealDebrid, "private-api-token".into()).unwrap();
+        let rd = serde_json::json!({"error": "bad token", "error_code": 8});
+        let err = api.provider_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            Some(&rd),
+        );
+        assert_eq!(err.code.as_deref(), Some("8"));
+        let text = err.to_string();
+        assert!(text.contains("Real-Debrid"));
+        assert!(text.contains("8"));
+        assert!(text.contains("bad token"));
+        // The documented meaning is spelled out for the user.
+        assert_eq!(realdebrid_error_text("34"), Some("too many requests"));
+        assert_eq!(realdebrid_error_text("16"), Some("unsupported hoster"));
+        assert_eq!(realdebrid_error_text("999"), None);
+    }
+
+    #[test]
+    fn the_backoff_honours_retry_after_but_stays_bounded() {
+        let api = Api::new(Provider::RealDebrid, "private-api-token".into()).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        // A provider that says when to come back wins...
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("5"),
+        );
+        assert_eq!(api.backoff_for(0, &headers), Duration::from_secs(5));
+        // ...but only up to the cap: a broken header must not stall the app.
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("3600"),
+        );
+        assert_eq!(api.backoff_for(0, &headers), RATE_BACKOFF_MAX);
+        // Without a header the wait grows with every attempt.
+        let empty = reqwest::header::HeaderMap::new();
+        assert_eq!(api.backoff_for(0, &empty), Duration::from_millis(500));
+        assert_eq!(api.backoff_for(1, &empty), Duration::from_millis(1000));
+        assert_eq!(api.backoff_for(2, &empty), Duration::from_millis(2000));
+    }
+
+    #[tokio::test]
+    async fn provider_failures_report_the_provider_code() {
+        // A provider that answers with its own error body.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut bytes = Vec::new();
+                    let mut b = [0; 1];
+                    while bytes.len() < 65536 {
+                        if socket.read_exact(&mut b).await.is_err() {
+                            return;
+                        }
+                        bytes.push(b[0]);
+                        if bytes.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let payload = r#"{"error":"bad token","error_code":8}"#;
+                    let reply = format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let mut api = Api::new(Provider::RealDebrid, "private-api-token".into()).unwrap();
+        api.test_base = Some(base);
+        let job = CloudJob {
+            provider: Provider::RealDebrid,
+            id: "rd123".into(),
+            kind: Kind::Torrent,
+        };
+        let err = api.list(&job).await.expect_err("the refusal must surface");
+        assert_eq!(provider_code(&err), Some("8"));
+        assert!(err.to_string().contains("bad token"));
+        task.abort();
+    }
+
+    #[test]
+    fn cloud_status_is_normalized_across_providers() {
+        assert_eq!(
+            normalize_status(Provider::RealDebrid, "downloaded"),
+            CloudStatus::Ready
+        );
+        assert_eq!(
+            normalize_status(Provider::RealDebrid, "waiting_files_selection"),
+            CloudStatus::Partial
+        );
+        assert_eq!(
+            normalize_status(Provider::RealDebrid, "downloading"),
+            CloudStatus::Downloading
+        );
+        assert_eq!(
+            normalize_status(Provider::RealDebrid, "magnet_error"),
+            CloudStatus::Failed
+        );
+        assert_eq!(
+            normalize_status(Provider::TorBox, "cached"),
+            CloudStatus::Ready
+        );
+        assert_eq!(
+            normalize_status(Provider::TorBox, "downloading"),
+            CloudStatus::Downloading
+        );
+        assert_eq!(
+            normalize_status(Provider::TorBox, "timed_out"),
+            CloudStatus::Failed
+        );
+        assert_eq!(
+            normalize_status(Provider::TorBox, "something new"),
+            CloudStatus::Unknown
+        );
+        assert_eq!(CloudStatus::Ready.label(), "ready");
+    }
+
+    #[tokio::test]
+    async fn a_status_refresh_bypasses_the_provider_cache() {
+        let (api, requests, task) = mock(Provider::TorBox).await;
+        let job = CloudJob {
+            provider: Provider::TorBox,
+            id: "71".into(),
+            kind: Kind::Torrent,
+        };
+        api.list(&job).await.unwrap();
+        api.list_fresh(&job).await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].starts_with("GET /torrents/mylist?id=71 "));
+        assert!(!requests[0].contains("bypass_cache"));
+        assert!(requests[1].contains("bypass_cache=true"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_links_carry_their_lifetime_and_can_be_refreshed() {
+        let (api, requests, task) = mock(Provider::TorBox).await;
+        let job = CloudJob {
+            provider: Provider::TorBox,
+            id: "71".into(),
+            kind: Kind::Torrent,
+        };
+        let file = CloudFile {
+            id: 3,
+            name: "file.bin".into(),
+            bytes: 123,
+            selected: true,
+            link: String::new(),
+        };
+        let link = api.link_info(&job, &file).await.unwrap();
+        assert_eq!(link.url, "https://cdn.example.test/file.bin");
+        assert!(!link.url.contains("private-api-token"));
+        // The provider stated no expiry: the TorBox default applies.
+        assert!(!link.expiry_known());
+        assert_eq!(link.lifetime_s, TORBOX_LINK_LIFETIME_S);
+        assert!(!link.is_expired(link.generated_at));
+        assert!(link.needs_refresh(link.generated_at + TORBOX_LINK_LIFETIME_S));
+        // A refresh asks the provider again; the old address is never
+        // reused.
+        let refreshed = api.refresh_link(&job, &file).await.unwrap();
+        assert_eq!(refreshed.url, link.url);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "the refresh must call the provider");
+        assert!(requests[1].contains("requestdl"));
+        task.abort();
+    }
+
+    #[test]
+    fn a_provider_stated_expiry_wins_over_the_default_lifetime() {
+        let now = 1_700_000_000u64;
+        let value = serde_json::json!({"download": "https://cdn.example.test/f", "expires": now + 60});
+        let expiry = link_expiry(&value).unwrap();
+        assert_eq!(expiry, now + 60);
+        let link = DirectLink {
+            url: "https://cdn.example.test/f".into(),
+            connections: None,
+            expires_at: Some(expiry),
+            generated_at: now,
+            lifetime_s: REALDEBRID_LINK_LIFETIME_S,
+        };
+        assert!(link.expiry_known());
+        assert!(!link.is_expired(now + 59));
+        assert!(link.is_expired(now + 60));
+        assert_eq!(link.expires_in(now + 30), 30);
+        // A relative expiry is read as seconds from now.
+        let value = serde_json::json!({"expires_in": 120});
+        assert!(link_expiry(&value).unwrap() >= now + 119);
     }
 }
