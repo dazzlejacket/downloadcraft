@@ -1,0 +1,1 @@
+PASS: supplied ZIP and all eight reference reports retain their original SHA-256 hashes. No reference payloads were copied into the repository.

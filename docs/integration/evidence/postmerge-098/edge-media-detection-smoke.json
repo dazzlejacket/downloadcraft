@@ -1,0 +1,127 @@
+{
+  "browser": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "output": "C:\\Users\\grego\\Documents\\Codex Projects\\DownloadCraft\\integration-098\\dist\\phase3-edge-smoke-1792873097031882100",
+  "sampleProbe": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_type": "video"
+      },
+      {
+        "codec_type": "audio"
+      }
+    ]
+  },
+  "scope": "isolated native extension detection; native messaging disabled",
+  "observation": {
+    "items": [
+      {
+        "url": "http://127.0.0.1:51910/sample.mp4",
+        "mime": "video/mp4",
+        "size": 37430,
+        "kind": "file",
+        "pageUrl": null,
+        "frameId": 0,
+        "documentId": "B89B261572C5532DDF3F40E0D6445C8E",
+        "seenAt": 1792873099794,
+        "tabs": 1
+      },
+      {
+        "url": "http://127.0.0.1:51910/sample.wav",
+        "mime": "audio/wav",
+        "size": 176478,
+        "kind": "file",
+        "pageUrl": null,
+        "frameId": 0,
+        "documentId": "B89B261572C5532DDF3F40E0D6445C8E",
+        "seenAt": 1792873099807,
+        "tabs": 1
+      },
+      {
+        "url": "http://127.0.0.1:51910/sample.m3u8?token=exact",
+        "mime": "application/vnd.apple.mpegurl",
+        "size": 117,
+        "kind": "playlist",
+        "pageUrl": null,
+        "frameId": 0,
+        "documentId": "B89B261572C5532DDF3F40E0D6445C8E",
+        "seenAt": 1792873099838,
+        "master": false,
+        "children": [
+          "http://127.0.0.1:51910/sample0.ts"
+        ],
+        "tabs": 1
+      },
+      {
+        "url": "http://127.0.0.1:51910/sample.mpd",
+        "mime": "application/dash+xml",
+        "size": 1879,
+        "kind": "playlist",
+        "pageUrl": null,
+        "frameId": 0,
+        "documentId": "B89B261572C5532DDF3F40E0D6445C8E",
+        "seenAt": 1792873099838,
+        "master": true,
+        "children": [],
+        "tabs": 1
+      },
+      {
+        "url": "http://localhost:51910/sample.mp4?frame=embedded",
+        "mime": "video/mp4",
+        "size": 37430,
+        "kind": "file",
+        "pageUrl": null,
+        "frameId": 8,
+        "documentId": "60CBB3A8A7BBB599D1F334E94723154C",
+        "seenAt": 1792873099834,
+        "tabs": 1
+      }
+    ],
+    "frames": [
+      {
+        "frameId": 0,
+        "labels": [
+          "Download this video",
+          "Download audio from this page"
+        ]
+      },
+      {
+        "frameId": 8,
+        "labels": [
+          "Download this video"
+        ]
+      }
+    ],
+    "dynamicKey": "http://127.0.0.1:51910/index.html|http://127.0.0.1:51910/sample.wav?revision=2"
+  },
+  "checks": {
+    "directVideo": true,
+    "audio": true,
+    "embeddedVideo": true,
+    "hls": true,
+    "dash": true,
+    "falsePositivesExcluded": true,
+    "audioControl": true,
+    "videoControl": true,
+    "dynamicAudioControl": true
+  },
+  "passed": true,
+  "fixtureRequests": [
+    "/index.html",
+    "/frame.html",
+    "/requests.js",
+    "/sample.mp4",
+    "/sample.wav",
+    "/sample.m3u8?token=exact",
+    "/sample.mpd",
+    "/binary",
+    "/fake.mp4",
+    "/denied.mp4",
+    "/sample.mp4?frame=embedded",
+    "/sample.m3u8?token=exact",
+    "/sample.mpd",
+    "/favicon.ico",
+    "/sample.wav?revision=2"
+  ]
+}

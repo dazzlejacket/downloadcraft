@@ -1,0 +1,34 @@
+{
+  "browser": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "output": "C:\\Users\\grego\\Documents\\Codex Projects\\DownloadCraft\\upstream-baseline\\dist\\phase3-edge-smoke-1792711985005942700",
+  "sampleProbe": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_type": "video"
+      },
+      {
+        "codec_type": "audio"
+      }
+    ]
+  },
+  "scope": "isolated native extension detection; native messaging disabled",
+  "observation": {
+    "error": "Headless browser did not run the unpacked test extension"
+  },
+  "checks": {
+    "directVideo": false,
+    "audio": false,
+    "embeddedVideo": false,
+    "hls": false,
+    "dash": false,
+    "falsePositivesExcluded": false,
+    "audioControl": false,
+    "videoControl": false
+  },
+  "passed": false,
+  "fixtureRequests": [
+    "/index.html"
+  ]
+}

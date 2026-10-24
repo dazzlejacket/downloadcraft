@@ -7,15 +7,361 @@
 
   // Playlist manifests the engine assembles itself (offer these, not parts).
   function isPlaylistUrl(u) {
-    return /(\.m3u8|\.mpd)(\?|#|$)/i.test(String(u || "").split("?")[0])
-      || /m3u8|mpegurl|dash/i.test(String(u || ""));
+    try {
+      const x = new URL(String(u || ""));
+      if (/\.(m3u8|mpd)$/i.test(x.pathname)) return true;
+      return [...x.searchParams.values()].some(v => /^(?:m3u8|mpd|application\/(?:dash\+xml|(?:vnd\.apple\.)?mpegurl|x-mpegurl))$/i.test(v));
+    } catch (e) { return false; }
+  }
+
+  // Vimeo's signed range endpoints can end in .mp4 but contain only a
+  // playback fragment. Never rewrite their signed paths/query strings.
+  function isVimeoFragment(u) {
+    try {
+      const x = new URL(String(u || ""));
+      return (x.hostname === "vimeocdn.com" || x.hostname.endsWith(".vimeocdn.com"))
+        && (/\/v2\/range\//i.test(x.pathname) || /^\d+-\d+$/.test(x.searchParams.get("range") || ""));
+    } catch (e) { return false; }
+  }
+
+  // ---- Google Drive ----
+  // A public Drive file is served through
+  //   https://drive.google.com/uc?export=download&id=<FILE_ID>
+  // Files big enough for the virus scan answer that URL with an HTML
+  // interstitial; the real bytes then live at
+  //   https://drive.usercontent.google.com/download?id=<ID>&export=download&confirm=<TOKEN>
+  // The confirm token is per-session and can only be obtained by loading the
+  // interstitial, so it is never invented here. The file id is the only
+  // stable identity.
+  const DRIVE_HOSTS = ["drive.google.com", "drive.usercontent.google.com", "docs.google.com"];
+  function isDriveUrl(u) {
+    try {
+      const h = new URL(String(u || "")).hostname.toLowerCase();
+      return DRIVE_HOSTS.indexOf(h) >= 0;
+    } catch (e) { return false; }
+  }
+  // The stable file id (never the per-session confirm/uuid token).
+  function driveFileId(u) {
+    try {
+      const x = new URL(String(u || ""));
+      if (DRIVE_HOSTS.indexOf(x.hostname.toLowerCase()) < 0) return null;
+      const id = x.searchParams.get("id");
+      if (id) return id;
+      const m = x.pathname.match(/\/(?:file|document|d|u)\/d\/([^/]+)/) || x.pathname.match(/\/d\/([^/]+)/);
+      return (m && m[1]) ? m[1] : null;
+    } catch (e) { return null; }
+  }
+  // id + the session uuid a page may carry next to it. The uuid is NOT a
+  // file identity: it changes per download session.
+  function driveIdentity(u) {
+    try {
+      const x = new URL(String(u || ""));
+      if (DRIVE_HOSTS.indexOf(x.hostname.toLowerCase()) < 0) return null;
+      return { id: driveFileId(u), uuid: x.searchParams.get("uuid") || null };
+    } catch (e) { return null; }
+  }
+  // Canonical public download form. Never adds a confirm token.
+  function normalizeDriveUrl(u) {
+    const raw = String(u || "");
+    if (!isDriveUrl(raw)) return raw;
+    try {
+      const x = new URL(raw);
+      const host = x.hostname.toLowerCase();
+      const id = driveFileId(raw);
+      const isUc = host === "drive.google.com" && /^\/uc\/?$/.test(x.pathname);
+      const isFile = host === "drive.google.com" && /^\/file\/d\/[^/]+/.test(x.pathname);
+      if (!isUc && !isFile) return raw; // usercontent bytes keep their signed form
+      const out = new URLSearchParams();
+      out.set("export", "download");
+      if (id) out.set("id", id);
+      // Keep everything else (resourcekey, uuid, ...): dropping them would
+      // break access to files that need them.
+      for (const [k, v] of x.searchParams) {
+        if (k !== "export" && k !== "id") out.append(k, v);
+      }
+      return "https://drive.google.com/uc?" + out.toString();
+    } catch (e) { return raw; }
+  }
+
+  // Response evidence, not a URL substring or an arbitrary binary payload.
+  // This observer never cancels requests; takeover has its own controller.
+  function mediaResponse(details, minSizeKB = 100) {
+    if (!details || !/^https?:\/\//i.test(details.url || "")
+        || !["media", "xmlhttprequest", "other", "main_frame", "sub_frame", "object"].includes(details.type)
+        || details.statusCode < 200 || details.statusCode >= 300
+        || !Number.isFinite(details.statusCode)
+        || (details.method && details.method !== "GET")) return null;
+    const headers = new Map((details.responseHeaders || []).map(h =>
+      [String(h.name || "").toLowerCase(), String(h.value || "")]));
+    const mime = (headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    const manifestMime = /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/(?:x-)?mpegurl)$/i.test(mime);
+    // Drive's download endpoint answers with the virus-scan interstitial
+    // (HTML) until the browser confirms the file. That page is not a media
+    // response and must never be offered as a downloadable stream.
+    if (isDriveUrl(details.url) && /text\/html/i.test(mime)) return null;
+    const playlist = isPlaylistUrl(details.url) || manifestMime;
+    let parsed;
+    try { parsed = new URL(details.url); } catch (e) { return null; }
+    if(parsed.username || parsed.password)return null;
+    const mediaPath = /\.(?:mp4|webm|mkv|mov|avi|m4v|mp3|m4a|aac|flac|ogg|opus|wav|m4s|ts|cmfv|cmfa)$/i.test(parsed.pathname);
+    const strongMime = /^(?:video|audio)\//i.test(mime) || mime === "application/mp4" || manifestMime;
+    const neutralMime = !mime || mime === "application/octet-stream" || (playlist && mime === "text/plain");
+    // Bandcamp's own stream names its format in the path and answers with a
+    // neutral MIME, so the path is the evidence there.
+    const bandcamp = isBandcampStream(details.url);
+    if (!strongMime && !(neutralMime && (playlist || mediaPath || bandcamp))) return null;
+    // Explicit HTML/JSON/image errors win over a misleading .mp4 filename.
+    const number = text => /^\d+$/.test(text || "") && Number.isSafeInteger(Number(text)) ? Number(text) : 0;
+    let size = number(headers.get("content-length"));
+    const range = /^bytes\s+\d+-\d+\/(\d+)$/i.exec((headers.get("content-range") || "").trim());
+    if (details.statusCode === 206 && range) size = number(range[1]);
+    const kind = playlist ? "playlist" : isSegmentUrl(details.url) ? "segment" : "file";
+    const threshold = Number(minSizeKB);
+    const minBytes = (Number.isFinite(threshold) && threshold >= 0 ? threshold : 100) * 1024;
+    if (kind === "file" && size > 0 && size < minBytes) return null;
+    // A Bandcamp stream answers with a neutral MIME; its path names the
+    // format, so the file is what it says it is.
+    let outMime = mime;
+    if (bandcamp && !/^audio\//i.test(outMime)) {
+      const fmt = bandcampFormat(details.url);
+      const bm = fmt === "mp3" ? "audio/mpeg" : fmt ? "audio/" + fmt : "";
+      if (bm) outMime = bm;
+    }
+    return {url:details.url, mime: outMime, size, kind};
+  }
+
+  // Manifests and adaptive MP4 legs must resolve together with audio.
+  function isVimeoAdaptive(u) {
+    try {
+      const x = new URL(String(u || ""));
+      const cdn = x.hostname === "vimeocdn.com" || x.hostname.endsWith(".vimeocdn.com");
+      return cdn && (isVimeoFragment(u) || isPlaylistUrl(u) || /^vod-adaptive[.-]/i.test(x.hostname));
+    } catch (e) { return false; }
+  }
+
+  function vimeoVideoPage(u) {
+    try {
+      const x = new URL(String(u || ""));
+      if (!/^https?:$/.test(x.protocol)) return null;
+      const player = x.hostname === "player.vimeo.com" && /^\/video\/\d+\/?$/.test(x.pathname);
+      const watch = (x.hostname === "vimeo.com" || x.hostname === "www.vimeo.com")
+        && /^\/\d+(?:\/[a-zA-Z0-9]+)?\/?$/.test(x.pathname);
+      return player || watch ? x.href : null;
+    } catch (e) { return null; }
   }
 
   // Stream parts that only make sense inside a playlist assembly.
   function isSegmentUrl(u) {
-    const base = String(u || "").split("?")[0];
-    return /(\.ts|\.m4s|\.cmfv|\.cmfa|\.mpd\.seg)(\?|#|$)/i.test(base)
-      || /\/chunklist|\/seg-|sequence/i.test(base);
+    try {
+      const x = new URL(String(u || ""));
+      const base = x.pathname;
+      const leaf = base.split("/").pop() || "";
+      const range = x.searchParams.get("range") || "";
+      const byteSlice = x.searchParams.has("bytestart") || x.searchParams.has("byteend");
+      const media = /\.(?:mp4|m4a|webm|mp3|aac|ts)$/i.test(base);
+      return isVimeoFragment(u) || (media && (/^\d+-\d+$/.test(range) || byteSlice))
+        || /\.(m4s|cmfv|cmfa|mpd\.seg)$/i.test(base)
+        || /^(?:(?:seg(?:ment)?|chunk|fragment|s|filesequence|sequence)[-_]?\d+|\d+)(?:[^/]*)\.ts$/i.test(leaf);
+    } catch (e) { return false; }
+  }
+
+  // Match the requesting frame, never another player's unrelated playlist.
+  function samePlayer(a, b) {
+    if (a.tabId !== undefined && b.tabId !== undefined && a.tabId !== b.tabId) return false;
+    if (a.frameId !== undefined && b.frameId !== undefined && a.frameId !== b.frameId) return false;
+    if (a.documentId && b.documentId && a.documentId !== b.documentId) return false;
+    if (a.pageUrl && b.pageUrl && a.pageUrl !== b.pageUrl) return false;
+    return (a.frameId !== undefined && b.frameId !== undefined)
+      || !!(a.pageUrl && b.pageUrl && a.pageUrl === b.pageUrl);
+  }
+
+  // ---- Manifest/segment URL sanitisation (HS-06) ------------------------
+  // A manifest is untrusted input: the page that served it decides which
+  // URLs the downloader will fetch. Every manifest-derived URL is validated
+  // here before it can reach the queue, the native host or a muxing tool.
+  //
+  // Policy:
+  //  - only http/https survive (file:, data:, blob:, javascript:, ftp: die);
+  //  - control characters (NUL, CR/LF, ESC, DEL) and raw spaces are refused;
+  //  - backslashes are refused — the URL parser folds them into "/", so
+  //    "\\host\x" silently becomes an authority and "..\..\" traverses;
+  //  - percent-encoded separators and dot-dot in the PATH are refused (a
+  //    server that decodes before routing would still see the traversal);
+  //  - a relative reference may climb to the origin root, never above it;
+  //  - credentials in the URL are refused;
+  //  - the result is the resolved absolute URL, so signed query strings
+  //    survive byte-for-byte.
+  const MAX_MANIFEST_BYTES = 1024 * 1024;
+  const MAX_MANIFEST_REFS = 512;
+  const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+  // Encoded dot-dot (%2e%2e, .%2e, %2e.) and encoded separators (%2f, %5c).
+  const ENCODED_DOTDOT = /(?:%2e%2e|%2e\.|\.%2e)/i;
+  const ENCODED_SEPARATOR = /%(?:2f|5c)/i;
+  const ABSOLUTE_REF = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+
+  function decodeOnce(s) {
+    try { return decodeURIComponent(s); } catch (e) { return s; }
+  }
+
+  // How many ".." levels a relative reference may climb. The base
+  // manifest's own directory plus the origin root is the ceiling; deeper
+  // is an escape attempt rather than a relative path.
+  function baseClimbLimit(baseUrl) {
+    const parts = baseUrl.pathname.split("/").filter(Boolean);
+    // The last segment is the manifest file, not a directory.
+    return Math.max(0, parts.length - 1) + 1;
+  }
+
+  // Resolve one manifest-derived reference against the manifest URL.
+  // Returns the absolute URL, or null when the reference is unsafe.
+  function manifestUrl(raw, base) {
+    if (typeof raw !== "string") return null;
+    const ref = raw.trim();
+    if (!ref) return null;
+    if (CONTROL_CHARS.test(ref)) return null;
+    if (ref.includes(" ") || ref.includes("\\")) return null;
+    let baseUrl;
+    try { baseUrl = new URL(String(base || "")); } catch (e) { return null; }
+    if (!/^https?:$/.test(baseUrl.protocol)) return null;
+    // Traversal risk lives in the path only: signed query strings
+    // legitimately carry %2F and %2E.
+    let pathPart;
+    if (ABSOLUTE_REF.test(ref)) {
+      let abs;
+      try { abs = new URL(ref); } catch (e) { return null; }
+      pathPart = abs.pathname;
+    } else {
+      const cut = ref.search(/[?#]/);
+      pathPart = cut >= 0 ? ref.slice(0, cut) : ref;
+      let climbs = 0;
+      for (const seg of pathPart.split("/")) if (seg === "..") climbs++;
+      if (climbs > baseClimbLimit(baseUrl)) return null;
+    }
+    if (ENCODED_DOTDOT.test(pathPart) || ENCODED_SEPARATOR.test(pathPart)) return null;
+    let u;
+    try { u = new URL(ref, baseUrl); } catch (e) { return null; }
+    if (!/^https?:$/.test(u.protocol)) return null;
+    if (u.username || u.password) return null;
+    if (!u.hostname) return null;
+    // The resolved path is checked while decoding: a double-encoded
+    // traversal (%252e%252e) only shows up then.
+    let decoded = u.pathname;
+    for (let i = 0; i < 3; i++) {
+      if (CONTROL_CHARS.test(decoded) || decoded.includes("\\")) return null;
+      if (decoded.split("/").some(seg => seg === "..")) return null;
+      const next = decodeOnce(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    }
+    return u.href;
+  }
+
+  function manifestBytes(text) {
+    // UTF-8 needs at most 4 bytes per code unit, so a short manifest can
+    // never reach the cap and never needs to be encoded.
+    if (text.length * 4 <= MAX_MANIFEST_BYTES) return text.length;
+    if (typeof TextEncoder === "undefined") return text.length;
+    return new TextEncoder().encode(text).length;
+  }
+
+  function playlistReferences(text, base) {
+    const src = String(text || "");
+    if (!/^\s*#EXTM3U(?:\s|$)/.test(src)) return [];
+    if (src.length > MAX_MANIFEST_BYTES || manifestBytes(src) > MAX_MANIFEST_BYTES) return [];
+    const refs = [];
+    for (const line of src.split(/\r?\n/)) {
+      const t = line.trim();
+      const raw = t && !t.startsWith("#") ? [t]
+        : /^#EXT-X-(?:MEDIA|I-FRAME-STREAM-INF|MAP):/.test(t)
+          ? [...t.matchAll(/(?:^|[,:])URI="([^"]+)"/g)].map(m => m[1]) : [];
+      for (const r of raw) {
+        const u = manifestUrl(r, base);
+        if (u && !refs.includes(u)) refs.push(u);
+        if(refs.length>=MAX_MANIFEST_REFS)return refs;
+      }
+    }
+    return refs;
+  }
+
+  function completePlaylist(entry, items) {
+    const pool = (items || []).filter(m => m && kindOf(m) === "playlist" && samePlayer(entry, m));
+    const reaches = (node, target, seen = new Set()) => {
+      if (seen.has(node.url)) return false;
+      seen.add(node.url);
+      return (node.children || []).some(u => u === target
+        || pool.some(child => child.url === u && reaches(child, target, seen)));
+    };
+    const linked = pool.filter(m => m.url !== entry.url && reaches(m, entry.url));
+    // Only an explicit manifest-reference path proves this association.
+    // Prefer its unique outer root; two players may share a CDN directory
+    // or a segment URL, even in the same frame.
+    const roots=linked.filter(node=>!linked.some(parent=>parent!==node && reaches(parent,node.url)));
+    if(roots.length===1)return roots[0];
+    return kindOf(entry) === "playlist" ? entry : null;
+  }
+
+
+  function playerEvidence(videos, url, mime, pageUrl, suppliedDuration) {
+    const isVideo = !/^audio\//i.test(String(mime || "")) && (String(url) === String(pageUrl) || /^blob:/i.test(String(url))
+      || /^video\//i.test(String(mime || "")) || isPlaylistUrl(url)
+      || /\.(?:mp4|webm|mkv|mov|m4v|avi|ts|m4s|cmfv)(?:[?#]|$)/i.test(String(url)));
+    const list = isVideo ? [...(videos || [])] : [];
+    const matches = list.filter(v => v.currentSrc === url || v.src === url);
+    const player = matches.length === 1 ? matches[0] : list.length === 1 ? list[0] : null;
+    let d = Number(suppliedDuration);
+    if (!(d > 0) && player) d = player.duration;
+    return {
+      dur: Number.isFinite(d) && d > 0 && d < 86400 ? Math.max(1, Math.round(d)) : null,
+      audioExpected: !!(player && (player.mozHasAudio === true || Number(player.webkitAudioDecodedByteCount) > 0
+        || (player.audioTracks && player.audioTracks.length > 0))),
+    };
+  }
+
+  function hideDownloadUI(settings, hostConnected) {
+    return !!(settings && settings.hideBrowserUI && settings.autoCapture && hostConnected);
+  }
+
+  // A navigation response explicitly offered as a download, never a player
+  // fragment or an XHR used internally by the page. Firefox can intercept it
+  // before its file picker starts, using webRequestBlocking.
+  function attachmentDownload(details) {
+    if (!details || details.method !== "GET" || !/^https?:\/\//i.test(details.url || "")
+        || !["main_frame", "sub_frame", "other"].includes(details.type)
+        || details.statusCode < 200 || details.statusCode >= 300 || details.statusCode === 206) return null;
+    const headers = new Map((details.responseHeaders || []).map(h => [String(h.name).toLowerCase(), String(h.value || "")]));
+    const disposition = headers.get("content-disposition") || "";
+    if (!/^\s*attachment(?:\s*;|$)/i.test(disposition)) return null;
+    const filename = dispositionFilename(disposition);
+    return {filename, size:Math.max(0, Number(headers.get("content-length")) || 0), mime:headers.get("content-type") || null};
+  }
+
+  function dispositionFilename(disposition) {
+    let filename = null;
+    const value = String(disposition || "");
+    const encoded = value.match(/(?:^|;)\s*filename\*\s*=\s*UTF-8'[^']*'([^;]+)/i);
+    const plain = value.match(/(?:^|;)\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]+))/i);
+    try { if (encoded) filename = decodeURIComponent(encoded[1].trim()); } catch (e) {}
+    if (!filename && plain) filename = (plain[1] || plain[2] || "").replace(/\\(.)/g, "$1").trim();
+    // A server filename is a basename, never a directory supplied by the server.
+    if (filename) filename = filename.split(/[\\/]/).pop().replace(/[\x00-\x1f\x7f]/g, "").slice(0,240) || null;
+    return filename;
+  }
+
+  function videoDismissKey(page, src, videoId) {
+    if (videoId) return `youtube:${videoId}`;
+    return `${String(page || "").split("#")[0]}|${String(src || "")}`;
+  }
+  function directDownloadLink(href, downloadAttribute) {
+    try {
+      const u = new URL(String(href || ""));
+      if (!/^https?:$/.test(u.protocol)) return false;
+      // Drive's download endpoint answers with an HTML virus-scan
+      // interstitial, not with the file. Classifying it as a direct
+      // download would hand an HTML page to the app, so the browser keeps
+      // that flow (it resolves the token with the user's own session).
+      if (isDriveUrl(u.toString())) return false;
+      return !!downloadAttribute || /\.(?:zip|7z|rar|tar|tgz|gz|bz2|xz|exe|msi|dmg|pkg|deb|rpm|appimage|iso)(?:$)/i.test(u.pathname);
+    } catch (e) { return false; }
   }
 
   // Canonical identity for duplicate collapse: slice selectors
@@ -23,6 +369,12 @@
   function canonicalUrl(u) {
     try {
       const x = new URL(String(u || ""));
+      // Drive: the file id IS the file. The same id behind uc? and
+      // usercontent? is one resource; two different ids never collapse.
+      if (isDriveUrl(x.toString())) {
+        const id = driveFileId(x.toString());
+        if (id) return "drive:" + id;
+      }
       x.searchParams.delete("bytestart");
       x.searchParams.delete("byteend");
       x.hash = "";
@@ -32,11 +384,158 @@
     }
   }
 
-  // 'playlist' | 'segment' | 'file'
+  // ---- Response classification (deep detection) ----
+  // Decides from one response's headers whether it is a stream, a media file,
+  // a subtitle, a playlist part, or worth sniffing its first bytes. Opaque
+  // CDNs hide manifests behind extensionless URLs and text/plain or
+  // octet-stream types, so URL + MIME matching alone misses them.
+  const VIDEO_EXT = ["mp4", "webm", "mkv", "mov", "avi", "m4v", "flv", "3gp", "wmv", "ogv"];
+  const AUDIO_EXT = ["mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "mka"];
+  const SUB_EXT = ["vtt", "webvtt", "srt", "ass", "ssa", "ttml", "dfxp"];
+  const SUB_MIME = /^(?:text\/vtt|application\/x-webvtt|application\/x-subrip|application\/x-srt|application\/(?:x-)?ttml\+xml|application\/dfxp\+xml|text\/x-ssa|application\/x-ssa)$/;
+  const OPAQUE_MIME = new Set(["text/plain", "application/octet-stream", "binary/octet-stream",
+    "application/binary", "application/x-binary", "application/force-download",
+    "application/x-download", "application/xml", "text/xml"]);
+  const HLS_MIME = "application/vnd.apple.mpegurl";
+  const DASH_MIME = "application/dash+xml";
+  const BIG_OPAQUE_BYTES = 5 * 1024 * 1024;
+  const SNIFF_TYPES = new Set(["xmlhttprequest", "media", "other", "object"]);
+
+  function extOf(name) {
+    const leaf = String(name || "").split(/[?#]/, 1)[0].split("/").pop() || "";
+    const dot = leaf.lastIndexOf(".");
+    return dot > 0 && dot < leaf.length - 1 ? leaf.slice(dot + 1).toLowerCase() : "";
+  }
+
+  function mediaMimeForExt(ext) {
+    if (VIDEO_EXT.includes(ext)) return ext === "mkv" ? "video/x-matroska" : ext === "mov" ? "video/quicktime" : `video/${ext === "m4v" ? "mp4" : ext}`;
+    if (AUDIO_EXT.includes(ext)) return ext === "mp3" ? "audio/mpeg" : ext === "m4a" ? "audio/mp4" : `audio/${ext}`;
+    return null;
+  }
+
+  // r: {url, mime, type, method, status, size, filename, acceptRanges}
+  // opts: {minBytes, deep}. Returns {kind, stream?, mime, reason},
+  // {sniff:true, reason}, or null (not media).
+  function classifyResponse(r, opts) {
+    const o = opts || {};
+    const minBytes = Math.max(0, Number(o.minBytes) || 0);
+    const url = String((r && r.url) || "");
+    const mime = String((r && r.mime) || "").toLowerCase().split(";")[0].trim();
+    const type = (r && r.type) || "";
+    const method = String((r && r.method) || "GET").toUpperCase();
+    const status = Number(r && r.status) || 200;
+    const size = Math.max(0, Number(r && r.size) || 0);
+    if (!/^https?:\/\//i.test(url)) return null;
+    if (!["GET", "HEAD", "POST"].includes(method)) return null;
+    if (status < 200 || status >= 300 || status === 204) return null;
+    let path = url, host = "";
+    try { const x = new URL(url); path = x.pathname; host = x.hostname; } catch (e) {}
+    const ext = extOf(path);
+    const frame = type === "main_frame" || type === "sub_frame";
+    if (frame && /^(?:text\/html|application\/xhtml\+xml)$/.test(mime)) return null; // pages
+    const tooSmall = size > 0 && size < minBytes;
+    const byExt = (x, why) => {
+      if (x === "m3u8") return { kind: "playlist", stream: "hls", mime: HLS_MIME, reason: why + "-hls" };
+      if (x === "mpd") return { kind: "playlist", stream: "dash", mime: DASH_MIME, reason: why + "-dash" };
+      if (SUB_EXT.includes(x)) return { kind: "subtitle", mime: SUB_MIME.test(mime) ? mime : "text/vtt", reason: why + "-subtitle" };
+      if (VIDEO_EXT.includes(x) || AUDIO_EXT.includes(x)) {
+        if (tooSmall) return null;
+        const usable = mime && !OPAQUE_MIME.has(mime) ? mime : mediaMimeForExt(x);
+        return { kind: "file", mime: usable, reason: why + "-media" };
+      }
+      return undefined;
+    };
+    if (/mpegurl/.test(mime)) return { kind: "playlist", stream: "hls", mime: HLS_MIME, reason: "hls-mime" };
+    if (mime === DASH_MIME) return { kind: "playlist", stream: "dash", mime: DASH_MIME, reason: "dash-mime" };
+    // Parts stay captured (unchanged behavior): they let a fragment resolve
+    // to its playlist or single-player page, and are demoted in menus.
+    if (isSegmentUrl(url) || mime === "video/mp2t") return { kind: "segment", mime: mime || "video/mp2t", reason: "segment" };
+    const fromPath = byExt(ext, "ext");
+    if (fromPath !== undefined) return fromPath;
+    // Content-Disposition names the real file behind download.php?id=… URLs.
+    const fromName = r && r.filename ? byExt(extOf(r.filename), "disposition") : undefined;
+    if (fromName !== undefined) return fromName;
+    if (SUB_MIME.test(mime)) return { kind: "subtitle", mime, reason: "subtitle-mime" };
+    if (/^(?:video|audio)\//.test(mime) || mime === "application/mp4" || mime === "application/ogg") {
+      return tooSmall ? null : { kind: "file", mime, reason: "media-mime" };
+    }
+    if (method !== "GET" || !SNIFF_TYPES.has(type)) return null;
+    const json = mime === "application/json" || /\+json$/.test(mime);
+    const hinted = /(?:^|\/)(?:hls|m3u8|dash|mpd)(?:[-_][^/?#]+)?(?:\/|$)/i.test(path)
+      || /(?:^|[.-])(?:hls|m3u8|dash|mpd)(?:[.-]|$)/i.test(host);
+    if (hinted && !json) return { sniff: true, reason: "stream-path-hint" };
+    if (/(?:^|\/)(?:master|manifest|playlist|index|video|audio|variant)(?:[-_.][^/?#]+)?\.txt$/i.test(path)) {
+      return { sniff: true, reason: "manifest-name-hint" };
+    }
+    // An extensionless, range-capable multi-megabyte body is almost always a
+    // progressive video behind an obfuscated URL.
+    if (!ext && r && r.acceptRanges && size >= Math.max(minBytes, BIG_OPAQUE_BYTES)) {
+      return { sniff: true, reason: "large-ranged-body" };
+    }
+    if (o.deep !== false && OPAQUE_MIME.has(mime)) return { sniff: true, reason: "opaque-mime" };
+    return null;
+  }
+
+  // Identify the first bytes (≤4 KiB) of a response. Returns
+  // {kind, stream?, mime, master?, reason} or null.
+  function sniffBytes(bytes) {
+    const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    if (!b.length) return null;
+    const at = (i, s) => [...s].every((c, k) => b[i + k] === c.charCodeAt(0));
+    if (at(4, "ftyp")) return { kind: "file", mime: "video/mp4", reason: "sniff-mp4" };
+    if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return { kind: "file", mime: "video/webm", reason: "sniff-webm" };
+    if (at(0, "FLV")) return { kind: "file", mime: "video/x-flv", reason: "sniff-flv" };
+    if (b[0] === 0x47 && (b.length <= 188 || b[188] === 0x47)) return { kind: "segment", mime: "video/mp2t", reason: "sniff-ts" };
+    if (at(0, "OggS")) return { kind: "file", mime: "application/ogg", reason: "sniff-ogg" };
+    if (at(0, "fLaC")) return { kind: "file", mime: "audio/flac", reason: "sniff-flac" };
+    if (at(0, "RIFF") && at(8, "WAVE")) return { kind: "file", mime: "audio/wav", reason: "sniff-wav" };
+    if (at(0, "ID3")) return { kind: "file", mime: "audio/mpeg", reason: "sniff-mp3" };
+    let enc = "utf-8", skip = 0;
+    if (b[0] === 0xff && b[1] === 0xfe) { enc = "utf-16le"; skip = 2; }
+    else if (b[0] === 0xfe && b[1] === 0xff) { enc = "utf-16be"; skip = 2; }
+    else if (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) skip = 3;
+    let text = "";
+    try { text = new TextDecoder(enc).decode(b.subarray(skip)); } catch (e) { return null; }
+    const low = text.trimStart().toLowerCase();
+    if (low.includes("#extm3u")) {
+      return { kind: "playlist", stream: "hls", mime: HLS_MIME, master: low.includes("#ext-x-stream-inf"), reason: "sniff-hls" };
+    }
+    if (/<mpd[\s>]/.test(low)) return { kind: "playlist", stream: "dash", mime: DASH_MIME, master: true, reason: "sniff-dash" };
+    if (low.startsWith("webvtt")) return { kind: "subtitle", mime: "text/vtt", reason: "sniff-vtt" };
+    if (/^\d+\s*\r?\n(?:\d{2}:)?\d{2}:\d{2}[:.,]\d{2,3}\s+-->\s+/.test(low)) return { kind: "subtitle", mime: "application/x-subrip", reason: "sniff-srt" };
+    if (low.includes('xmlns="http://www.w3.org/ns/ttml"')) return { kind: "subtitle", mime: "application/ttml+xml", reason: "sniff-ttml" };
+    return null;
+  }
+
+  // Request headers worth replaying from the download manager: the session
+  // (cookie), the page relationship (referer/origin), bearer tokens, and the
+  // CDN's own x-* tokens. Never hop-by-hop or browser-variation headers.
+  function forwardHeaders(requestHeaders) {
+    const out = { referer: null, cookie: null, headers: {} };
+    let budget = 8192;
+    for (const h of requestHeaders || []) {
+      const name = String((h && h.name) || "").toLowerCase();
+      const value = String((h && h.value) || "");
+      if (!name || !value || /[\r\n]/.test(value) || value.length > 4096) continue;
+      if (name === "referer") { out.referer = value; continue; }
+      if (name === "cookie") { out.cookie = value.length <= 6000 ? value : null; continue; }
+      const keep = name === "origin" || name === "authorization"
+        || (name.startsWith("x-") && name !== "x-client-data");
+      if (!keep || budget - value.length < 0) continue;
+      budget -= value.length;
+      out.headers[name] = value;
+    }
+    return out;
+  }
+
+  // 'playlist' | 'segment' | 'subtitle' | 'file'
   function kindOf(entry) {
     const u = (entry && entry.url) || "";
-    if (isPlaylistUrl(u)) return "playlist";
-    if (isSegmentUrl(u)) return "segment";
+    const mime = String(entry && entry.mime || "").toLowerCase();
+    if (isPlaylistUrl(u) || /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/(?:x-)?mpegurl)(?:;|$)/i.test(mime)) return "playlist";
+    if (entry && entry.whole) return "file"; // a player's full track (+ audio pair)
+    if ((entry && entry.segment) || isSegmentUrl(u)) return "segment";
+    if ((entry && entry.kind === "subtitle") || SUB_MIME.test(mime.split(";")[0]) || SUB_EXT.includes(extOf(u))) return "subtitle";
     return "file";
   }
 
@@ -50,6 +549,8 @@
     const hasPlaylist = !!(ctx && ctx.hasPlaylist);
     const kind = kindOf(e);
     if (kind === "segment" && hasPlaylist) return -1;
+    // Subtitles are offered as files, but never outrank a video or stream.
+    if (kind === "subtitle") return 10;
     let s = kind === "file" ? 300 : kind === "playlist" ? 200 : 50;
     if (mime.startsWith("video/")) s += 100;
     else if (mime.startsWith("audio/")) s += 60;
@@ -85,9 +586,11 @@
   function fmtDur(sec) {
     const n = Math.round(Number(sec) || 0);
     if (!(n > 0) || n >= 86400) return "";
-    const m = Math.floor(n / 60);
+    const h = Math.floor(n / 3600);
+    const m = Math.floor((n % 3600) / 60);
     const s = String(n % 60).padStart(2, "0");
-    return `${m}:${s}`;
+    // A movie reads "1:49:02", not "109:02".
+    return h ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
   }
 
   // Floating panel tokens: the "extension_popup.html" design — a circle
@@ -203,7 +706,345 @@
     } catch (e) {}
   }
 
-  const DCRank = { isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  // ---- Facebook: one entry per video from the page's own JSON ----
+  // Facebook preloads several reels and plays each as DASH byte ranges, so
+  // the sniffer sees dozens of .mp4 pieces per video. The page JSON (initial
+  // HTML and /api/graphql answers) describes each video whole instead:
+  //   all_video_dash_prefetch_representations: [{video_id, representations:
+  //     [{mime_type, base_url, bandwidth, width, height}]}]   (whole files)
+  //   progressive_urls: [{progressive_url, metadata:{quality:"SD"|"HD"}}]
+  //   length_in_second / playable_duration_in_ms, preferred_thumbnail
+  // The last three sit just after their video's "id", so each is tied to
+  // the nearest preceding known video id.
+  function jsonAt(text, start) {
+    // Balanced {...} / [...] from `start`, strings respected.
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+      } else if (c === '"') inStr = true;
+      else if (c === "[" || c === "{") depth++;
+      else if (c === "]" || c === "}") {
+        if (--depth === 0) {
+          try { return JSON.parse(text.slice(start, i + 1)); } catch (e) { return null; }
+        }
+      }
+    }
+    return null;
+  }
+  // `known`: ids of videos found earlier. A later answer often carries only
+  // a video's metadata (duration, SD/HD, thumbnail) without its DASH list,
+  // and those fields still belong to it.
+  function fbVideos(text, known) {
+    const t = String(text || "");
+    const byId = new Map();
+    const entry = (id) => {
+      if (!byId.has(id)) byId.set(id, { id, dur: 0, thumb: "", video: [], audio: [], progressive: [] });
+      return byId.get(id);
+    };
+    const knownIds = new Set((known || []).map(String));
+    for (const id of knownIds) entry(id);
+    const httpUrl = (u) => typeof u === "string" && /^https:\/\/[^/]+\.(fbcdn\.net|cdninstagram\.com)\//i.test(u);
+    const KEY = '"all_video_dash_prefetch_representations":';
+    for (let p = t.indexOf(KEY); p >= 0; p = t.indexOf(KEY, p + KEY.length)) {
+      const arr = jsonAt(t, p + KEY.length);
+      if (!Array.isArray(arr)) continue;
+      for (const v of arr) {
+        const id = v && /^\d{6,}$/.test(String(v.video_id)) ? String(v.video_id) : "";
+        if (!id || !Array.isArray(v.representations)) continue;
+        const e = entry(id);
+        for (const r of v.representations) {
+          if (!r || !httpUrl(r.base_url)) continue;
+          const mime = String(r.mime_type || "");
+          const list = mime.startsWith("audio/") ? e.audio : mime.startsWith("video/") ? e.video : null;
+          if (!list || list.some((x) => x.url === r.base_url)) continue;
+          list.push({ url: r.base_url, mime, bw: Number(r.bandwidth) || 0,
+            w: Number(r.width) || 0, h: Number(r.height) || 0, codecs: String(r.codecs || "") });
+        }
+      }
+    }
+    if (!byId.size) return [];
+    // Nearest known id before `p` (within a window), for the fields that
+    // follow a video's "id".
+    const idRe = /"(?:id|video_id)":"(\d{6,})"/g;
+    const ownerAt = (p) => {
+      const from = Math.max(0, p - 6000);
+      idRe.lastIndex = from;
+      let owner = "";
+      for (let m; (m = idRe.exec(t)) && m.index < p;) if (byId.has(m[1])) owner = m[1];
+      return owner;
+    };
+    const each = (key, fn) => {
+      for (let p = t.indexOf(key); p >= 0; p = t.indexOf(key, p + key.length)) {
+        const id = ownerAt(p);
+        if (id) fn(byId.get(id), p + key.length);
+      }
+    };
+    each('"length_in_second":', (e, at) => {
+      const n = parseFloat(t.slice(at, at + 20));
+      if (!e.dur && n > 0 && n < 86400) e.dur = Math.round(n);
+    });
+    each('"playable_duration_in_ms":', (e, at) => {
+      const n = parseInt(t.slice(at, at + 20), 10);
+      if (!e.dur && n > 0 && n < 86400000) e.dur = Math.round(n / 1000);
+    });
+    each('"progressive_urls":', (e, at) => {
+      const arr = jsonAt(t, at);
+      for (const x of Array.isArray(arr) ? arr : []) {
+        const u = x && x.progressive_url;
+        if (!httpUrl(u) || e.progressive.some((y) => y.url === u)) continue;
+        const br = parseInt((u.match(/[?&]bitrate=(\d+)/) || [])[1], 10) || 0;
+        e.progressive.push({ url: u, quality: String((x.metadata && x.metadata.quality) || ""), bw: br });
+      }
+    });
+    each('"preferred_thumbnail":', (e, at) => {
+      const o = jsonAt(t, at);
+      const u = o && o.image && o.image.uri;
+      if (!e.thumb && typeof u === "string" && /^https:\/\//i.test(u)) e.thumb = u;
+    });
+    // Per quality, H.264 first: Facebook also serves AV1/VP9 copies, which
+    // many players (Windows' own) cannot open - the joined file then looked
+    // like it had no picture or no sound.
+    const h264 = (c) => (/^(avc1|avc3|h264)/i.test(c || "") ? 1 : 0);
+    for (const e of byId.values()) {
+      e.video.sort((a, b) => (b.h * b.w - a.h * a.w) || (h264(b.codecs) - h264(a.codecs)) || (b.bw - a.bw));
+      e.audio.sort((a, b) => b.bw - a.bw);
+    }
+    return [...byId.values()].filter((e) => e.video.length || e.progressive.length
+      || (knownIds.has(e.id) && (e.dur || e.thumb)));
+  }
+  // The file path identifies a representation across its byte-range pieces
+  // and signature refreshes (the query string changes, the path does not).
+  function fbPathOf(u) {
+    try { return new URL(String(u)).pathname; } catch (e) { return ""; }
+  }
+
+  // ---- Bandcamp ----
+  // Bandcamp's player is its own widget: no <audio controls>, no <video>.
+  // The track is fetched by XHR and played from a blob, so the DOM can only
+  // say "there is a player", never "here is the file". The file is the
+  // network response, and the name comes from the page's own player
+  // metadata.
+  //
+  // The stream URLs name their format in the path
+  // (/stream/<hash>/mp3-128/<track id>) and carry a fresh token in the
+  // query, so the PATH is what identifies a track.
+  const BANDCAMP_HOST = /(^|\.)(?:bcbits\.com|bandcamp\.com)$/i;
+  const BANDCAMP_FORMAT = /\/(?:mp3-128|mp3-64|mp3-v0|mp3|m4a|flac|aac|ogg|opus|wav)(?:\/|$)/i;
+
+  function isBandcampHost(u) {
+    try { return BANDCAMP_HOST.test(new URL(String(u)).hostname); }
+    catch (e) { return false; }
+  }
+
+  // Is this URL one of Bandcamp's own media streams?
+  function isBandcampStream(u) {
+    try {
+      const x = new URL(String(u));
+      if (!BANDCAMP_HOST.test(x.hostname)) return false;
+      return BANDCAMP_FORMAT.test(x.pathname);
+    } catch (e) { return false; }
+  }
+
+  // The format a stream carries, read from its path: "mp3", "flac", ...
+  function bandcampFormat(u) {
+    try {
+      const m = BANDCAMP_FORMAT.exec(new URL(String(u)).pathname);
+      if (!m) return "";
+      let f = m[0].replace(/^\//, "").replace(/\/$/, "").toLowerCase();
+      // "mp3-128" and friends are the mp3 format at a given bitrate.
+      if (f.indexOf("mp3") === 0) f = "mp3";
+      return f;
+    } catch (e) { return ""; }
+  }
+
+  // The page's player metadata.
+  //
+  // It arrives as JSON: either in a data- attribute (HTML-escaped) or as an
+  // assigned JS object. Both shapes are accepted, and a blob that cannot be
+  // read is simply no metadata - never a guessed title.
+  function bandcampParse(text) {
+    const s = String(text || "").trim();
+    if (!s) return null;
+    // The attribute form is HTML-escaped.
+    const unescaped = s.replace(/&quot;/g, '"')
+      .replace(/&#0*39;/g, "'").replace(/&apos;/g, "'")
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&");
+    let data = null;
+    for (const candidate of [s, unescaped]) {
+      try { data = JSON.parse(candidate); } catch (e) { data = null; }
+      if (data && typeof data === "object") break;
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      // The older page assigns the object: TralbumData = {...};
+      const m = /TralbumData\s*=\s*(\{[\s\S]*\})\s*;?\s*$/.exec(unescaped);
+      if (!m) return null;
+      try { data = JSON.parse(m[1]); } catch (e) { return null; }
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+    const artist = String(data.artist || "").trim();
+    const out = {
+      artist,
+      album: String(data.album_title || "").trim(),
+      tracks: [],
+      currentId: 0,
+      currentTitle: "",
+    };
+    const info = Array.isArray(data.trackinfo) ? data.trackinfo : [];
+    for (const t of info) {
+      if (!t || typeof t !== "object") continue;
+      const title = String(t.title || "").trim();
+      if (!title) continue;
+      const files = (t.file && typeof t.file === "object") ? t.file : {};
+      const urls = [];
+      for (const k of Object.keys(files)) {
+        const v = files[k];
+        if (typeof v === "string" && /^https?:\/\//i.test(v)) urls.push({ format: k, url: v });
+      }
+      out.tracks.push({
+        title,
+        artist: String(t.artist || artist || "").trim(),
+        id: Number(t.id) || 0,
+        trackNum: Number(t.track_num) || 0,
+        duration: Number(t.duration) || 0,
+        urls,
+      });
+    }
+    // The track the player is on right now.
+    const cur = (data.current && typeof data.current === "object") ? data.current : null;
+    if (cur) {
+      out.currentId = Number(cur.id) || 0;
+      out.currentTitle = String(cur.title || "").trim();
+    }
+    return out;
+  }
+
+  // The track this stream URL is. The path is compared, not the query
+  // string: Bandcamp re-issues the stream with a fresh token.
+  function bandcampTrackFor(url, bc) {
+    if (!url || !bc || !Array.isArray(bc.tracks)) return null;
+    let path = "";
+    try { path = new URL(String(url)).pathname; } catch (e) { return null; }
+    if (!path) return null;
+    for (const t of bc.tracks) {
+      for (const f of (t.urls || [])) {
+        let p = "";
+        try { p = new URL(f.url).pathname; } catch (e) { continue; }
+        if (p && p === path) return t;
+      }
+    }
+    return null;
+  }
+
+  // The track the player is on. Used when the stream's own track is not
+  // known, so the name follows what is playing rather than the album.
+  function bandcampCurrentTrack(bc) {
+    if (!bc || !Array.isArray(bc.tracks) || !bc.tracks.length) return null;
+    if (bc.currentId) {
+      const byId = bc.tracks.find((t) => t.id === bc.currentId);
+      if (byId) return byId;
+    }
+    if (bc.currentTitle) {
+      const byTitle = bc.tracks.find((t) => t.title === bc.currentTitle);
+      if (byTitle) return byTitle;
+    }
+    return null;
+  }
+
+  // The name of the file: "Artist - Track.mp3" when both are known,
+  // "Track.mp3" when only the track is. Nothing is invented - an unknown
+  // track yields an empty name and the caller keeps the original.
+  function bandcampFilename(track, ext) {
+    if (!track || !track.title) return "";
+    let e = String(ext || "").trim().toLowerCase();
+    if (e && e.charAt(0) !== ".") e = "." + e;
+    const artist = String(track.artist || "").trim();
+    const title = String(track.title || "").trim();
+    if (!title) return "";
+    return (artist ? artist + " - " + title : title) + e;
+  }
+
+  // The extension an audio MIME really is. "audio/mpeg" is an mp3, not the
+  // m4a every audio download used to be called.
+  function audioExtForMime(mime) {
+    const m = String(mime || "").toLowerCase().split(";")[0].trim();
+    if (!m) return "";
+    if (m === "audio/mpeg" || m === "audio/mp3") return ".mp3";
+    if (m === "audio/mp4" || m === "audio/x-m4a") return ".m4a";
+    if (m === "audio/aac" || m === "audio/aacp") return ".aac";
+    if (m === "audio/flac" || m === "audio/x-flac") return ".flac";
+    if (m === "audio/ogg") return ".ogg";
+    if (m === "audio/opus") return ".opus";
+    if (m === "audio/wav" || m === "audio/x-wav" || m === "audio/wave") return ".wav";
+    if (m === "audio/webm") return ".weba";
+    return "";
+  }
+
+  // Every audio file the app knows. The category is decided by the file's
+  // own extension, so a stream without a name still lands in the right
+  // folder. This is the CATEGORY list: it is wider than the list the
+  // response classifier uses, because a file that is already on disk only
+  // has a name to go by.
+  const CATEGORY_AUDIO_EXT = new Set([
+    "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav",
+    "aif", "aiff", "weba", "mka", "wma", "amr", "m4b", "mpa", "mp2",
+  ]);
+
+  // Is this media audio?
+  //
+  // The MIME says so when the server names one. When it does not, the
+  // file's own extension decides - and anything else stays unknown rather
+  // than being called audio by accident.
+  function isAudioMedia(url, mime) {
+    const m = String(mime || "").toLowerCase().split(";")[0].trim();
+    if (m.startsWith("audio/")) return true;
+    if (m && m !== "application/octet-stream" && m !== "binary/octet-stream") return false;
+    return CATEGORY_AUDIO_EXT.has(extOf(url));
+  }
+
+  // The app's category folders (model::category_of), in one place.
+  //
+  // The browser saves into the same folder the app would choose, so a file
+  // saved in the browser lands where the app would put it by default. The
+  // Rust side has the same table; a change here needs the same change
+  // there.
+  const CATEGORY_VIDEO_EXT = ["mp4", "mkv", "avi", "mov", "webm", "ts", "m4s"];
+  const CATEGORY_IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"];
+  const CATEGORY_DOC_EXT = ["pdf", "doc", "docx", "txt", "epub"];
+  const CATEGORY_ZIP_EXT = ["zip", "rar", "7z", "tar", "gz"];
+  const CATEGORY_APP_EXT = ["exe", "msi"];
+
+  // The category a file belongs to, decided by its own extension.
+  function categoryOf(name) {
+    const ext = extOf(String(name || ""));
+    if (CATEGORY_VIDEO_EXT.includes(ext)) return "Video";
+    if (CATEGORY_AUDIO_EXT.has(ext)) return "Audio";
+    if (CATEGORY_IMAGE_EXT.includes(ext)) return "Image";
+    if (CATEGORY_DOC_EXT.includes(ext)) return "Document";
+    if (CATEGORY_ZIP_EXT.includes(ext)) return "Compressed";
+    if (CATEGORY_APP_EXT.includes(ext)) return "Apps";
+    return "Other";
+  }
+
+  const DCRank = {
+    // ours: the CHIRP response classifier, the manifest URL validator and
+    // the Google Drive helpers
+    mediaResponse, manifestUrl, isDriveUrl, driveFileId, driveIdentity, normalizeDriveUrl,
+    // upstream: the Facebook parser, the response classifier and the header helpers
+    fbVideos, fbPathOf, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename,
+    // shared
+    attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence,
+    playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment,
+    vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia,
+    collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel,
+    // Bandcamp
+    isBandcampHost, isBandcampStream, bandcampFormat, bandcampParse, bandcampTrackFor,
+    bandcampCurrentTrack, bandcampFilename, audioExtForMime, isAudioMedia, categoryOf
+  };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

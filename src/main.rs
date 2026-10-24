@@ -5,22 +5,35 @@
 
 mod aes128;
 mod app;
+mod archive;
 mod basket;
 mod cli;
 mod complete;
 mod confirm;
+mod debrid;
 mod dm;
+mod drive;
+mod dupcheck;
 mod engine;
+mod extension;
 mod fonts;
 mod ftp;
 mod grabber;
+mod links;
 mod manual;
 mod model;
 mod native_host;
 mod progress;
 mod settings;
 mod shaped;
+mod window;
+#[cfg(windows)]
 mod tray;
+#[cfg(not(windows))]
+#[path="tray_portable.rs"]
+mod tray;
+mod platform;
+mod helpers;
 
 use app::CraftApp;
 use clap::Parser;
@@ -45,6 +58,7 @@ fn install_panic_hook() {
 fn main() -> eframe::Result<()> {
     // Migrate legacy `idm_rust` config (queue/settings/inbox) forward.
     model::migrate_config();
+    if let Err(e)=model::secure_config_directory() { eprintln!("Could not protect application state directory: {e}"); }
     install_panic_hook();
     // Native-messaging host mode for the browser extension:
     // launched by Chrome/Edge/Firefox, speaks length-prefixed JSON on stdio.
@@ -56,6 +70,10 @@ fn main() -> eframe::Result<()> {
     // captured download, always on top). Spawned by the native host.
     if args.iter().any(|a| a == "--confirm-download") {
         return confirm::run();
+    }
+    // IDM-style "Download all links" picker (spawned by the native host).
+    if args.iter().any(|a| a == "--links") {
+        return links::run();
     }
     // IDM-style standalone per-download progress window.
     if args.iter().any(|a| a == "--progress") {
@@ -108,9 +126,13 @@ fn main() -> eframe::Result<()> {
             .build()
             .expect("tokio runtime"),
     );
+    // No OS caption: the app paints its own title bar (brand, menus, search,
+    // update chip, window buttons — `main_window_titlebar.html`). Drag, resize,
+    // snap and double-click still go through the OS (`StartDrag` / `BeginResize`).
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([920.0, 500.0])
-        .with_min_inner_size([840.0, 480.0]);
+        .with_min_inner_size([840.0, 480.0])
+        .with_decorations(false);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }

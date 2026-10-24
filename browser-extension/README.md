@@ -1,4 +1,24 @@
+## Draggable video download bar
+
+Drag the grip at the left or drag the Download this video button to reposition it. A normal click still downloads or opens the quality menu; the small X dismisses the bar. Focus the grip and use arrow keys for keyboard movement (Shift moves farther).
+
+The last position is saved in local extension storage. It survives reloads, new pages, background-worker restarts and full browser restarts. An existing session position migrates automatically. Removing the extension or clearing its local storage resets the preference. Nothing is stored in website storage or synced between devices. Positions stay within the viewport when resizing. In embedded players, movement is bounded by the frame.
+
+Restore a dismissed bar through the extension popup's Show video download buttons again command. Reload existing video tabs after updating the extension.
+
+Visible native audio players with an HTTP(S) file now get a **Download this audio** bar, placed above or below the native controls. Hidden/background audio and blob/adaptive audio do not receive a new bar. The same grip and close control work for audio. Bars hide when unrelated content enters fullscreen, and dismissed sources stay dismissed when a dynamic page reuses its player.
+
+Repeated identical link or media clicks are ignored while a handoff is awaiting its response. Different quality selections and later retries remain available. This guard prevents accidental concurrent prompts; it does not automatically approve downloading an existing file again.
+
+> Version 0.9.6.1: automatic takeover and the video-dismiss X are shared by
+> Chrome/Brave and Firefox on Windows, macOS and Linux. Portable packages now
+> include a ready-to-load `browser-extension-firefox` folder and Firefox XPI.
+> `python3 scripts/package_extensions.py` builds both extension variants on any OS.
+> Firefox has an additional attachment-response handoff; the X follows fullscreen.
+
 # Browser extension — "Send to Download Craft" (zero-config)
+
+Local development extension 0.9.7.3 adds conservative response detection in permitted media documents/frames, refreshed per-frame metadata, bounded optional manifest inspection, and source-attribute/metadata event refreshes. Binary installers, HTML errors and failed responses are not media candidates. Explicit HLS references connect quality/audio playlists to a complete master; unrelated streams are not paired just because they share a frame. Browser/desktop takeover and its failure replay are unchanged. Detection indicates a candidate, not a verified complete download. See `docs/research/` in the source repository for the evidence and remaining limitations.
 
 Every download is captured automatically — no pasting IDs,
 no per-file clicks.

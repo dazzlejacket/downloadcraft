@@ -702,10 +702,6 @@ mod win32 {
             sub_app_name: *const u16,
             sub_id_list: *const u16,
         ) -> i32;
-        pub fn SetWindowCompositionAttribute(
-            hwnd: isize,
-            data: *mut WindowCompositionAttribData,
-        ) -> i32;
     }
 
     /// `WINDOWCOMPOSITIONATTRIBDATA` for the undocumented dark-colours switch
@@ -727,12 +723,31 @@ mod win32 {
             data: &mut value as *mut _ as *mut std::ffi::c_void,
             size: std::mem::size_of::<i32>(),
         };
-        SetWindowCompositionAttribute(hwnd, &mut data);
+        // This undocumented API is exported by user32.dll on supported
+        // Windows versions, but is absent from some Windows SDK import libs.
+        // Resolve it at runtime so MSVC builds do not require a static import.
+        let user32 = GetModuleHandleW("user32.dll\0".encode_utf16().collect::<Vec<_>>().as_ptr());
+        if user32 == 0 {
+            return;
+        }
+        let Some(address) = GetProcAddress(user32, b"SetWindowCompositionAttribute\0".as_ptr()) else {
+            return;
+        };
+        let set_window_composition_attribute: unsafe extern "system" fn(
+            isize,
+            *mut WindowCompositionAttribData,
+        ) -> i32 = std::mem::transmute(address);
+        set_window_composition_attribute(hwnd, &mut data);
     }
 
     #[link(name = "kernel32")]
     extern "system" {
         pub fn GetCurrentThreadId() -> u32;
+        pub fn GetModuleHandleW(name: *const u16) -> isize;
+        pub fn GetProcAddress(
+            module: isize,
+            name: *const u8,
+        ) -> Option<unsafe extern "system" fn()>;
         pub fn CreateEventW(
             attributes: *const std::ffi::c_void,
             manual_reset: i32,
@@ -774,3 +789,6 @@ mod win32 {
     pub const EVENT_MODIFY_STATE: u32 = 0x0002;
     pub const WAIT_OBJECT_0: u32 = 0;
 }
+
+/// Windows already uses the native HWND; portable builds retain the egui context.
+pub fn set_context(_: &egui::Context) {}

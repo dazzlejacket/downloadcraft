@@ -1,4 +1,7 @@
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Timelike};
+
+/// Public application version. Keep this aligned with Cargo and extension manifests.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,65 +44,42 @@ fn shorten(s: &str, n: usize) -> String {
     format!("{}…", &s[..cut])
 }
 
-/// Best-effort interprocess file lock (no new deps): `config/<name>.lock
-/// created with `create_new`. Stale locks (mtime older than 20 s — no
-/// operation legitimately holds one longer) are stolen. All shared-file
-/// read-modify-writes (queue, inbox, wake, cmd) take the matching lock so
-/// the GUI, dialogs, CLI, and native host stop clobbering each other.
-/// If the lock can never be acquired we proceed anyway (single-user box:
-///
-/// better to risk a race than deadlock the UI).
+/// OS-held interprocess lock. Lock files persist; the handle owns the lock,
+/// which the OS releases on close/crash. A long download must never lose its
+/// destination lock merely because a timestamp is old.
 pub struct FsGuard {
-    path: std::path::PathBuf,
-    ours: bool,
+    _file: Option<std::fs::File>,
 }
-
 impl FsGuard {
-    /// Whether this guard actually holds the lock (a `false` guard means
-    /// another process is inside the critical section right now).
     pub fn owned(&self) -> bool {
-        self.ours
+        self._file.is_some()
     }
 }
-
-impl Drop for FsGuard {
-    fn drop(&mut self) {
-        if self.ours {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
 pub fn fs_lock(name: &str) -> FsGuard {
-    let path = match config_dir() {
-        Some(d) => d.join(format!("{name}.lock")),
-        None => return FsGuard { path: std::path::PathBuf::new(), ours: false },
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    for _ in 0..100 {
-        let mut opts = std::fs::OpenOptions::new();
-        match opts.write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                use std::io::Write;
-                let _ = writeln!(f, "{}", std::process::id());
-                return FsGuard { path, ours: true };
-            }
-            Err(_) => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .map(|t| t.elapsed().map(|e| e.as_secs() > 20).unwrap_or(true))
-                    .unwrap_or(true);
-                if stale {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
+    fn acquire(name: &str) -> Option<std::fs::File> {
+        let path = config_dir()?.join(format!("{name}.lock"));
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .ok()?;
+        for _ in 0..100 {
+            match file.try_lock() {
+                Ok(()) => return Some(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                Err(_) => return None,
             }
         }
+        None
     }
-    FsGuard { path, ours: false }
+    FsGuard {
+        _file: acquire(name),
+    }
 }
 
 /// Liveness heartbeat for the main window (`main.lock` timestamp, refreshed
@@ -145,6 +125,22 @@ pub struct DownloadItem {
     pub referer: String,
     #[serde(default)]
     pub cookie: String,
+/// The browser's own User-Agent, when the capture carried one.
+    ///
+    /// A site that checks the browser (a Cloudflare browser check, for
+    /// one) only answers the browser that solved it, so the captured
+    /// agent travels with the row. Empty = use the app's own setting.
+    #[serde(default)]
+    pub user_agent: String,
+    /// Origin / Authorization / x-* headers the browser player sent with the
+    /// captured media (see engine::CapturedHeaders). Cleared on completion
+    /// like the cookie.
+    ///
+    /// Never written to disk: `Authorization` is a bearer token, and a
+    /// queue.json on disk is a file another program can read. The headers
+    /// live in memory for the transfer and are dropped when it ends.
+    #[serde(default, skip)]
+    pub extra_headers: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub username: String,
     #[serde(default)]
@@ -181,9 +177,12 @@ pub struct DownloadItem {
     #[serde(default)]
     pub resolution: String,
     /// Media duration in seconds from the extension (best-effort, P4).
-    /// Display/metadata only — never affects engine behavior.
+    /// Used to check the completed file when ffprobe is available.
     #[serde(default)]
     pub duration_secs: u64,
+    /// Positive audio evidence from the captured player; unknown stays false.
+    #[serde(default)]
+    pub expects_audio: bool,
     /// Per-download retry budget (P5). None = use the global setting.
     /// Some(n) overrides it for this item only (clamped 1–20 at use).
     #[serde(default)]
@@ -196,6 +195,13 @@ pub struct DownloadItem {
     /// a persistently corrupt source fails loudly instead of looping.
     #[serde(default)]
     pub checksum_repaired: bool,
+    /// Queue v2 ordering: higher runs first; ties keep creation order.
+    #[serde(default)]
+    pub priority: i64,
+    /// Queue v2 scheduled start, "HH:MM" local. Empty = as soon as the queue
+    /// can take it. A time already past starts immediately.
+    #[serde(default)]
+    pub start_at: String,
 }
 
 impl DownloadItem {
@@ -214,6 +220,8 @@ impl DownloadItem {
             selected: false,
             referer: String::new(),
             cookie: String::new(),
+user_agent: String::new(),
+            extra_headers: std::collections::BTreeMap::new(),
             username: String::new(),
             password: String::new(),
             resumable: false,
@@ -225,9 +233,12 @@ impl DownloadItem {
             quality_pref: String::new(),
             resolution: String::new(),
             duration_secs: 0,
+            expects_audio: false,
             max_retries: None,
             timeout_secs: None,
             checksum_repaired: false,
+            priority: 0,
+            start_at: String::new(),
         }
     }
 
@@ -257,16 +268,44 @@ impl DownloadItem {
     }
 }
 
-pub fn category_of(filename: &str) -> &'static str {
-    let ext = filename
+/// Queue v2: whether a row's "start at" time has arrived. Blank = now.
+/// A time already past also means now (set it and it runs), and an
+/// unparsable value never blocks a download forever.
+pub fn start_at_due(s: &str, now: DateTime<Local>) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    match parse_hhmm(t) {
+        Some(mins) => {
+            let now_secs = now.hour() * 3600 + now.minute() * 60 + now.second();
+            mins as u32 * 60 <= now_secs
+        }
+        None => true,
+    }
+}
+
+/// The category a file belongs to, decided by its own extension.
+///
+/// Audio is a category of its own: MP3, M4A, AAC, FLAC, OGG, OPUS, WAV
+/// and the rest are "Audio", the same name the browser extension uses for
+/// the folder it saves into. The list is the same one in
+/// `browser-extension/rank.js` (`categoryOf`) - the two have to agree, or a
+/// file saved in the browser lands in a folder the app did not choose.
+///
+/// The category is computed from the NAME every time it is shown, never
+/// stored: an item that was downloaded before the category was called
+/// "Audio" shows the right category now, and nothing is moved on disk.
+pub fn category_of(filename: &str) -> &'static str {    let ext = filename
         .rsplit('.')
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => "Image",
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" => "Music",
-        "mp4" | "mkv" | "avi" | "mov" | "webm" => "Video",
+        "mp3" | "m4a" | "aac" | "flac" | "ogg" | "oga" | "opus" | "wav" | "aif"
+        | "aiff" | "weba" | "mka" | "wma" | "amr" | "m4b" | "mpa" | "mp2" => "Audio",
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "ts" | "m4s" => "Video",
         "pdf" | "doc" | "docx" | "txt" | "epub" => "Document",
         "zip" | "rar" | "7z" | "tar" | "gz" => "Compressed",
         "exe" | "msi" => "Apps",
@@ -346,11 +385,39 @@ pub fn filename_from_url(raw: &str) -> String {
                 if is_hash {
                     continue;
                 }
-                return percent_decode(clean);
+                let name = safe_segment(&percent_decode(clean));
+                if name.is_empty() {
+                    // Not a name (it was only dots): try an earlier segment.
+                    continue;
+                }
+                return name;
             }
         }
     }
     format!("download_{}.bin", chrono::Local::now().timestamp())
+}
+
+/// A URL path segment, once decoded, must not become a path of its own.
+///
+/// "..%2f..%2fboot.ini" is one path segment that decodes to
+/// "../../boot.ini". A name like that is not a file name: joined onto the
+/// download folder it would point somewhere else entirely. Separators and
+/// control characters become "_", and a segment that is nothing but dots
+/// ("." and "..") is not a name at all.
+fn safe_segment(decoded: &str) -> String {
+    let out: String = decoded
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => '_',
+            c if (c as u32) < 32 => '_',
+            c => c,
+        })
+        .collect();
+    let out = out.trim().to_string();
+    if out.is_empty() || out.chars().all(|c| c == '.') {
+        return String::new();
+    }
+    out
 }
 
 /// Extension for a `Content-Type` (with parameters tolerated): the correct
@@ -381,6 +448,10 @@ pub fn ext_for_mime(mime: &str) -> Option<&'static str> {
         "application/x-7z-compressed" => Some(".7z"),
         "application/gzip" | "application/x-gzip" => Some(".gz"),
         "application/x-msdownload" | "application/octet-stream" => None,
+        // Subtitle files: a caption is a file like any other, and it keeps
+        // its own suffix (a caption URL often names no file at all).
+        "text/vtt" => Some(".vtt"),
+        "application/x-subrip" | "text/srt" => Some(".srt"),
         _ => None,
     }
 }
@@ -430,6 +501,21 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&raw).into_owned()
 }
 
+/// Whether this text is a magnet link.
+///
+/// A magnet is not a file the app can fetch: it names a torrent, and the
+/// only way to get the file is for a cloud provider to fetch it. The app
+/// has no torrent client of its own, so a magnet is handed to the cloud
+/// provider panel instead of the download queue.
+pub fn is_magnet(s: &str) -> bool {
+    let t = s.trim();
+    t.len() > 16
+        && t.len() < 4096
+        && !t.contains(' ')
+        && t.to_ascii_lowercase().starts_with("magnet:")
+        && t.to_ascii_lowercase().contains("xt=urn:bt")
+}
+
 pub fn is_download_url(s: &str) -> bool {
     let t = s.trim();
     // `ftps://` passes the gate so the engine can refuse it loudly with
@@ -454,6 +540,12 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|p| p.join(APP_SLUG))
 }
 
+/// Default destination when the OS has no configured Downloads directory.
+pub fn default_download_dir() -> std::path::PathBuf {
+    dirs::download_dir().or_else(|| dirs::home_dir().map(|p| p.join("Downloads")))
+        .unwrap_or_else(|| std::path::PathBuf::from("Downloads"))
+}
+
 /// Claim the single-instance slot for a standalone window (`name` values look
 /// like `progress_12` / `complete_12`). Windows enforces the exclusivity and
 /// releases it when the owning process ends, so a window the user closed frees
@@ -470,7 +562,10 @@ pub fn claim_window(name: &str) -> Option<std::fs::File> {
         // No other process may even open it while this handle lives.
         opts.share_mode(0);
     }
-    opts.open(dir.join(name)).ok()
+    let file = opts.open(dir.join(name)).ok()?;
+    #[cfg(unix)]
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 /// The monitor's work area in points: the desktop minus the taskbar (and any
@@ -576,6 +671,8 @@ pub fn ui_pref_str(key: &str, default: &str) -> String {
 /// Merge one boolean into ui.json, leaving every other key alone. The main app
 /// watches that file's mtime and reloads it, so the change lands live.
 pub fn ui_pref_set_bool(key: &str, value: bool) {
+    let _guard=fs_lock("ui-settings");
+    if !_guard.owned() { return; }
     let Some(p) = config_dir().map(|d| d.join("ui.json")) else {
         return;
     };
@@ -587,6 +684,25 @@ pub fn ui_pref_set_bool(key: &str, value: bool) {
         return;
     };
     obj.insert(key.to_string(), serde_json::Value::Bool(value));
+    if let Ok(json) = serde_json::to_string_pretty(&v) {
+        let _ = atomic_write(&p, json.as_bytes());
+    }
+}
+
+/// Merge one string into ui.json (used when an action commits a helper choice
+/// right away, e.g. "Re-download" switching to the app's own ffmpeg).
+pub fn ui_pref_set_str(key: &str, value: &str) {
+    let Some(p) = config_dir().map(|d| d.join("ui.json")) else {
+        return;
+    };
+    let mut v: serde_json::Value = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    obj.insert(key.to_string(), serde_json::Value::String(value.to_string()));
     if let Ok(json) = serde_json::to_string_pretty(&v) {
         let _ = atomic_write(&p, json.as_bytes());
     }
@@ -648,6 +764,14 @@ pub fn is_valid_sha256(s: &str) -> bool {
     t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Compute the SHA-256 hex digest of a byte slice.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
 /// Compute the SHA-256 hex digest of a file (streamed, low memory).
 pub fn sha256_of_file(path: &std::path::Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
@@ -690,15 +814,83 @@ pub fn conflict_free_dest(dest: &std::path::Path) -> std::path::PathBuf {
     dest.to_path_buf()
 }
 
+/// The keys an older install may still carry in `ui.json` that no longer
+/// mean anything: there is one overlay now, so the style and the side that
+/// owned it are gone.
+pub const OBSOLETE_UI_KEYS: [&str; 2] = ["overlay_style", "overlay_style_source"];
+
+/// Drop the obsolete overlay-style keys from a `ui.json` object.
+pub fn drop_obsolete_ui_keys(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for k in OBSOLETE_UI_KEYS {
+        obj.remove(k);
+    }
+}
+
+/// Drop the obsolete overlay-style keys from a `ui.json` payload.
+///
+/// `ui.json` is shared by the main window, the Settings window and the
+/// helper preferences, and each of them merges its own keys into the file
+/// instead of rewriting it. An old key would survive every save that way,
+/// so it is removed here, on the way out, where every writer passes.
+fn without_obsolete_ui_keys(path: &std::path::Path, data: &[u8]) -> std::io::Result<Vec<u8>> {
+    if path.file_name().and_then(|n| n.to_str()) != Some("ui.json") {
+        return Ok(data.to_vec());
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return Ok(data.to_vec());
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return Ok(data.to_vec());
+    };
+    if !OBSOLETE_UI_KEYS.iter().any(|k| obj.contains_key(*k)) {
+        return Ok(data.to_vec());
+    }
+    drop_obsolete_ui_keys(obj);
+    serde_json::to_vec_pretty(&v)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Atomically write `data` to `path` (temp file + rename) so a crash or
 /// power loss never leaves a half-written queue/settings file.
 pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let data = without_obsolete_ui_keys(path, data)?;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {fn drop(&mut self){let _=std::fs::remove_file(&self.0);}}
+    let name=path.file_name().ok_or_else(||std::io::Error::other("No state filename"))?.to_string_lossy();
+    for _ in 0..100 {
+        let id=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        let temp=path.with_file_name(format!(".{name}.{}.{id}.tmp",std::process::id()));
+        let mut options=std::fs::OpenOptions::new();options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp) {
+            Ok(mut file) => {
+                let cleanup=Temp(temp);
+                std::io::Write::write_all(&mut file,&data)?;
+                drop(file);
+                std::fs::rename(&cleanup.0,path)?;
+                return Ok(());
+            }
+            Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
+    Err(std::io::Error::other("Cannot create a private state file"))
+}
+
+/// The queue and inbox can contain captured session credentials. Also protect
+/// existing state files before any app, dialog, CLI or native-host mode starts.
+pub fn secure_config_directory() -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(dir)=config_dir() {
+        use std::os::unix::fs::{DirBuilderExt,PermissionsExt};
+        let mut builder=std::fs::DirBuilder::new();builder.recursive(true).mode(0o700).create(&dir)?;
+        std::fs::set_permissions(dir,std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
 }
 
@@ -732,7 +924,13 @@ impl FolderRule {
 pub fn default_folder_rules() -> Vec<FolderRule> {
     vec![
         FolderRule { exts: "mp4,mkv,webm,mov,avi".into(), folder: "Video".into() },
-        FolderRule { exts: "mp3,m4a,flac,ogg,wav".into(), folder: "Music".into() },
+        // The audio folder carries the category's name, so a file saved in
+        // the browser and a file saved by the app land in the same place.
+        FolderRule {
+            exts: "mp3,m4a,aac,flac,ogg,oga,opus,wav,aif,aiff,weba,mka,wma,amr,m4b,mpa,mp2"
+                .into(),
+            folder: "Audio".into(),
+        },
         FolderRule { exts: "png,jpg,jpeg,gif,webp,svg".into(), folder: "Image".into() },
         FolderRule { exts: "pdf,doc,docx,txt,epub".into(), folder: "Document".into() },
         FolderRule { exts: "zip,rar,7z,tar,gz".into(), folder: "Compressed".into() },
@@ -844,11 +1042,40 @@ fn entry_is_dead(d: &DownloadItem) -> bool {
 
 /// Look up a queued URL. Returns `(id, dead)`; `dead` mirrors what
 /// `append_to_queue` would do with a fresh capture of the same URL.
-pub fn queued_entry(url: &str) -> Option<(u64, bool)> {
+pub fn queued_entry(url: &str, quality: &str) -> Option<(u64, bool)> {
     let path = config_dir()?.join("queue.json");
     let items = read_queue_items(&path).ok()?;
-    let d = items.into_iter().find(|d| d.url == url)?;
+    let d = items.into_iter().find(|d| d.url == url && same_quality(&d.quality_pref, quality))?;
     Some((d.id, entry_is_dead(&d)))
+}
+
+/// Status of queue row `id`, as the queue file has it.
+pub fn queued_status(id: u64) -> Option<Status> {
+    let path = config_dir()?.join("queue.json");
+    read_queue_items(&path).ok()?.into_iter().find(|d| d.id == id).map(|d| d.status)
+}
+
+/// Two requests for one page URL are the same download only at the same
+/// quality: a YouTube watch page queued at 1080p and again at 720p is two
+/// files.
+pub fn same_quality(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// `dest`, or "name (n).ext" when another queued row (or a file on disk)
+/// already owns that path.
+fn dest_free_of_queue(items: &[DownloadItem], dest: &std::path::Path) -> std::path::PathBuf {
+    let taken = |p: &std::path::Path| p.exists() || items.iter().any(|d| d.dest_path() == p);
+    if !taken(dest) {
+        return dest.to_path_buf();
+    }
+    let parent = dest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "download".to_string());
+    let ext = dest.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (1..1000)
+        .map(|n| parent.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !taken(p))
+        .unwrap_or_else(|| dest.to_path_buf())
 }
 
 /// Append an item to the shared queue file with a fresh id (used by the
@@ -859,11 +1086,54 @@ pub fn queued_entry(url: &str) -> Option<(u64, bool)> {
 /// re-click never creates a colliding duplicate.
 pub fn append_to_queue(item: &mut DownloadItem) -> AppendResult {
     let _guard = fs_lock("queue");
+    if !_guard.owned() { return AppendResult::Error("Queue is busy; retry shortly".into()); }
     let path = match config_dir() {
         Some(d) => d.join("queue.json"),
         None => return AppendResult::Error("no config directory".to_string()),
     };
     append_to_queue_at(&path, item)
+}
+
+/// Add a download that already finished elsewhere (the browser extension's
+/// "Download in browser") as a Completed row, so it shows in the app's list
+/// with Open file / Open folder. A row for the same file is not added twice.
+pub fn record_finished(item: &mut DownloadItem) -> AppendResult {
+    let _guard = fs_lock("queue");
+    if !_guard.owned() { return AppendResult::Error("Queue is busy; retry shortly".into()); }
+    let path = match config_dir() {
+        Some(d) => d.join("queue.json"),
+        None => return AppendResult::Error("no config directory".to_string()),
+    };
+    let mut items = match read_queue_items(&path) {
+        Ok(v) => v,
+        Err(e) => return AppendResult::Error(e),
+    };
+    if let Some(d) = items.iter().find(|d| d.dest_path() == item.dest_path()) {
+        return AppendResult::AlreadyQueued(d.id);
+    }
+    item.id = next_queue_id(&path, &items);
+    item.status = Status::Completed;
+    items.push(item.clone());
+    match write_queue(&path, &items) {
+        Ok(()) => AppendResult::Added(item.id),
+        Err(e) => AppendResult::Error(e),
+    }
+}
+
+/// Next queue id. Ids are never reused, even after the newest row is
+/// removed: the main window treats an id it has seen disappear as deleted
+/// and silently drops a later row that reuses it (a dialog's "starting it"
+/// then started nothing). A high-water mark beside the queue file keeps the
+/// counter moving. Callers must hold the queue lock.
+pub fn next_queue_id(queue_path: &std::path::Path, items: &[DownloadItem]) -> u64 {
+    let mark = queue_path.with_extension("lastid");
+    let last = std::fs::read_to_string(&mark)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let id = items.iter().map(|d| d.id).max().unwrap_or(0).max(last) + 1;
+    let _ = std::fs::write(&mark, id.to_string());
+    id
 }
 
 /// Path-injected core of `append_to_queue` (unit-tested without touching the
@@ -873,28 +1143,50 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         Ok(v) => v,
         Err(e) => return AppendResult::Error(e),
     };
-    if let Some(pos) = items.iter().position(|d| d.url == item.url) {
+    if let Some(pos) = items.iter().position(|d| d.url == item.url && same_quality(&d.quality_pref, &item.quality_pref)) {
         // Same URL again. Reuse the row unless it is dead (failed, or finished
         // with the file gone) — then refresh it so "Start Download" always
         // works instead of dead-ending on "already in queue".
         if !entry_is_dead(&items[pos]) {
             return AppendResult::AlreadyQueued(items[pos].id);
         }
-        let id = items[pos].id;
-        let created = items[pos].created_at;
-        items[pos].downloaded_bytes = 0;
-        if item.total_bytes.is_some() {
-            items[pos].total_bytes = item.total_bytes;
-        }
-        items[pos].speed_bps = 0.0;
-        items[pos].status = Status::Queued;
-        items[pos].created_at = created;
-        let dp = items[pos].dest_path();
-        drop_resume_state(&dp);
+        // The fresh capture's data replaces the dead row's (only identity and
+        // queue settings stay): keeping the old cookie/headers/referer — the
+        // very ones that expired — made the retry fail the same way.
+        let old = &items[pos];
+        drop_resume_state(&old.dest_path());
+        let mut fresh = item.clone();
+        fresh.id = old.id;
+        fresh.created_at = old.created_at;
+        fresh.priority = old.priority;
+        fresh.start_at = old.start_at.clone();
+        fresh.downloaded_bytes = 0;
+        fresh.speed_bps = 0.0;
+        fresh.status = Status::Queued;
+        fresh.selected = false;
+        let id = fresh.id;
+        item.id = id;
+        items[pos] = fresh;
         return match write_queue(path, &items) {
             Ok(()) => AppendResult::Added(id),
             Err(e) => AppendResult::Error(e),
         };
+    }
+    // Another quality of the same page wanting the same file name gets its
+    // own name instead of taking over that row.
+    if let Some(pos) = find_dest_clash(&items, &item.dest_path()) {
+        // A different download (another quality, or another URL while that
+        // row is running or paused) gets its own name. Taking over an active
+        // row swapped its URL and deleted its partial files mid-transfer.
+        let active = matches!(items[pos].status, Status::Downloading | Status::Paused);
+        if (items[pos].url == item.url && !same_quality(&items[pos].quality_pref, &item.quality_pref))
+            || (active && items[pos].url != item.url)
+        {
+            let free = dest_free_of_queue(&items, &item.dest_path());
+            if let Some(name) = free.file_name() {
+                item.filename = name.to_string_lossy().to_string();
+            }
+        }
     }
     if let Some(pos) = find_dest_clash(&items, &item.dest_path()) {
         let id = items[pos].id;
@@ -906,6 +1198,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         items[pos].save_dir = item.save_dir.clone();
         items[pos].referer = std::mem::take(&mut item.referer);
         items[pos].cookie = std::mem::take(&mut item.cookie);
+        items[pos].extra_headers = std::mem::take(&mut item.extra_headers);
         items[pos].username = std::mem::take(&mut item.username);
         items[pos].password = std::mem::take(&mut item.password);
         let checksum_changed = items[pos].checksum_sha256 != item.checksum_sha256;
@@ -914,6 +1207,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         items[pos].pair_mime = std::mem::take(&mut item.pair_mime);
         items[pos].quality_pref = std::mem::take(&mut item.quality_pref);
         items[pos].duration_secs = item.duration_secs;
+        items[pos].expects_audio = item.expects_audio;
         items[pos].max_retries = item.max_retries;
         items[pos].timeout_secs = item.timeout_secs;
         if checksum_changed {
@@ -937,7 +1231,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
             Err(e) => AppendResult::Error(e),
         };
     }
-    let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
+    let id = next_queue_id(path, &items);
     item.id = id;
     item.status = Status::Queued;
     items.push(item.clone());
@@ -1060,9 +1354,70 @@ pub fn pick_windows_asset(v: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A magnet is recognised, and only a magnet.
+    ///
+    /// The Add dialog hands a magnet to the cloud provider panel, so this
+    /// must not fire for an ordinary URL and must not miss a real magnet.
+    #[test]
+    fn a_magnet_is_told_apart_from_a_url() {
+        assert!(is_magnet(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=film"
+        ));
+        assert!(is_magnet("  MAGNET:?XT=URN:BTIH:0123456789ABCDEF  "));
+        // Not magnets.
+        assert!(!is_magnet("https://example.com/file.mp4"));
+        assert!(!is_magnet("magnet:?dn=only-a-name"));
+        assert!(!is_magnet("magnet:"));
+        assert!(!is_magnet(""));
+        assert!(!is_magnet("not a magnet:?xt=urn:btih:0123456789abcdef"));
+        // A magnet is not something the download queue can take.
+        assert!(!is_download_url(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+        ));
+    }
+
+    #[test]
+    fn queue_start_times() {
+        use chrono::TimeZone;
+        let at = |h, m| Local.with_ymd_and_hms(2026, 10, 21, h, m, 0).unwrap();
+        // Blank means now; a time already past also means now.
+        assert!(start_at_due("", at(10, 0)));
+        assert!(start_at_due("08:30", at(10, 0)));
+        assert!(start_at_due("10:00", at(10, 0)));
+        // A later clock time holds the row back.
+        assert!(!start_at_due("23:30", at(10, 0)));
+        // Garbage never blocks a download forever.
+        assert!(start_at_due("later", at(10, 0)));
+    }
+
+    /// The browser's own agent travels with the row: a site that checks
+    /// the browser only answers that browser, so the capture's agent has
+    /// to survive the queue. An older queue file without the field still
+    /// loads, with an empty agent.
+    #[test]
+    fn a_captured_user_agent_survives_the_queue() {
+        let mut item = DownloadItem::new(
+            7,
+            "https://archive.chirpmyradio.com/download?stream=next".into(),
+            "next-20261023.bin".into(),
+            "C:/tmp".into(),
+            4,
+        );
+        item.user_agent = "Mozilla/5.0 (Windows NT 10.0) Chrome/131.0.0.0".into();
+        let text = serde_json::to_string(&item).unwrap();
+        let back: DownloadItem = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.user_agent, item.user_agent);
+        // A queue file written before the field existed still loads: the
+        // missing field falls back to empty.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("user_agent");
+        let old: DownloadItem = serde_json::from_value(value).unwrap();
+        assert!(old.user_agent.is_empty());
+    }
+
     #[test]
     fn categories() {
-        assert_eq!(category_of("a.mp3"), "Music");
+        assert_eq!(category_of("a.mp3"), "Audio");
         assert_eq!(category_of("a.MP4"), "Video");
         assert_eq!(category_of("a.png"), "Image");
         assert_eq!(category_of("a.pdf"), "Document");
@@ -1070,6 +1425,14 @@ mod tests {
         assert_eq!(category_of("a.exe"), "Apps");
         assert_eq!(category_of("a.xyz"), "Other");
         assert_eq!(category_of("noext"), "Other");
+        // The whole audio family is Audio, not just the five the category
+        // used to know.
+        for n in [
+            "a.mp3", "a.m4a", "a.aac", "a.flac", "a.ogg", "a.oga", "a.opus", "a.wav", "a.aif",
+            "a.aiff", "a.weba", "a.mka", "a.wma", "a.amr", "a.m4b", "a.mpa", "a.mp2",
+        ] {
+            assert_eq!(category_of(n), "Audio", "{}", n);
+        }
     }
 
     #[test]
@@ -1189,6 +1552,52 @@ mod tests {
     }
 
     #[test]
+    fn other_quality_of_one_page_is_its_own_download() {
+        let dir = std::env::temp_dir().join("dc_append_quality_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("queue.json");
+        std::fs::write(&p, "[]").unwrap();
+        let page = "https://www.youtube.com/watch?v=x";
+        let item = |q: &str| {
+            let mut d = DownloadItem::new(0, page.into(), "Video.mp4".into(), dir.to_string_lossy().into(), 8);
+            d.quality_pref = q.into();
+            d
+        };
+        assert_eq!(append_to_queue_at(&p, &mut item("1080p")), AppendResult::Added(1));
+        // Same page, other quality, same suggested name: a second row with
+        // its own file, never "already queued" or a takeover of row 1.
+        assert_eq!(append_to_queue_at(&p, &mut item("720p")), AppendResult::Added(2));
+        let items = read_queue_items(&p).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].quality_pref, "1080p");
+        assert_eq!(items[0].filename, "Video.mp4");
+        assert_eq!(items[1].filename, "Video (1).mp4");
+        // The same quality again is still a duplicate.
+        assert_eq!(append_to_queue_at(&p, &mut item("720P")), AppendResult::AlreadyQueued(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removed_ids_are_never_reused() {
+        let dir = std::env::temp_dir().join("dc_append_ids_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("queue.json");
+        std::fs::write(&p, "[]").unwrap();
+        let item = |n: &str| DownloadItem::new(0, format!("https://e.com/{n}"), n.into(), dir.to_string_lossy().into(), 8);
+        assert_eq!(append_to_queue_at(&p, &mut item("a.zip")), AppendResult::Added(1));
+        assert_eq!(append_to_queue_at(&p, &mut item("b.zip")), AppendResult::Added(2));
+        // The newest row is removed (CLI `remove`, main window delete)…
+        let mut items = read_queue_items(&p).unwrap();
+        items.retain(|d| d.id != 2);
+        write_queue(&p, &items).unwrap();
+        // …and the next capture must not inherit its id.
+        assert_eq!(append_to_queue_at(&p, &mut item("c.zip")), AppendResult::Added(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn corrupt_queue_is_never_wiped() {
         let dir = std::env::temp_dir().join("dc_append_corrupt_test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1289,6 +1698,35 @@ mod tests {
     }
 
     #[test]
+    fn a_url_name_cannot_escape_the_download_folder() {
+        // One percent-encoded path segment must not turn into a path of its
+        // own when the name is joined onto the download folder.
+        let name = filename_from_url("https://h/x/..%2f..%2fboot.ini");
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains('\\'), "{name}");
+        assert!(!name.is_empty(), "{name}");
+        // A literal dot-dot segment is resolved by the URL parser itself.
+        assert_eq!(filename_from_url("https://h/x/../../boot.ini"), "boot.ini");
+        // A segment that is nothing but dots is not a name: an earlier one wins.
+        assert_eq!(filename_from_url("https://h/x/%2e%2e/file.mp4"), "file.mp4");
+        // A backslash separator is neutralised too.
+        assert_eq!(filename_from_url("https://h/x/a%5cb.mp4"), "a_b.mp4");
+        // The name is a single file name, never a nested path.
+        for raw in [
+            "https://h/x/..%2f..%2fboot.ini",
+            "https://h/x/%2e%2e%2f%2e%2e%2fsecret.txt",
+            "https://h/x/a%5cb.mp4",
+        ] {
+            let n = filename_from_url(raw);
+            assert!(!n.contains('/') && !n.contains('\\'), "{raw} -> {n}");
+            assert!(
+                std::path::Path::new(&n).file_name().map(|f| f.to_string_lossy() == n).unwrap_or(false),
+                "{raw} -> {n}"
+            );
+        }
+    }
+
+    #[test]
     fn mime_naming_matrix() {
         // P1: extension-from-MIME only rescues last-resort names.
         assert_eq!(ext_for_mime("video/mp4"), Some(".mp4"));
@@ -1298,6 +1736,10 @@ mod tests {
         assert_eq!(ext_for_mime("audio/mpeg"), Some(".mp3"));
         assert_eq!(ext_for_mime("image/jpeg"), Some(".jpg"));
         assert_eq!(ext_for_mime("application/pdf"), Some(".pdf"));
+        // A caption file keeps its own suffix.
+        assert_eq!(ext_for_mime("text/vtt"), Some(".vtt"));
+        assert_eq!(ext_for_mime("text/vtt; charset=utf-8"), Some(".vtt"));
+        assert_eq!(ext_for_mime("application/x-subrip"), Some(".srt"));
         assert_eq!(ext_for_mime("application/octet-stream"), None);
         assert_eq!(ext_for_mime("text/html"), None);
         assert_eq!(ext_for_mime(""), None);
@@ -1326,6 +1768,13 @@ mod tests {
         assert_eq!(ytid, "aqz-KE-bpKQ.mp4");
         let disp = filename_from_url_with_mime("https://h/dl?id=7", Some("application/pdf"));
         assert_eq!(disp, "dl.pdf");
+        // A caption URL names no file: the MIME gives it its suffix, so the
+        // caption is saved as a caption and not as an unnamed blob.
+        let cap = filename_from_url_with_mime(
+            "https://www.youtube.com/api/timedtext?v=abc123&lang=en&fmt=vtt",
+            Some("text/vtt"),
+        );
+        assert!(cap.ends_with(".vtt"), "{cap}");
         // unknown mime: usable bare names stay, true fallbacks keep .bin
         let keep = filename_from_url_with_mime("https://h/nameless", Some("text/html"));
         assert_eq!(keep, "nameless");
@@ -1394,6 +1843,22 @@ mod tests {
     }
 
     #[test]
+    fn a_magnet_is_never_a_download_url() {
+        // A magnet goes to the cloud provider panel, which turns it into an
+        // ordinary HTTPS address. It must never reach the download queue,
+        // and it must never reach the Links window: upstream's `links_batch`
+        // filters through `is_download_url`, so a magnet can never be
+        // picked there either.
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        assert!(is_magnet(magnet));
+        assert!(!is_download_url(magnet));
+        assert!(!is_download_url("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=file"));
+        assert!(!is_download_url("MAGNET:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"));
+        // A plain http address is still a download URL.
+        assert!(is_download_url("https://example.test/video.mp4"));
+    }
+
+    #[test]
     fn folder_rules_and_templates() {
         let rules = default_folder_rules();
         assert!(rules.iter().find(|r| r.folder == "Video").unwrap().matches("a.MP4"));
@@ -1456,5 +1921,119 @@ mod tests {
         let v3: serde_json::Value = serde_json::json!({"assets": []});
         assert_eq!(pick_windows_asset(&v3), None);
         assert_eq!(pick_windows_asset(&serde_json::json!({})), None);
+    }
+}
+
+/// Overlay only fields owned by this writer, preserving plugin preferences.
+pub fn merge_ui_values(mut current:serde_json::Value,patch:serde_json::Value)->serde_json::Value {
+    if !current.is_object(){current=serde_json::json!({});}
+    if let (Some(target),Some(changes))=(current.as_object_mut(),patch.as_object()) {
+        for (key,value) in changes {target.insert(key.clone(),value.clone());}
+    }
+    current
+}
+#[cfg(test)]
+mod preference_merge_tests {
+    #[test]fn main_window_save_keeps_helper_locations(){
+        let saved=super::merge_ui_values(serde_json::json!({"ytdlp_source":"custom","ytdlp_custom_path":"/home/user/yt-dlp","ffmpeg_custom_path":"/home/user/ffmpeg","theme":"dark"}),serde_json::json!({"columns":["name"],"theme":"light"}));
+        assert_eq!(saved["ytdlp_source"],"custom");assert_eq!(saved["ffmpeg_custom_path"],"/home/user/ffmpeg");assert_eq!(saved["theme"],"light");
+    }
+}
+
+/// An older install still carries the overlay style in `ui.json`. The file
+/// must still load, and the next save must leave the obsolete keys out so
+/// that no later reader mistakes them for a live setting.
+#[cfg(test)]
+mod overlay_migration_tests {
+    use super::*;
+
+    #[test]
+    fn an_old_ui_state_file_loses_the_overlay_keys_on_save() {
+        let dir = std::env::temp_dir().join("dc_ui_overlay_migration_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui.json");
+        // The file as an older install left it.
+        let old = serde_json::json!({
+            "columns": ["Name", "Size"],
+            "theme": "dark",
+            "overlay_style": "modern",
+            "overlay_style_source": "extension",
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+
+        // Loading the old file must not fail.
+        let current: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(current.get("theme").and_then(|x| x.as_str()), Some("dark"));
+
+        // The UI-state save path: overlay the window's own keys onto the
+        // file and write it back.
+        let merged = merge_ui_values(
+            current,
+            serde_json::json!({"columns": ["Name"], "show_complete": true}),
+        );
+        atomic_write(
+            &path,
+            serde_json::to_string_pretty(&merged).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let obj = written.as_object().unwrap();
+        // The obsolete keys are gone.
+        for k in OBSOLETE_UI_KEYS {
+            assert!(!obj.contains_key(k), "{k} survived the save");
+        }
+        // Nothing else broke: the window's own keys are there, and the keys
+        // the app does not own are still there.
+        assert_eq!(obj.get("theme").and_then(|x| x.as_str()), Some("dark"));
+        assert_eq!(
+            obj.get("columns")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            obj.get("show_complete").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod audit_lock_tests {
+    use super::*;
+    #[test]
+    fn audit_active_lock_is_not_stolen_after_twenty_seconds() {
+        let name=format!("audit-held-{}",std::process::id());
+        let first=fs_lock(&name);
+        assert!(first.owned());
+        let path=config_dir().unwrap().join(format!("{name}.lock"));
+        let file=std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()-std::time::Duration::from_secs(60))).unwrap();
+        let second=fs_lock(&name);
+        assert!(!second.owned(),"a live owner's lock must never expire");
+        drop(second);drop(first);
+        assert!(fs_lock(&name).owned());
+    }
+}
+
+#[cfg(all(test,unix))]
+mod audit_private_state_tests {
+    #[test]
+    fn replacing_state_makes_credentials_private_and_cleans_temporary_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir=std::env::temp_dir().join(format!("dc-private-state-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();let p=dir.join("state.json");
+        std::fs::write(&p,b"old").unwrap();
+        std::fs::set_permissions(&p,std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::atomic_write(&p,b"private").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(),b"private");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,0o600);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(),1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

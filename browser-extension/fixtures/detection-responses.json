@@ -1,0 +1,16 @@
+[
+  {"name":"opaque video in a permitted iframe", "type":"sub_frame", "url":"https://media.example.test/stream?id=1", "mime":"video/mp4", "status":200, "expected":"file"},
+  {"name":"top-level native audio document", "type":"main_frame", "url":"https://media.example.test/song", "mime":"audio/ogg", "status":200, "expected":"file"},
+  {"name":"object player", "type":"object", "url":"https://media.example.test/movie.webm", "mime":"video/webm", "status":200, "expected":"file"},
+  {"name":"opaque HLS legacy audio MIME", "type":"xmlhttprequest", "url":"https://media.example.test/master?token=exact", "mime":"audio/x-mpegurl", "status":200, "expected":"playlist"},
+  {"name":"opaque DASH response", "type":"xmlhttprequest", "url":"https://media.example.test/manifest", "mime":"application/dash+xml", "status":200, "expected":"playlist"},
+  {"name":"plain-text HLS", "type":"xmlhttprequest", "url":"https://media.example.test/master.m3u8", "mime":"text/plain", "status":200, "expected":"playlist"},
+  {"name":"binary fragment", "type":"xmlhttprequest", "url":"https://media.example.test/seg-01.m4s", "mime":"application/octet-stream", "status":206, "expected":"segment"},
+  {"name":"binary installer is not media", "type":"other", "url":"https://media.example.test/setup.exe", "mime":"application/octet-stream", "status":200, "expected":null},
+  {"name":"binary WASM is not media", "type":"xmlhttprequest", "url":"https://media.example.test/runtime.wasm", "mime":"application/octet-stream", "status":200, "expected":null},
+  {"name":"HTML error masquerades as MP4", "type":"media", "url":"https://media.example.test/movie.mp4", "mime":"text/html", "status":200, "expected":null},
+  {"name":"JSON API URL mentions media", "type":"xmlhttprequest", "url":"https://media.example.test/api?next=master.m3u8", "mime":"application/json", "status":200, "expected":null},
+  {"name":"failed media authorization", "type":"media", "url":"https://media.example.test/movie.mp4", "mime":"video/mp4", "status":403, "expected":null},
+  {"name":"redirect is not the playable response", "type":"media", "url":"https://media.example.test/movie.mp4", "mime":"video/mp4", "status":302, "expected":null},
+  {"name":"image is not video", "type":"image", "url":"https://media.example.test/thumb.jpg", "mime":"image/jpeg", "status":200, "expected":null}
+]

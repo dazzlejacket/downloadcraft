@@ -3,19 +3,26 @@ use futures_util::StreamExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// Shared state between the UI thread and the download task.
 pub struct SharedState {
     pub downloaded: AtomicU64,
     pub total: AtomicU64,
     pub has_total: AtomicBool,
+    /// Duration/audio expectations from the player, manifest or extractor.
+    pub expected_duration: AtomicU64,
+    pub expects_audio: AtomicBool,
     /// Transfer rate in bytes/s reported by the helper itself (yt-dlp). Left at
     /// 0 by the built-in engine, which lets the UI measure the rate from the
     /// byte counter instead.
     pub speed_bps: AtomicU64,
     pub paused: AtomicBool,
     pub cancelled: AtomicBool,
+    /// Set only after the engine and all final validation have succeeded.
+    pub succeeded: AtomicBool,
+    /// External tools pause by stopping and restarting from their partial files.
+    pub external_helper: AtomicBool,
     /// Engine-detected filename (Content-Disposition / video title).
     pub resolved_name: std::sync::Mutex<Option<String>>,
     /// Whether the server supports range resume.
@@ -26,6 +33,9 @@ pub struct SharedState {
     pub part_done: std::sync::Mutex<Vec<u64>>,
     /// Set when YouTube answers with a bot-check wall (HTTP 429 /sorry).
     pub rate_limited: AtomicBool,
+    /// Set when the server answered with a Cloudflare browser check instead
+    /// of the file (the "Just a moment..." interstitial).
+    pub challenged: AtomicBool,
     /// What the transfer is doing when it is not moving bytes — the helper's
     /// own phase names ("Getting info", "Merging"), empty for the built-in
     /// engine, which is always transferring once it has started. yt-dlp spends
@@ -44,6 +54,14 @@ pub struct SharedState {
     /// frame size read back with ffprobe. Empty while unknown, so the UI can
     /// show what really landed instead of the browser's guess.
     pub resolution: std::sync::Mutex<String>,
+    /// Set once a live HLS playlist is being recorded. The UI uses it to treat
+    /// Stop as "finish the recording" instead of "pause for later".
+    pub live: AtomicBool,
+    /// Fragment index/count while a helper fetches a fragmented stream
+    /// (count 0 = not fragmented). Such a stream has no size until it is
+    /// done, so this is what the progress bar and Part Info show.
+    pub frag_index: AtomicU64,
+    pub frag_count: AtomicU64,
 }
 
 impl SharedState {
@@ -52,18 +70,26 @@ impl SharedState {
             downloaded: AtomicU64::new(0),
             total: AtomicU64::new(0),
             has_total: AtomicBool::new(false),
+            expected_duration: AtomicU64::new(0),
+            expects_audio: AtomicBool::new(false),
             speed_bps: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            succeeded: AtomicBool::new(false),
+            external_helper: AtomicBool::new(false),
             resolved_name: std::sync::Mutex::new(None),
             resumable: AtomicBool::new(false),
             part_total: std::sync::Mutex::new(Vec::new()),
             part_done: std::sync::Mutex::new(Vec::new()),
             rate_limited: AtomicBool::new(false),
+            challenged: AtomicBool::new(false),
             phase: std::sync::Mutex::new(String::new()),
             error: std::sync::Mutex::new(None),
             note: std::sync::Mutex::new(None),
             resolution: std::sync::Mutex::new(String::new()),
+            live: AtomicBool::new(false),
+            frag_index: AtomicU64::new(0),
+            frag_count: AtomicU64::new(0),
         }
     }
 
@@ -158,6 +184,8 @@ pub struct EngineOpts {
     /// Optional expected SHA-256 hex digest; verified after transfer.
     /// Empty = skip verification.
     pub expected_sha256: String,
+    pub expected_duration_secs: u64,
+    pub require_audio: bool,
     /// When true, an existing destination file is replaced instead of
     /// auto-renaming to `name (1).ext`.
     pub overwrite_existing: bool,
@@ -168,6 +196,73 @@ pub struct EngineOpts {
     /// Live scheduler override (speed windows): when present, the rate
     /// limiter honors it over `speed_limit_bps` without restarts.
     pub global_limit: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Maximum concurrent connections to ONE host across every download
+    /// (Queue v2). 0 = no extra cap. Enforced process-wide, so three
+    /// simultaneous jobs cannot open 3×8 sockets to the same server.
+    pub per_host_conns: usize,
+    /// Origin / Authorization / CDN x-* headers the browser player sent with
+    /// the captured media, replayed so token-checked CDNs don't answer 403.
+    pub captured_headers: CapturedHeaders,
+}
+
+/// Request headers captured by the extension for one download. They are
+/// sent only to the site they were captured from, never to unrelated hosts a
+/// playlist or redirect points at (bearer tokens must not leak).
+#[derive(Debug, Clone, Default)]
+pub struct CapturedHeaders {
+    site: String,
+    headers: Vec<(String, String)>,
+}
+
+impl CapturedHeaders {
+    pub fn for_url(url: &str, headers: &std::collections::BTreeMap<String, String>) -> Self {
+        let Some(site) = site_of_url(url) else { return Self::default() };
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .filter(|(k, v)| replayable_header(k) && !v.is_empty() && !v.contains(['\r', '\n']))
+            .collect();
+        if headers.is_empty() { Self::default() } else { Self { site, headers } }
+    }
+
+    fn applies_to(&self, url: &str) -> bool {
+        !self.headers.is_empty() && site_of_url(url).as_deref() == Some(self.site.as_str())
+    }
+}
+
+/// Which captured request headers may be replayed by the engine. Cookie and
+/// Referer travel in their own fields; hop-by-hop, range and fetch-metadata
+/// headers are the engine's own business.
+pub fn replayable_header(name: &str) -> bool {
+    name == "origin" || name == "authorization" || (name.starts_with("x-") && name != "x-client-data")
+}
+
+/// Registrable site of a URL's host ("a.b.example.co.uk" -> "example.co.uk",
+/// "rr1.googlevideo.com" -> "googlevideo.com"). Approximate public-suffix
+/// handling: a two-letter country TLD under a short second level (co.uk,
+/// com.au) keeps three labels.
+fn site_of_url(url: &str) -> Option<String> {
+    let host = reqwest::Url::parse(url).ok()?.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host.parse::<std::net::IpAddr>().is_ok() || !host.contains('.') {
+        return Some(host);
+    }
+    // Multi-tenant hosting: every customer has its own subdomain, so the
+    // site is the whole host (d111.cloudfront.net is not d222's).
+    const SHARED_SUFFIXES: &[&str] = &[
+        "cloudfront.net", "akamaized.net", "akamaihd.net", "edgesuite.net", "azureedge.net",
+        "blob.core.windows.net", "fastly.net", "b-cdn.net", "r2.dev", "r2.cloudflarestorage.com",
+        "workers.dev", "pages.dev", "github.io", "githubusercontent.com", "gitlab.io",
+        "herokuapp.com", "appspot.com", "web.app", "firebaseapp.com", "netlify.app",
+        "vercel.app", "amazonaws.com", "storage.googleapis.com", "googleusercontent.com",
+        "digitaloceanspaces.com", "backblazeb2.com", "onrender.com", "fly.dev",
+    ];
+    if SHARED_SUFFIXES.iter().any(|s| host.ends_with(&format!(".{s}"))) {
+        return Some(host);
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let n = labels.len();
+    let keep = if n >= 3 && labels[n - 1].len() == 2 && labels[n - 2].len() <= 3 { 3 } else { 2 };
+    Some(labels[n.saturating_sub(keep)..].join("."))
 }
 
 impl Default for EngineOpts {
@@ -184,15 +279,23 @@ impl Default for EngineOpts {
             proxy_url: String::new(),
             allow_rename: true,
             expected_sha256: String::new(),
+            expected_duration_secs: 0,
+            require_audio: false,
             overwrite_existing: false,
             quality_pref: String::new(),
             global_limit: None,
+            per_host_conns: 0,
+            captured_headers: CapturedHeaders::default(),
         }
     }
 }
 
 impl EngineOpts {
     pub fn build_client(&self) -> Result<reqwest::Client> {
+        self.build_client_redirects(true)
+    }
+
+    fn build_client_redirects(&self, follow: bool) -> Result<reqwest::Client> {
         // HTTP/1.1 only: several media servers RST or truncate H2 streams
         // from non-browser TLS stacks, while plain H1 range GETs work.
         // IPv4-only egress: a broken IPv6 path (tunnel/relay) completes TCP
@@ -205,11 +308,32 @@ impl EngineOpts {
         // dozens of short requests per file) + TCP keepalives so throttled
         // CDN idle sockets don't die mid-range. H2/IPv6 stay OFF until a
         // live CDN proof run clears them (see P2 in docs/ENGINE_ROADMAP.md).
+        // Captured headers ride on every request, and on a redirect reqwest
+        // strips only Authorization/Cookie: an x-* token or Origin would
+        // follow a redirect to any host. Refuse redirects that leave the
+        // captured site instead (the browser already resolved its own).
+        let redirect = match self.captured_headers.headers.is_empty() {
+            true => reqwest::redirect::Policy::limited(10),
+            false => {
+                let site = self.captured_headers.site.clone();
+                reqwest::redirect::Policy::custom(move |attempt| {
+                    if attempt.previous().len() >= 10 {
+                        attempt.error("too many redirects")
+                    } else if site_of_url(attempt.url().as_str()).as_deref() != Some(site.as_str()) {
+                        attempt.error("redirected to another site while carrying captured browser headers; capture the video again from its page")
+                    } else {
+                        attempt.follow()
+                    }
+                })
+            }
+        };
+        let redirect = if follow { redirect } else { reqwest::redirect::Policy::none() };
         let mut b = reqwest::Client::builder()
             .user_agent(self.user_agent.clone())
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .redirect(redirect)
             .local_address(std::net::IpAddr::from([0, 0, 0, 0]))
             .http1_only()
+            .tcp_nodelay(true)
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .pool_max_idle_per_host(16)
             .tcp_keepalive(std::time::Duration::from_secs(60));
@@ -262,7 +386,7 @@ impl EngineOpts {
                     format!("\"Chromium\";v=\"{v}\", \"Google Chrome\";v=\"{v}\", \"Not-A.Brand\";v=\"99\""),
                 )
                 .header("sec-ch-ua-mobile", "?0")
-                .header("sec-ch-ua-platform", "\"Windows\"");
+                .header("sec-ch-ua-platform", format!("\"{}\"", client_hint_platform(&self.user_agent)));
         }
         // Default page referer for social CDNs when the caller captured none:
         // bare CDN hosts (fbcdn/instagram) often 403 Range requests with no
@@ -284,6 +408,16 @@ impl EngineOpts {
         if !self.cookie.trim().is_empty() {
             r = r.header(reqwest::header::COOKIE, self.cookie.trim().to_string());
         }
+        if url.is_some_and(|u| self.captured_headers.applies_to(u)) {
+            for (name, value) in &self.captured_headers.headers {
+                if let (Ok(n), Ok(v)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) {
+                    r = r.header(n, v);
+                }
+            }
+        }
         if !self.username.trim().is_empty() {
             r = r.basic_auth(
                 self.username.trim(),
@@ -296,6 +430,22 @@ impl EngineOpts {
         }
         r
     }
+}
+
+/// Streaming write buffer for the network loops. `tokio::fs::File` turns
+/// every `write_all` into a blocking-pool round trip, so a stream that yields
+/// 8–16 KiB chunks pays one dispatch per chunk; a 1 MiB buffer cuts that ~64×
+/// and keeps the socket drain loop off the disk path.
+const WRITE_BUF: usize = 1 << 20;
+
+fn client_hint_platform(ua: &str) -> &'static str {
+    if ua.contains("Android") { "Android" }
+    else if ua.contains("iPhone") || ua.contains("iPad") { "iOS" }
+    else if ua.contains("Windows") { "Windows" }
+    else if ua.contains("Macintosh") { "macOS" }
+    else if ua.contains("CrOS") { "Chrome OS" }
+    else if ua.contains("Linux") { "Linux" }
+    else { "Unknown" }
 }
 
 pub(crate) async fn wait_if_paused(shared: &Arc<SharedState>) -> Result<()> {
@@ -346,10 +496,229 @@ struct ResumeMeta {
     url: String,
     total: Option<u64>,
     conns: usize,
+    /// Version binding of the saved bytes (QR-02). Absent in sidecars
+    /// written before this change: those are re-checked against the
+    /// server (overlap window) instead of being trusted.
+    #[serde(default)]
+    validator: Option<Validator>,
+}
+
+/// HTTP validators that bind saved bytes to one exact version of a
+/// resource (QR-02).
+///
+/// Only a STRONG ETag proves that two responses carry the same bytes:
+/// `W/"…"` is explicitly allowed to change meaning between responses, so
+/// it is never stored. `Last-Modified` is the fallback condition for
+/// servers that send no ETag at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Validator {
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub modified: Option<String>,
+}
+
+impl Validator {
+    /// Read the validators out of a response.
+    pub(crate) fn read(h: &reqwest::header::HeaderMap) -> Option<Self> {
+        let text = |key: reqwest::header::HeaderName| {
+            h.get(key)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let etag = text(reqwest::header::ETAG)
+            .filter(|v| !v.starts_with("W/") && v.starts_with('"') && v.ends_with('"'));
+        let modified = text(reqwest::header::LAST_MODIFIED);
+        (etag.is_some() || modified.is_some()).then_some(Self { etag, modified })
+    }
+
+    /// The `If-Range` condition: a strong ETag wins over a date.
+    pub(crate) fn condition(&self) -> Option<&str> {
+        self.etag.as_deref().or(self.modified.as_deref())
+    }
+
+    /// Do both sets of validators describe the same version of the file?
+    /// Anything unproven counts as "not the same": the caller then
+    /// re-checks the saved bytes instead of trusting them.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        match (&self.etag, &other.etag) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => self.modified == other.modified,
+            _ => false,
+        }
+    }
+}
+
+/// The saved bytes belong to a different version of the resource (QR-02).
+/// The caller discards them and restarts the transfer from scratch.
+#[derive(Debug)]
+struct SourceChanged;
+
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the source changed on the server — the saved data was discarded")
+    }
+}
+impl std::error::Error for SourceChanged {}
+
+fn source_changed() -> anyhow::Error {
+    anyhow::Error::new(SourceChanged)
+}
+
+fn is_source_changed(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<SourceChanged>().is_some()
+}
+
+/// Parse `Content-Range: bytes <first>-<last>/<total>`.
+fn content_range(h: &reqwest::header::HeaderMap) -> Option<(u64, u64, Option<u64>)> {
+    let text = h.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?.trim();
+    let rest = text.strip_prefix("bytes ")?;
+    let (span, total) = rest.split_once('/')?;
+    let (first, last) = span.split_once('-')?;
+    let first = first.trim().parse::<u64>().ok()?;
+    let last = last.trim().parse::<u64>().ok()?;
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse::<u64>().ok()?),
+    };
+    Some((first, last, total))
+}
+
+/// How many bytes at the end of a saved prefix are re-fetched and compared
+/// when no validator proves the versions match (QR-02).
+const OVERLAP_WINDOW: u64 = 4096;
+
+/// Remove every partial file and the sidecar of `dest`.
+///
+/// Used when the saved bytes turn out to belong to a different version of
+/// the resource: they are discarded, never appended to.
+fn discard_partials(dest: &std::path::Path) {
+    let _ = std::fs::remove_file(dest.with_extension("dcpart"));
+    let _ = std::fs::remove_file(resume_meta_path(dest));
+    for i in 0..16 {
+        let _ = std::fs::remove_file(dest.with_extension(format!("dcpart{i}")));
+    }
+}
+
+/// Compare the tail of a saved range with the server's copy (QR-02).
+///
+/// Without a strong validator nothing proves that the saved bytes still
+/// belong to the resource. Re-fetching a small window of the file and
+/// comparing it byte for byte is the only safe answer: equal -> the
+/// saved range is the same resource and may be continued; different ->
+/// the resource changed and the saved bytes must be discarded.
+///
+/// `part_start` is the absolute offset of the part file inside the
+/// resource, `have` the number of bytes already saved in it.
+async fn overlap_matches(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    part: &std::path::Path,
+    part_start: u64,
+    have: u64,
+) -> Result<bool> {
+    if have == 0 {
+        return Ok(true);
+    }
+    let window = have.min(OVERLAP_WINDOW);
+    let from = part_start + have - window;
+    let to = part_start + have - 1;
+    let resp = opts
+        .get(client, url)
+        .header(reqwest::header::RANGE, format!("bytes={from}-{to}"))
+        .send()
+        .await?;
+    // A server that cannot serve the window cannot prove anything: the
+    // saved range stays unproven and the caller restarts instead.
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(false);
+    }
+    match content_range(resp.headers()) {
+        Some((first, last, _)) if first == from && last == to => {}
+        _ => return Ok(false),
+    }
+    let mut remote = Vec::with_capacity(window as usize);
+    let mut stream = resp.bytes_stream();
+    while let Some(next) = stream.next().await {
+        let chunk = next?;
+        if remote.len() as u64 + chunk.len() as u64 > window {
+            return Ok(false);
+        }
+        remote.extend_from_slice(&chunk);
+    }
+    if remote.len() as u64 != window {
+        return Ok(false);
+    }
+    let mut file = tokio::fs::File::open(part).await?;
+    file.seek(std::io::SeekFrom::Start(part_start + have - window))
+        .await?;
+    let mut local = vec![0u8; window as usize];
+    file.read_exact(&mut local).await?;
+    Ok(local == remote)
+}
+
+/// Check that the saved bytes still belong to the resource being served
+/// (QR-02).
+///
+/// - validators that disagree prove a change: the saved bytes must be
+///   discarded;
+/// - a response that repeats no validator proves nothing: an overlap
+///   window of the saved bytes is compared with the server's copy
+///   instead;
+/// - validators that agree prove the saved bytes may be continued.
+///
+/// Returns the validator of the current response (the caller stores it
+/// for the next resume).
+async fn verify_version(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    part: &std::path::Path,
+    part_start: u64,
+    have: u64,
+    saved: Option<&Validator>,
+    resp: &reqwest::Response,
+) -> Result<Option<Validator>> {
+    let current = Validator::read(resp.headers());
+    match (saved, current.as_ref()) {
+        (Some(a), Some(b)) => {
+            if !a.same(b) {
+                return Err(source_changed());
+            }
+        }
+        (Some(_), None) => {
+            // The server did not repeat the validator: prove the saved
+            // bytes by comparing them with the server's own copy.
+            if !overlap_matches(client, opts, url, part, part_start, have).await? {
+                return Err(source_changed());
+            }
+        }
+        (None, _) => {}
+    }
+    Ok(current)
 }
 
 fn resume_meta_path(dest: &std::path::Path) -> std::path::PathBuf {
     dest.with_extension("dcmeta")
+}
+
+/// Resume metadata is useful only while partial data exists. Call after
+/// successful completion/verification; retain it for paused/failed jobs.
+fn cleanup_completed_resume(dest: &std::path::Path) {
+    if !dest.is_file() || dest.with_extension("dcpart").exists()
+        || (0..16).any(|i| dest.with_extension(format!("dcpart{i}")).exists()) {
+        return;
+    }
+    let _ = std::fs::remove_file(resume_meta_path(dest));
+}
+
+fn cleanup_completed_job(dest: &std::path::Path, shared: &Arc<SharedState>) {
+    let resolved = mutex_guard(&shared.resolved_name).clone();
+    let actual = resolved.map(|n| dest.with_file_name(n)).unwrap_or_else(|| dest.to_path_buf());
+    cleanup_completed_resume(&actual);
 }
 
 fn read_resume_meta(dest: &std::path::Path) -> Option<ResumeMeta> {
@@ -357,10 +726,33 @@ fn read_resume_meta(dest: &std::path::Path) -> Option<ResumeMeta> {
     serde_json::from_str(&raw).ok()
 }
 
-fn write_resume_meta(dest: &std::path::Path, url: &str, total: Option<u64>, conns: usize) {
-    let m = ResumeMeta { url: url.to_string(), total, conns };
+fn write_resume_meta(
+    dest: &std::path::Path,
+    url: &str,
+    total: Option<u64>,
+    conns: usize,
+    validator: Option<&Validator>,
+) {
+    let m = ResumeMeta {
+        url: url.to_string(),
+        total,
+        conns,
+        validator: validator.cloned(),
+    };
     if let Ok(json) = serde_json::to_string(&m) {
         let _ = std::fs::write(resume_meta_path(dest), json);
+    }
+}
+
+/// Remember the version of the resource the saved bytes belong to (QR-02).
+/// Only the validator is touched: the URL/total/split binding stays as it
+/// was.
+fn bind_validator(dest: &std::path::Path, validator: &Validator) {
+    if let Some(mut meta) = read_resume_meta(dest) {
+        meta.validator = Some(validator.clone());
+        if let Ok(json) = serde_json::to_string(&meta) {
+            let _ = std::fs::write(resume_meta_path(dest), json);
+        }
     }
 }
 
@@ -392,7 +784,7 @@ pub(crate) fn resume_offset(
         Some(meta) if meta_matches(&meta, url, total, conns) => {
             // Adopt a newly learned total into the binding.
             if meta.total.is_none() && total.is_some() {
-                write_resume_meta(dest, url, total, conns);
+                write_resume_meta(dest, url, total, conns, meta.validator.as_ref());
             }
             // Clamp absurd prefixes (total shrank server-side): the 416
             // paths handle the restart; never resume past the end.
@@ -410,13 +802,13 @@ pub(crate) fn resume_offset(
                 let _ = std::fs::remove_file(dest.with_extension(format!("dcpart{i}")));
             }
             let _ = std::fs::remove_file(resume_meta_path(dest));
-            write_resume_meta(dest, url, total, conns);
+            write_resume_meta(dest, url, total, conns, None);
             0
         }
         None => {
             // Legacy/unbound partial: resume once by length, then bind it.
             // (One-time hole for pre-sidecar files; self-heals on next run.)
-            write_resume_meta(dest, url, total, conns);
+            write_resume_meta(dest, url, total, conns, None);
             have
         }
     }
@@ -498,6 +890,47 @@ pub(crate) fn mutex_guard<'a, T>(m: &'a std::sync::Mutex<T>) -> std::sync::Mutex
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// ---- per-host connection cap (Queue v2) ------------------------------------
+//
+// IDM-style "max connections per server": one process-wide semaphore per host,
+// shared by every download, so a burst of jobs cannot hammer a CDN with more
+// sockets than the user allows. 0 = no extra cap (opt-in in Settings).
+
+type HostSlotMap = std::collections::HashMap<String, (usize, Arc<tokio::sync::Semaphore>)>;
+static HOST_SLOTS: std::sync::OnceLock<std::sync::Mutex<HostSlotMap>> = std::sync::OnceLock::new();
+
+fn host_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+/// Hold a connection slot for `url`'s host until the permit is dropped.
+async fn host_slot(url: &str, cap: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if cap == 0 {
+        return None;
+    }
+    let host = host_of(url);
+    if host.is_empty() {
+        return None;
+    }
+    let sem = {
+        let map = HOST_SLOTS.get_or_init(|| std::sync::Mutex::new(HostSlotMap::new()));
+        let mut g = mutex_guard(map);
+        match g.get(&host) {
+            // A changed cap gets a fresh semaphore; old permits die with it.
+            Some((c, s)) if *c == cap => s.clone(),
+            _ => {
+                let s = Arc::new(tokio::sync::Semaphore::new(cap));
+                g.insert(host, (cap, s.clone()));
+                s
+            }
+        }
+    };
+    sem.acquire_owned().await.ok()
+}
+
 /// Marker for HTTP refusals that must NOT be retried (401/403): the same
 /// request will fail the same way. Attached to the error (instead of
 /// matching "403" substrings in rendered text, which false-positives on
@@ -524,10 +957,7 @@ fn final_err(msg: String) -> anyhow::Error {
 fn http_status_err(url: &str, e: reqwest::Error) -> anyhow::Error {
     let status = e.status();
     if status == Some(reqwest::StatusCode::FORBIDDEN) {
-        if url.contains("googlevideo.com")
-            || url.contains("youtube.com")
-            || url.contains("youtu.be")
-        {
+        if url.contains("googlevideo.com") || is_youtube_video_page(url) {
             return final_err(
                 "YouTube refused this link (403) — stream links expire and are locked to the browser session that created them: replay the video, reopen the ⬇ Download this video menu for a fresh quality row, and download that (progressive ≤720p saves as one ready file)".to_string(),
             );
@@ -549,6 +979,67 @@ fn http_status_err(url: &str, e: reqwest::Error) -> anyhow::Error {
 
 fn is_final_http_error(e: &anyhow::Error) -> bool {
     e.downcast_ref::<FinalHttp>().is_some()
+}
+
+/// Cloudflare marks the browser check it wants the visitor to solve with
+/// `Cf-Mitigated: challenge` (the "Just a moment…" interstitial). The
+/// header is the reliable signal: the page itself is a normal HTML error
+/// document, and its text varies between Cloudflare's templates.
+fn cloudflare_challenge_header(h: &reqwest::header::HeaderMap) -> bool {
+    h.get("cf-mitigated")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("challenge"))
+        .unwrap_or(false)
+}
+
+/// Text markers of Cloudflare's interstitial page. Used when the header is
+/// missing (some edge configurations answer the challenge without it) and
+/// when the page is served with a 200 instead of a 403.
+fn cloudflare_challenge_body(body: &str) -> bool {
+    let low = body.to_ascii_lowercase();
+    // Unambiguous: the challenge widget, the challenge script, or the
+    // interstitial's own instruction line.
+    const STRONG: &[&str] = &[
+        "cf-browser-verification",
+        "cf-chl-",
+        "cf_chl_opt",
+        "__cf_chl_",
+        "cdn-cgi/challenge-platform",
+        "enable javascript and cookies to continue",
+        "checking your browser",
+        "attention required! | cloudflare",
+        "ddos protection by cloudflare",
+    ];
+    if STRONG.iter().any(|m| low.contains(m)) {
+        return true;
+    }
+    // "Just a moment..." is the interstitial's title, but a page may just
+    // mention it - it only counts together with Cloudflare's own wording.
+    low.contains("just a moment")
+        && (low.contains("cloudflare") || low.contains("cf-chl") || low.contains("challenge"))
+}
+
+/// The refusal for a browser check. The check can only be completed in the
+/// user's own browser, so the message says exactly that: the app does not
+/// try to solve it, and nothing is written to disk.
+fn cloudflare_challenge_err() -> anyhow::Error {
+    final_err(
+        "the server wants a browser check (Cloudflare challenge) — open the link in your browser, let the \"Just a moment...\" page finish, then capture the download again with the Download Craft extension (no file was saved)".to_string(),
+    )
+}
+
+/// True when the row expects a file rather than a web page. A name without
+/// an extension (the `download_123.bin` fallback) or with a non-HTML one
+/// means the row wants bytes: an HTML body there is an error page, never
+/// the download.
+fn expects_binary_file(dest: &std::path::Path) -> bool {
+    match dest.extension().and_then(|e| e.to_str()) {
+        Some(ext) => {
+            let low = ext.to_ascii_lowercase();
+            !matches!(low.as_str(), "html" | "htm" | "xhtml")
+        }
+        None => true,
+    }
 }
 
 /// Saturating counter decrement (plain `fetch_sub` wraps to u64::MAX on
@@ -628,17 +1119,101 @@ fn social_page_url(asset: &str, referer: &str) -> Option<String> {
     Some(page.to_string())
 }
 
+/// A URL naming an individual media fragment, rather than an ordinary
+/// complete file which merely supports HTTP Range requests.
+fn is_media_fragment(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else { return false; };
+    let path = u.path().to_ascii_lowercase();
+    let leaf = path.rsplit('/').next().unwrap_or("");
+    if [".m4s", ".cmfv", ".cmfa", ".mpd.seg"].iter().any(|e| path.ends_with(e)) { return true; }
+    if path.ends_with(".ts") {
+        let stem = leaf.trim_end_matches(".ts");
+        if stem.bytes().all(|c| c.is_ascii_digit())
+            || ["seg", "segment", "chunk", "fragment", "s", "filesequence", "sequence"].iter()
+                .any(|p| stem.strip_prefix(p).map(|v| v.trim_start_matches(['-', '_']).starts_with(|c: char| c.is_ascii_digit())).unwrap_or(false)) {
+            return true;
+        }
+    }
+    let media = [".mp4", ".m4a", ".webm", ".mp3", ".aac", ".ts"].iter().any(|e| path.ends_with(e));
+    media && u.query_pairs().any(|(k,v)| {
+        k == "bytestart" || k == "byteend" || (k == "range" && v.split_once('-').map(|(a,b)|
+            !a.is_empty() && !b.is_empty() && a.bytes().all(|c| c.is_ascii_digit()) && b.bytes().all(|c| c.is_ascii_digit())
+        ).unwrap_or(false))
+    })
+}
+
+fn fragment_page(raw: &str, referer: &str) -> Result<Option<String>> {
+    if !is_media_fragment(raw) { return Ok(None); }
+    let page = url::Url::parse(referer).ok().filter(|u| matches!(u.scheme(), "http" | "https")
+        && !looks_media_url(referer) && !is_media_fragment(referer));
+    page.map(|p| Some(p.to_string())).ok_or_else(|| anyhow!(
+        "this URL is a playback fragment, not the complete media — capture the full playlist or the specific player page"))
+}
+
+/// Vimeo fragments are not progressive MP4 files, even when named .mp4.
+fn is_vimeo_fragment(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else { return false; };
+    let host = u.host_str().unwrap_or("");
+    (host == "vimeocdn.com" || host.ends_with(".vimeocdn.com"))
+        && (u.path().contains("/v2/range/") || u.query_pairs().any(|(k, v)| {
+            k == "range" && v.split_once('-').map(|(a, b)| {
+                !a.is_empty() && !b.is_empty()
+                    && a.bytes().all(|c| c.is_ascii_digit())
+                    && b.bytes().all(|c| c.is_ascii_digit())
+            }).unwrap_or(false)
+        }))
+}
+
+/// Manifests and adaptive legs need audio-aware resolution, not HLS concat.
+fn is_vimeo_adaptive(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else { return false; };
+    let host = u.host_str().unwrap_or("");
+    (host == "vimeocdn.com" || host.ends_with(".vimeocdn.com"))
+        && (is_playlist_url(raw) || is_vimeo_fragment(raw)
+            || host.starts_with("vod-adaptive.") || host.starts_with("vod-adaptive-"))
+}
+
+fn vimeo_download_target(raw: &str, referer: &str) -> Result<Option<String>> {
+    if is_vimeo_video_page(raw) { return Ok(Some(raw.to_string())); }
+    if !is_vimeo_adaptive(raw) { return Ok(None); }
+    if is_vimeo_video_page(referer) { return Ok(Some(referer.to_string())); }
+    if is_playlist_url(raw) { return Ok(Some(raw.to_string())); }
+    Err(anyhow!("Vimeo URL is only a playback fragment — capture the full manifest or the specific Vimeo player URL"))
+}
+
+fn vimeo_needs_audio(raw: &str) -> bool {
+    is_vimeo_video_page(raw) || is_vimeo_adaptive(raw)
+}
+
+/// Only a specific video, never a profile/feed. Keep unlisted hashes and query.
+fn is_vimeo_video_page(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else { return false; };
+    if !matches!(u.scheme(), "http" | "https") { return false; }
+    let parts: Vec<_> = u.path().trim_matches('/').split('/').collect();
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    match u.host_str().unwrap_or("") {
+        "player.vimeo.com" => parts.len() == 2 && parts[0] == "video" && numeric(parts[1]),
+        "vimeo.com" | "www.vimeo.com" => (parts.len() == 1 || parts.len() == 2) && numeric(parts[0]),
+        _ => false,
+    }
+}
+
 /// Which site a cookie string belongs to, for the Netscape jar yt-dlp reads.
 /// The wrong domain silently drops every cookie, and Facebook then answers as
 /// a logged-out visitor that hides the video.
-fn cookie_domain(url: &str) -> &'static str {
+fn cookie_domain(url: &str) -> String {
+    if vimeo_needs_audio(url) {
+        return ".vimeo.com".to_string();
+    }
     let low = url.to_ascii_lowercase();
     if low.contains("facebook") || low.contains("fbcdn") || low.contains("fbsbx") {
-        ".facebook.com"
+        ".facebook.com".to_string()
     } else if low.contains("instagram") || low.contains("cdninstagram") {
-        ".instagram.com"
+        ".instagram.com".to_string()
+    } else if low.contains("youtube.com") || low.contains("youtu.be") || low.contains("googlevideo.com") {
+        ".youtube.com".to_string()
     } else {
-        ".youtube.com"
+        url::Url::parse(url).ok().and_then(|u| u.host_str().map(|h| format!(".{h}"))).unwrap_or_default()
     }
 }
 
@@ -690,6 +1265,38 @@ fn is_youtube_page(url: &str) -> bool {
     url.contains("youtube.com") || url.contains("youtu.be")
 }
 
+include!("captions.rs");
+
+/// A caption file YouTube serves itself.
+///
+/// The caption endpoint (`/api/timedtext`) hands out a WebVTT when it is
+/// asked for one (`fmt=vtt`), and its URL carries the video's id (`v=`) —
+/// so every YouTube-shaped test calls it a page, and resolving it as one
+/// downloads the VIDEO the captions belong to instead of the captions.
+pub fn is_youtube_caption_url(url: &str) -> bool {
+    url::Url::parse(url).ok().map(|u| {
+        youtube_host(u.host_str().unwrap_or("")) && u.path() == "/api/timedtext"
+    }).unwrap_or(false)
+}
+
+/// A YouTube *page* is a video to resolve. A YouTube *file* — the caption
+/// endpoint above — is a file to download as it is.
+pub fn is_youtube_video_page(url: &str) -> bool {
+    url::Url::parse(url).ok().map(|u| youtube_host(u.host_str().unwrap_or(""))).unwrap_or(false)
+        && !is_youtube_caption_url(url)
+}
+
+/// Does this URL have to be resolved into a media stream before it can be
+/// downloaded?
+///
+/// An HTML page is a page. A YouTube link is a video page, so the app
+/// resolves it to the stream instead of saving the HTML. A caption file is
+/// neither: it is downloaded as it is.
+pub fn needs_resolve(url: &str, content_type: Option<&str>) -> bool {
+    !is_youtube_caption_url(url) && (content_type.map(|c| c.contains("text/html")).unwrap_or(false)
+        || is_youtube_video_page(url))
+}
+
 /// Verify a finished file against an expected SHA-256 hex digest.
 /// Returns Ok(()) when no digest was requested.
 pub async fn verify_checksum(path: &PathBuf, expected_hex: &str) -> Result<()> {
@@ -713,6 +1320,24 @@ pub async fn verify_checksum(path: &PathBuf, expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
+/// What one probe learned about a URL.
+#[derive(Debug, Default, Clone)]
+pub struct ProbeInfo {
+    /// Total size in bytes, when the server said so.
+    pub total: Option<u64>,
+    /// Whether the server honors Range requests.
+    pub supports_range: bool,
+    /// Content-Type of the final response.
+    pub content_type: Option<String>,
+    /// File name from the final response's Content-Disposition.
+    pub disposition: Option<String>,
+    /// The URL the redirects finally landed on. The file may live somewhere
+    /// else than the captured URL, and only the final URL knows its name.
+    pub final_url: Option<String>,
+    /// The server answered with a Cloudflare browser check, not a file.
+    pub challenged: bool,
+}
+
 /// Probe total size + range support with HEAD, falling back to a 0-0 range GET.
 /// Returns (total, supports_range, content_type, disposition_filename).
 pub async fn probe(
@@ -720,7 +1345,26 @@ pub async fn probe(
     opts: &EngineOpts,
     url: &str,
 ) -> (Option<u64>, bool, Option<String>, Option<String>) {
+    let info = probe_full(client, opts, url).await;
+    (
+        info.total,
+        info.supports_range,
+        info.content_type,
+        info.disposition,
+    )
+}
+
+/// Probe a URL and report everything the engine learned about it: size, range
+/// support, content type, the server's file name, the URL the redirects
+/// landed on, and whether a Cloudflare browser check answered instead of the
+/// file.
+pub async fn probe_full(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+) -> ProbeInfo {
     let dbg = std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok();
+    let mut info = ProbeInfo::default();
     // Try HEAD first — but ONLY trust success responses. Error pages
     // (403/404 with `Content-Length: 0`) must fall through to the Range
     // fallback: treating 0 as a real total poisons everything downstream
@@ -729,6 +1373,9 @@ pub async fn probe(
         if dbg {
             eprintln!("[dbg] probe HEAD status={}", resp.status());
         }
+        // Redirects are followed by the client, so this is the URL the
+        // response really came from.
+        info.final_url = Some(resp.url().to_string());
         if resp.status().is_success() {
             let h = resp.headers();
             let total = h
@@ -745,13 +1392,19 @@ pub async fn probe(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
             let disp = disposition_filename(h);
-            if total.is_some() || disp.is_some() {
-                return (total, accept, ctype, disp);
+            let learned = total.is_some() || disp.is_some();
+            info.total = total;
+            info.supports_range = accept;
+            info.content_type = ctype;
+            info.disposition = disp;
+            info.challenged = cloudflare_challenge_header(h);
+            if learned {
+                return info;
             }
         }
     }
     // Fallback: GET bytes=0-0, parse Content-Range: bytes 0-0/12345
-    if let Ok(resp) = opts
+    if let Ok(mut resp) = opts
         .get(client, url)
         .header(reqwest::header::RANGE, "bytes=0-0")
         .send()
@@ -761,11 +1414,18 @@ pub async fn probe(
         if dbg {
             eprintln!("[dbg] probe GET 0-0 status={status}");
         }
+        info.final_url = Some(resp.url().to_string());
+        // The GET fallback reports no content type (see `probe`), so the
+        // interstitial check below works on the body instead.
+        info.content_type = None;
+        info.supports_range = false;
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
             if let Some(cr) = resp.headers().get(reqwest::header::CONTENT_RANGE) {
                 if let Ok(s) = cr.to_str() {
                     if let Some(total) = s.split('/').next_back().and_then(|t| t.parse::<u64>().ok()) {
-                        return (Some(total), true, None, None);
+                        info.total = Some(total);
+                        info.supports_range = true;
+                        return info;
                     }
                 }
             }
@@ -776,14 +1436,35 @@ pub async fn probe(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
         let disp = disposition_filename(resp.headers());
+        info.disposition = disp;
+        // A browser check is not a file. Recognize it here so the download
+        // fails with a clear message instead of saving the interstitial.
+        if cloudflare_challenge_header(resp.headers()) {
+            info.challenged = true;
+        } else if !status.is_success() || content_type_is_html(resp.headers()) {
+            // Error and interstitial pages are small: read a bounded prefix
+            // of the body to recognize Cloudflare's "Just a moment..." page.
+            let body = read_prefix(&mut resp, 32 * 1024).await;
+            info.challenged = cloudflare_challenge_body(&body);
+        }
         // Error statuses teach nothing: a 403 page's `Content-Length: 0` is
         // not a total (see the HEAD gate above).
         if status.is_success() {
-            return (total, false, None, disp);
+            info.total = total;
+            return info;
         }
-        return (None, false, None, disp);
+        info.total = None;
+        return info;
     }
-    (None, false, None, None)
+    info
+}
+
+/// True when the response announces an HTML body.
+fn content_type_is_html(h: &reqwest::header::HeaderMap) -> bool {
+    h.get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
 }
 
 /// One-shot Range check for expiring signed CDN links: a single
@@ -929,17 +1610,26 @@ pub fn sanitize_filename(s: &str) -> String {
         out = "download.bin".to_string();
     }
     if out.len() > 120 {
-        // keep the extension (char-boundary safe)
+        // Keep the extension, and a closing quality tag (" [1080p]") with it:
+        // a long title in a 3-byte script (Bengali) used to cut the tag to
+        // " [1" and the 1080p and 720p copies of a reel then shared a name.
         if let Some(dot) = out.rfind('.') {
             let (stem, ext) = out.split_at(dot);
-            let keep = 120usize.saturating_sub(ext.len());
+            let tag_at = stem
+                .rfind(" [")
+                .filter(|&i| stem.ends_with(']') && stem.len() - i <= 24);
+            let (stem, tag) = match tag_at {
+                Some(i) => stem.split_at(i),
+                None => (stem, ""),
+            };
+            let keep = 120usize.saturating_sub(ext.len() + tag.len());
             let cut = stem
                 .char_indices()
-                .take_while(|(i, _)| *i < keep)
+                .take_while(|(i, c)| i + c.len_utf8() <= keep)
                 .last()
                 .map(|(i, c)| i + c.len_utf8())
                 .unwrap_or(0);
-            out = format!("{}{}", &stem[..cut], ext);
+            out = format!("{}{}{}", stem[..cut].trim_end(), tag, ext);
         } else {
             let cut = out
                 .char_indices()
@@ -951,6 +1641,26 @@ pub fn sanitize_filename(s: &str) -> String {
         }
     }
     out
+}
+
+/// A file name for a response whose URL carried none: the final URL's last
+/// meaningful segment, plus an extension from the MIME type when that type
+/// is a known binary one. An HTML response never gets an invented extension
+/// (`ext_for_mime` knows no HTML type), and a URL with nothing usable keeps
+/// the clearly-fallback name.
+fn derived_file_name(final_url: &str, ctype: Option<&str>) -> Option<String> {
+    let base = crate::model::filename_from_url(final_url);
+    if crate::model::is_fallback_filename(&base) {
+        return None;
+    }
+    let base = sanitize_filename(&base);
+    if base.contains('.') {
+        return Some(base);
+    }
+    match ctype.and_then(crate::model::ext_for_mime) {
+        Some(ext) => Some(base + ext),
+        None => Some(base),
+    }
 }
 
 /// A resolved playable stream: the video URL plus an optional companion
@@ -1016,6 +1726,13 @@ pub async fn resolve_media(
                 return Some(hit);
             }
         }
+        return None;
+    }
+    // Cloudflare's browser check is not a page either: it carries no media,
+    // and the caller must say "complete the check in your browser" instead
+    // of "this page has no video".
+    if cloudflare_challenge_body(&html) {
+        shared.challenged.store(true, Ordering::SeqCst);
         return None;
     }
     if walled {
@@ -1945,6 +2662,99 @@ async fn resolve_youtube_full(
     })
 }
 
+/// Display-only progress of one HLS segment for Part Info: bytes so far, and
+/// its real size once complete (`total`).
+fn set_segment_progress(shared: &SharedState, idx: usize, done: u64, total: Option<u64>) {
+    if let Ok(mut g) = shared.part_total.lock() {
+        if let Some(slot) = g.get_mut(idx) {
+            match total {
+                Some(t) => *slot = (0, t.max(1) - 1),
+                // Still arriving: an estimate the segment has outgrown would
+                // read as "Finished", so keep the total just past the bytes.
+                None if done > 0 && done >= slot.1 + 1 => *slot = (0, done),
+                None => {}
+            }
+        }
+    }
+    if let Ok(mut g) = shared.part_done.lock() {
+        if let Some(slot) = g.get_mut(idx) {
+            *slot = done;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestKind {
+    Hls,
+    Dash,
+}
+
+/// Response types that may hide a manifest: generic text/binary/XML, or none.
+fn opaque_manifest_type(ctype: Option<&str>) -> bool {
+    let Some(t) = ctype else { return true };
+    let t = t.to_ascii_lowercase();
+    let base = t.split(';').next().unwrap_or("").trim();
+    base.is_empty()
+        || matches!(
+            base,
+            "text/plain"
+                | "application/octet-stream"
+                | "binary/octet-stream"
+                | "application/binary"
+                | "application/x-binary"
+                | "application/xml"
+                | "text/xml"
+        )
+}
+
+/// What the first bytes of a body are, if a manifest (BOM-tolerant).
+fn manifest_kind_of(head: &[u8]) -> Option<ManifestKind> {
+    let text = String::from_utf8_lossy(head);
+    let low = text.trim_start_matches('\u{feff}').trim_start().to_ascii_lowercase();
+    if low.contains("#extm3u") {
+        Some(ManifestKind::Hls)
+    } else if low.contains("<mpd ") || low.contains("<mpd>") || low.contains("<mpd\n") || low.contains("<mpd\r") {
+        Some(ManifestKind::Dash)
+    } else {
+        None
+    }
+}
+
+/// Fetch at most 4 KiB of `url` and classify it as a manifest or not.
+async fn sniff_manifest(client: &reqwest::Client, opts: &EngineOpts, url: &str) -> Option<ManifestKind> {
+    const HEAD: usize = 4096;
+    let resp = opts
+        .get(client, url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", HEAD - 1))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    // A server that ignores Range streams the whole body: stop at HEAD bytes.
+    let mut body = resp.bytes_stream();
+    let mut head = Vec::with_capacity(HEAD);
+    while head.len() < HEAD {
+        match body.next().await {
+            Some(Ok(chunk)) => head.extend_from_slice(&chunk[..chunk.len().min(HEAD - head.len())]),
+            _ => break,
+        }
+    }
+    manifest_kind_of(&head)
+}
+
+/// An HLS/DASH manifest by URL or type. Its byte length is the playlist
+/// text, never the video's size, so dialogs must not show it as one.
+pub fn is_stream_manifest(url: &str, ctype: Option<&str>, mime_hint: &str) -> bool {
+    let is_manifest_type = |t: &str| {
+        let t = t.to_ascii_lowercase();
+        t.contains("mpegurl") || t.contains("dash+xml")
+    };
+    is_playlist_url(url) || ctype.is_some_and(is_manifest_type) || is_manifest_type(mime_hint)
+}
+
 /// True for HLS/DASH playlists: the progressive engine cannot consume these
 /// as a single file (they need segment-assembly + transmux).
 fn is_playlist_url(u: &str) -> bool {
@@ -2510,6 +3320,22 @@ fn hls_media_sequence(text: &str) -> u64 {
     0
 }
 
+/// `#EXT-X-TARGETDURATION` — how often a live playlist gains a segment.
+fn hls_target_duration(text: &str) -> u64 {
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("#EXT-X-TARGETDURATION:") {
+            let raw = rest.trim();
+            return raw
+                .split(['.', ',', ' '])
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(6);
+        }
+    }
+    6
+}
+
 fn parse_hex_iv(s: &str) -> Option<[u8; 16]> {
     let t = s.trim().strip_prefix("0x").or_else(|| s.trim().strip_prefix("0X")).unwrap_or(s.trim());
     if t.len() != 32 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -2526,15 +3352,27 @@ fn parse_hex_iv(s: &str) -> Option<[u8; 16]> {
 /// block-aligned by the packager). Backed by the vendored FIPS-197
 /// implementation (`crate::aes128`, zero new dependencies).
 fn aes128_cbc_decrypt(data: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Result<Vec<u8>> {
-    crate::aes128::cbc_decrypt(key, iv, data).map_err(|e| anyhow!("AES: {e}"))
+    let mut out = crate::aes128::cbc_decrypt(key, iv, data).map_err(|e| anyhow!("AES: {e}"))?;
+    // RFC 8216 §4.3.2.4: AES-128 segments carry PKCS7 padding. Leaving it
+    // put 1–16 junk bytes after every segment (breaking TS packet sync and
+    // fMP4 box chains in the merged file).
+    if let Some(&n) = out.last() {
+        let n = n as usize;
+        if (1..=16).contains(&n) && n <= out.len() && out[out.len() - n..].iter().all(|b| *b as usize == n) {
+            out.truncate(out.len() - n);
+        }
+    }
+    Ok(out)
 }
 
 /// HLS VOD download (clean-room, no IDM code): fetch playlist, follow the
 /// best variant, fetch segments in parallel (4–8), decrypt AES-128 when
 /// present (incl. key rotation, one fetch per distinct key URI), prepend
 /// the EXT-X-MAP init section when present, resume via a sidecar map,
-/// concat in order. Live, oversize, and SAMPLE-AES playlists are rejected
-/// with guidance — and DRM (Widevine/FairPlay) is never bypassed.
+/// concat in order. Live playlists (no ENDLIST) are recorded by
+/// [`record_live_hls`] until the stream ends or the user stops it; oversize and
+/// SAMPLE-AES playlists are rejected with guidance — and DRM
+/// (Widevine/FairPlay) is never bypassed.
 async fn download_hls(
     playlist_url: &str,
     dest: &PathBuf,
@@ -2543,6 +3381,24 @@ async fn download_hls(
     shared: &Arc<SharedState>,
 ) -> Result<()> {
     const MAX_SEGS: usize = 2000;
+    // An existing file is kept (numbered copy) unless overwrite was chosen,
+    // as on the progressive path; the final rename used to replace it
+    // silently. A resumable job (segment map or parts at this name) stays.
+    let renamed;
+    let dest: &PathBuf = if opts.allow_rename
+        && dest.exists()
+        && !opts.overwrite_existing
+        && !dest.with_extension("hlsmap").exists()
+        && !dest.with_extension("hls0").exists()
+    {
+        renamed = crate::model::conflict_free_dest(dest);
+        if let Some(name) = renamed.file_name().map(|s| s.to_string_lossy().to_string()) {
+            mutex_guard(&shared.resolved_name).replace(name);
+        }
+        &renamed
+    } else {
+        dest
+    };
     let _job = claim_dest_job(dest).ok_or_else(|| {
         anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
     })?;
@@ -2562,6 +3418,14 @@ async fn download_hls(
         .text()
         .await
         .map_err(|e| anyhow!("playlist read: {e}"))?;
+    let external_audio = hls_external_audio(&text);
+    if external_audio || text.contains("#EXT-X-BYTERANGE") || text.contains("BYTERANGE=") {
+        if external_audio { shared.expects_audio.store(true, Ordering::SeqCst); }
+        let mut helper_opts = opts.clone();
+        helper_opts.require_audio |= external_audio;
+        let exe = ensure_ytdlp(&client).await?;
+        return download_with_ytdlp(&exe, playlist_url, dest, connections, &helper_opts, shared).await;
+    }
     if text.contains("#EXT-X-STREAM-INF") {
         pl_url = hls_pick_variant(&text, &pl_url).ok_or_else(|| {
             anyhow!("could not pick a variant from this master playlist — use the extension MP4 qualities")
@@ -2577,22 +3441,29 @@ async fn download_hls(
             .await
             .map_err(|e| anyhow!("variant read: {e}"))?;
     }
+    if text.contains("#EXT-X-ENDLIST") {
+        let seconds: f64 = text.lines().filter_map(|l| l.trim().strip_prefix("#EXTINF:")
+            .and_then(|v| v.split(',').next()).and_then(|v| v.parse::<f64>().ok())).sum();
+        if seconds.is_finite() && seconds > 0.0 {
+            let _ = shared.expected_duration.compare_exchange(0, seconds.round().max(1.0) as u64, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
     let schedule = hls_key_schedule(&text, &pl_url)?;
     let seq0 = hls_media_sequence(&text);
     let segs = hls_segments(&text, &pl_url);
+    // Live first: its window is short, sometimes empty right at the start, and
+    // it grows instead of carrying a total.
+    let is_live = !text.contains("#EXT-X-ENDLIST") && text.contains("#EXT-X-MEDIA-SEQUENCE");
+    if is_live {
+        return record_live_hls(&client, opts, &pl_url, dest, shared, &text).await;
+    }
     if segs.is_empty() {
-        return Err(anyhow!("playlist has no media segments — it may be live or expired"));
+        return Err(anyhow!("playlist has no media segments — it may have expired"));
     }
     if segs.len() > MAX_SEGS {
         return Err(anyhow!(
-            "playlist too large ({} segments) — live streams are not supported",
+            "playlist has too many segments ({} for a finished stream)",
             segs.len()
-        ));
-    }
-    let is_live = !text.contains("#EXT-X-ENDLIST") && text.contains("#EXT-X-MEDIA-SEQUENCE");
-    if is_live {
-        return Err(anyhow!(
-            "this looks like a live stream (no ENDLIST) — live capture is not supported; only finished VOD playlists"
         ));
     }
     // 2. Key bytes for AES-128, including rotations (P3): every distinct
@@ -2665,27 +3536,30 @@ async fn download_hls(
             let same = v.get("playlist").and_then(|x| x.as_str()) == Some(pl_url.as_str())
                 && v.get("count").and_then(|x| x.as_u64()) == Some(segs.len() as u64);
             if same {
-                if let Some(arr) = v.get("done").and_then(|x| x.as_array()) {
-                    for x in arr {
-                        if let Some(i) = x.as_u64() {
-                            let i = i as usize;
-                            if i < segs.len()
-                                && dest.with_extension(format!("hls{i}")).exists()
-                            {
-                                done.insert(i);
-                            }
-                        }
+                // Segment files are written via rename, so one that exists
+                // is complete: every one of them counts, not only those the
+                // map listed (it is only rewritten at the end, so a stopped
+                // run listed none and resume re-fetched everything).
+                for i in 0..segs.len() {
+                    if dest.with_extension(format!("hls{i}")).exists() {
+                        done.insert(i);
                     }
                 }
             }
         }
     }
+    // Finished segments survive a stop and are skipped on restart (the map
+    // above), so a VOD stream download does resume.
+    shared.resumable.store(true, Ordering::SeqCst);
     let save_map = |done: &std::collections::HashSet<usize>| {
         let mut v: Vec<u64> = done.iter().map(|i| *i as u64).collect();
         v.sort_unstable();
         let j = serde_json::json!({ "playlist": pl_url, "count": segs.len(), "done": v });
         std::fs::write(&map_path, serde_json::to_string_pretty(&j).unwrap_or_default()).ok();
     };
+    // The map names this playlist before any segment arrives, so a run that
+    // stops midway resumes from the segment files it already finished.
+    save_map(&done);
     // 4. Byte totals via concurrent ranged HEADs (best-effort).
     let parallel = connections.clamp(4, 8);
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel));
@@ -2723,15 +3597,21 @@ async fn download_hls(
             shared.has_total.store(true, Ordering::SeqCst);
         }
     }
-    // Progress: one slot per segment.
+    // Progress: one slot per segment, sized by the stream estimate until the
+    // segment's real length is known (Part Info showed "1 B" per segment).
     {
+        let est = if shared.has_total.load(Ordering::SeqCst) && !segs.is_empty() {
+            (shared.total.load(Ordering::SeqCst) / segs.len() as u64).max(1)
+        } else {
+            1
+        };
         let mut totals = mutex_guard(&shared.part_total);
         let mut dones = mutex_guard(&shared.part_done);
         totals.clear();
         dones.clear();
         for i in 0..segs.len() {
-            totals.push((i as u64, i as u64));
-            dones.push(if done.contains(&i) { 1 } else { 0 });
+            totals.push((0, est - 1));
+            dones.push(if done.contains(&i) { est } else { 0 });
         }
     }
     shared.downloaded.store(0, Ordering::SeqCst);
@@ -2770,6 +3650,7 @@ async fn download_hls(
         let key_map = key_map.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.map_err(|e| anyhow!("semaphore: {e}"))?;
+            let _host_slot = host_slot(&url, opts.per_host_conns).await;
             // Per-segment key from the schedule (P3 rotation): explicit IV
             // when the playlist gives one, else the sequence number.
             let kb: Option<[u8; 16]> = match &seg_key {
@@ -2830,11 +3711,24 @@ async fn download_hls(
                                 sub_saturating(&shared.downloaded, attempt_bytes);
                                 return Err(anyhow!("cancelled"));
                             }
+                            // Pause holds in-flight segments too (finishing a
+                            // dozen parallel segments kept tens of MB arriving
+                            // after Pause). Reading stops, so TCP stops the
+                            // server; nothing received is lost. A connection
+                            // the server drops meanwhile takes the retry path.
+                            if shared.paused.load(Ordering::SeqCst) {
+                                if let Err(e) = wait_if_paused(&shared).await {
+                                    sub_saturating(&shared.downloaded, attempt_bytes);
+                                    set_segment_progress(&shared, idx, 0, None);
+                                    return Err(e);
+                                }
+                            }
                             match chunk {
                                 Ok(bytes) => {
                                     buf.extend_from_slice(&bytes);
                                     attempt_bytes += bytes.len() as u64;
                                     shared.downloaded.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                                    set_segment_progress(&shared, idx, attempt_bytes, None);
                                     limiter.consume(bytes.len() as u64).await;
                                 }
                                 Err(e) => {
@@ -2845,6 +3739,7 @@ async fn download_hls(
                         }
                         if let Some(e) = bad {
                             sub_saturating(&shared.downloaded, attempt_bytes);
+                            set_segment_progress(&shared, idx, 0, None);
                             if attempt >= max_retries {
                                 abort.store(true, Ordering::SeqCst);
                                 return Err(e);
@@ -2857,6 +3752,7 @@ async fn download_hls(
                         if let Some(n) = expect_len {
                             if buf.len() as u64 != n {
                                 sub_saturating(&shared.downloaded, attempt_bytes);
+                                set_segment_progress(&shared, idx, 0, None);
                                 if attempt >= max_retries {
                                     abort.store(true, Ordering::SeqCst);
                                     return Err(anyhow!(
@@ -2890,12 +3786,14 @@ async fn download_hls(
                     },
                     _ => data,
                 };
-                tokio::fs::write(&part, &plain).await.map_err(|e| anyhow!(io_message(&e)))?;
-                if let Ok(mut g) = shared.part_done.lock() {
-                    if let Some(slot) = g.get_mut(idx) {
-                        *slot = 1;
-                    }
-                }
+                // Temp file + rename: a segment file exists only when whole,
+                // so resume can trust any it finds (an abort mid-write used to
+                // leave a short file behind).
+                let staging = part.with_extension(format!("hls{idx}tmp"));
+                tokio::fs::write(&staging, &plain).await.map_err(|e| anyhow!(io_message(&e)))?;
+                tokio::fs::rename(&staging, &part).await.map_err(|e| anyhow!(io_message(&e)))?;
+                let got = attempt_bytes.max(1);
+                set_segment_progress(&shared, idx, got, Some(got));
                 return Ok::<(), anyhow::Error>(());
             }
         }));
@@ -2968,19 +3866,392 @@ async fn download_hls(
     Ok(())
 }
 
-/// Entry point used by the UI. Downloads `url` to `dest` with N connections.
-/// If `url` is an HTML page (e.g. YouTube), a direct media stream is
+/// Live HLS capture (clean-room, no IDM code): refresh the media playlist,
+/// append every new segment to the destination the moment it appears, and keep
+/// going until the stream ends (`EXT-X-ENDLIST`) or the user presses Stop.
+///
+/// Written incrementally on purpose: a stopped capture is still a playable
+/// file. No total is known, so the row shows a growing size instead of a
+/// percentage. MPEG-TS playlists land as `.ts` (the bytes really are TS; naming
+/// them `.mp4` would make Windows players refuse the file); fragmented-MP4
+/// playlists (`EXT-X-MAP`) keep their `.mp4` name.
+async fn record_live_hls(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    pl_url: &str,
+    dest: &PathBuf,
+    shared: &Arc<SharedState>,
+    initial_text: &str,
+) -> Result<()> {
+    shared.live.store(true, Ordering::SeqCst);
+    shared.set_phase("Recording live");
+    shared.has_total.store(false, Ordering::SeqCst);
+    shared.total.store(0, Ordering::SeqCst);
+    let mut text = initial_text.to_string();
+    let has_map = hls_map_init(&text, pl_url)?.is_some();
+    let mut target = dest.clone();
+    if !has_map && opts.allow_rename && !dest.exists() {
+        target = dest.with_extension("ts");
+        if let Some(name) = target.file_name().map(|s| s.to_string_lossy().to_string()) {
+            mutex_guard(&shared.resolved_name).replace(name);
+        }
+    }
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    shared.set_note(if has_map {
+        "Live stream: recording until you press Stop (or the stream ends). Saved as fragmented MP4."
+    } else {
+        "Live stream: recording until you press Stop (or the stream ends). Saved as MPEG-TS (.ts) — playable in VLC/MPC."
+    });
+    let existing = tokio::fs::metadata(&target).await.map(|m| m.len()).unwrap_or(0);
+    {
+        // Resume a stopped capture by appending, never by truncating what the
+        // user already recorded.
+        let cur = shared.downloaded.load(Ordering::SeqCst);
+        shared.downloaded.store(cur.max(existing), Ordering::SeqCst);
+    }
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)
+        .await
+        .map_err(|e| anyhow!(io_message(&e)))?;
+    let limiter = std::sync::Arc::new(
+        RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()),
+    );
+    let mut keys: std::collections::HashMap<String, [u8; 16]> =
+        std::collections::HashMap::new();
+    let mut last_seq: Option<u64> = None;
+    let mut init_done: Option<String> = None;
+    let mut refresh_fails = 0u32;
+    let mut written: u64 = 0;
+    let mut missed: u64 = 0;
+
+    loop {
+        wait_if_paused(shared).await?;
+        let segs = hls_segments(&text, pl_url);
+        let seq0 = hls_media_sequence(&text);
+        // A restarted encoder rewinds the sequence; start following it again.
+        if let Some(last) = last_seq {
+            let max_seq = seq0.saturating_add(segs.len().saturating_sub(1) as u64);
+            if segs.is_empty() || max_seq < last {
+                last_seq = None;
+            }
+        }
+        let schedule = hls_key_schedule(&text, pl_url)?;
+        // Fragmented MP4: the init section leads the stream (and again after a
+        // map change).
+        if let Some(uri) = hls_map_init(&text, pl_url)? {
+            if init_done.as_deref() != Some(uri.as_str()) {
+                let Some(blob) = fetch_live_segment(client, opts, &uri, opts.max_retries).await?
+                else {
+                    return Err(anyhow!(
+                        "the stream's init section (EXT-X-MAP) is gone from the server — cannot continue this fragmented-MP4 capture"
+                    ));
+                };
+                out.write_all(&blob)
+                    .await
+                    .map_err(|e| anyhow!(io_message(&e)))?;
+                shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
+                written = written.saturating_add(blob.len() as u64);
+                limiter.consume(blob.len() as u64).await;
+                init_done = Some(uri);
+            }
+        }
+        for (i, seg_url) in segs.iter().enumerate() {
+            wait_if_paused(shared).await?;
+            let seq = seq0.saturating_add(i as u64);
+            if let Some(last) = last_seq {
+                if seq <= last {
+                    continue;
+                }
+            }
+            let slot = schedule.get(i).cloned().flatten();
+            let kb = match &slot {
+                Some(k) => Some(hls_key_bytes(client, opts, &k.uri, &mut keys).await?),
+                None => None,
+            };
+            let iv = match (&kb, &slot) {
+                (Some(_), Some(k)) => match k.iv_hex.as_deref() {
+                    Some(hex) => Some(parse_hex_iv(hex).ok_or_else(|| anyhow!("bad EXT-X-IV"))?),
+                    None => Some((seq as u128).to_be_bytes()),
+                },
+                _ => None,
+            };
+            match fetch_live_segment(client, opts, seg_url, opts.max_retries).await? {
+                Some(data) => {
+                    let plain = match (&kb, iv) {
+                        (Some(k), Some(v)) => aes128_cbc_decrypt(&data, k, &v)?,
+                        _ => data,
+                    };
+                    out.write_all(&plain)
+                        .await
+                        .map_err(|e| anyhow!(io_message(&e)))?;
+                    // Flush per segment: an aborted capture must leave every
+                    // complete segment on disk.
+                    out.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
+                    shared.downloaded.fetch_add(plain.len() as u64, Ordering::SeqCst);
+                    written = written.saturating_add(plain.len() as u64);
+                    limiter.consume(plain.len() as u64).await;
+                }
+                None => {
+                    // The live window moved past this one; skip it instead of
+                    // killing a long recording.
+                    missed = missed.saturating_add(1);
+                }
+            }
+            last_seq = Some(seq);
+        }
+        if text.contains("#EXT-X-ENDLIST") {
+            break;
+        }
+        let wait = (hls_target_duration(&text) / 2).clamp(1, 5);
+        sleep_live(shared, wait).await?;
+        match fetch_playlist_text(client, opts, pl_url).await {
+            Ok(t) => {
+                text = t;
+                refresh_fails = 0;
+            }
+            Err(e) => {
+                refresh_fails += 1;
+                if refresh_fails > 4 {
+                    return Err(anyhow!(
+                        "live playlist refresh failed after {refresh_fails} tries: {e:#} — {} already recorded stays on disk",
+                        crate::model::format_bytes(written)
+                    ));
+                }
+                sleep_live(shared, 1u64 << refresh_fails.min(3)).await?;
+            }
+        }
+    }
+    out.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
+    drop(out);
+    let final_len = tokio::fs::metadata(&target).await.map(|m| m.len()).unwrap_or(0);
+    shared.total.store(final_len, Ordering::SeqCst);
+    shared.has_total.store(true, Ordering::SeqCst);
+    if final_len == 0 {
+        return Err(anyhow!(
+            "the live stream ended before any media was recorded — nothing to save"
+        ));
+    }
+    if missed > 0 {
+        eprintln!("[dbg] live capture skipped {missed} expired segment(s)");
+    }
+    if !opts.expected_sha256.trim().is_empty() {
+        if let Err(e) = verify_checksum(&target, &opts.expected_sha256).await {
+            let _ = tokio::fs::remove_file(&target).await;
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// One playlist GET with the row's headers (cookies/referer/proxy).
+async fn fetch_playlist_text(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+) -> Result<String> {
+    opts.get(client, url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("playlist fetch: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow!("playlist HTTP: {e}"))?
+        .text()
+        .await
+        .map_err(|e| anyhow!("playlist read: {e}"))
+}
+
+/// AES-128 key for a live segment, fetched once per distinct URI.
+async fn hls_key_bytes(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    uri: &str,
+    cache: &mut std::collections::HashMap<String, [u8; 16]>,
+) -> Result<[u8; 16]> {
+    if let Some(k) = cache.get(uri) {
+        return Ok(*k);
+    }
+    let kb = opts
+        .get(client, uri)
+        .send()
+        .await
+        .map_err(|e| anyhow!("key fetch: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow!("key HTTP: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("key read: {e}"))?;
+    if kb.len() != 16 {
+        return Err(anyhow!("HLS key is not 16 bytes — refusing"));
+    }
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&kb);
+    cache.insert(uri.to_string(), k);
+    Ok(k)
+}
+
+/// One live segment. `Ok(None)` = the segment is gone (expired from the live
+/// window) and should be skipped; `Err` = retries exhausted on a real error.
+async fn fetch_live_segment(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    max_retries: u32,
+) -> Result<Option<Vec<u8>>> {
+    let _host_slot = host_slot(url, opts.per_host_conns).await;
+    let max = max_retries.max(1);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match opts.get(client, url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == reqwest::StatusCode::NOT_FOUND
+                    || status == reqwest::StatusCode::GONE
+                {
+                    return Ok(None);
+                }
+                match resp.error_for_status() {
+                    Ok(r) => {
+                        let expect = r.content_length();
+                        match r.bytes().await {
+                            Ok(body) => {
+                                if let Some(n) = expect {
+                                    if body.len() as u64 != n && attempt < max {
+                                        tokio::time::sleep(std::time::Duration::from_secs(
+                                            1 << attempt.min(3),
+                                        ))
+                                        .await;
+                                        continue;
+                                    }
+                                }
+                                return Ok(Some(body.to_vec()));
+                            }
+                            Err(e) => {
+                                if attempt >= max {
+                                    return Err(anyhow!("segment network: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let m = http_status_err(url, e);
+                        if is_final_http_error(&m) || attempt >= max {
+                            return Err(m);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if attempt >= max {
+                    return Err(anyhow!("segment fetch: {e}"));
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(3))).await;
+    }
+}
+
+/// Sleep in short slices so Pause/Stop react immediately during a live wait.
+async fn sleep_live(shared: &Arc<SharedState>, secs: u64) -> Result<()> {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs.max(1));
+    loop {
+        wait_if_paused(shared).await?;
+        let now = std::time::Instant::now();
+        if now >= end {
+            return Ok(());
+        }
+        let left = end.saturating_duration_since(now);
+        tokio::time::sleep(left.min(std::time::Duration::from_millis(200))).await;
+    }
+}
+
+/// Ask Google Drive for the real download URL of a file.
+///
+/// Drive answers a capture with a web page for anything that is not tiny.
+/// That page carries a form with a one-time confirm token, and the token
+/// cannot be made up — it has to be read off the page the server sent. A
+/// file that is served straight away (a redirect to the bytes) is left
+/// alone: the normal transfer follows it.
+async fn follow_drive_interstitial(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+) -> Option<String> {
+    // A link that already points at the download endpoint needs no page.
+    if url.contains("drive.usercontent.google.com") {
+        return None;
+    }
+    let id = crate::drive::file_id(url)?;
+    let probe = crate::drive::download_url(&id);
+    let resp = opts.get(client, &probe).send().await.ok()?;
+    let is_html = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.contains("text/html"))
+        .unwrap_or(false);
+    if !is_html {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    if !crate::drive::looks_like_interstitial(&body) {
+        return None;
+    }
+    crate::drive::interstitial_target(&body)
+}
+
+/// Entry point used by the UI. Downloads `url` to `dest` with N connections./// If `url` is an HTML page (e.g. YouTube), a direct media stream is
 /// auto-detected first, like the video capture in classic download managers.
 /// Plain (non-encrypted) HLS VOD playlists (.m3u8) are assembled
 /// segment-by-segment; DASH (.mpd) likewise; `ftp://` URLs go to the
 /// plain-FTP backend.
 pub async fn download(
+    url: String, dest: PathBuf, connections: usize, opts: EngineOpts, shared: Arc<SharedState>,
+) -> Result<()> {
+    shared.expected_duration.store(opts.expected_duration_secs, Ordering::SeqCst);
+    shared.expects_audio.store(opts.require_audio, Ordering::SeqCst);
+    download_inner(url, dest.clone(), connections, opts.clone(), shared.clone()).await?;
+    verify_completed_media(&dest, &shared).await?;
+    cleanup_completed_job(&dest, &shared);
+    Ok(())
+}
+
+async fn download_inner(
     mut url: String,
     mut dest: PathBuf,
     connections: usize,
     mut opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    if is_youtube_caption_url(&url) {
+        return download_caption(&url, dest, &opts, &shared).await;
+    }
+    // Resolve Vimeo before probing the CDN: a successful fragment response
+    // proves nothing about the full video's size or completeness.
+    let resolve_page = match vimeo_download_target(&url, &opts.referer)? {
+        Some(page) => Some(page),
+        None => fragment_page(&normalize_media_url(&url), &opts.referer)?,
+    };
+    if let Some(page) = resolve_page {
+        let _job = claim_dest_job(&dest).ok_or_else(|| anyhow!("this destination is already downloading elsewhere"))?;
+        if opts.allow_rename && dest.exists() && !opts.overwrite_existing {
+            dest = crate::model::conflict_free_dest(&dest);
+            if let Some(name) = dest.file_name() {
+                mutex_guard(&shared.resolved_name).replace(name.to_string_lossy().to_string());
+            }
+        }
+        let client = opts.build_client()?;
+        let exe = ensure_ytdlp(&client).await?;
+        shared.total.store(0, Ordering::SeqCst);
+        shared.has_total.store(false, Ordering::SeqCst);
+        shared.downloaded.store(0, Ordering::SeqCst);
+        // Fail on extraction errors; never fall back to saving a fragment.
+        return download_with_ytdlp(&exe, &page, &dest, connections, &opts, &shared).await;
+    }
     // Facebook slice URLs (bytestart/byteend) can only ever return that
     // preview slice: normalize to the full-file URL before any probe, and
     // drop the stale slice prefix (it starts at ~byte 967, not 0, so it
@@ -3050,6 +4321,19 @@ pub async fn download(
     })?;
     let client = opts.build_client()?;
 
+    // Google Drive answers a capture with a web page instead of the file for
+    // anything that is not tiny, and that page carries the form which points
+    // at the real download. The confirm token in it cannot be made up: it has
+    // to be read off the page the server just sent.
+    if crate::drive::is_drive_url(&url) {
+        if let Some(direct) = follow_drive_interstitial(&client, &opts, &url).await {
+            if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
+                eprintln!("[dbg] drive interstitial followed");
+            }
+            url = direct;
+        }
+    }
+
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -3088,10 +4372,65 @@ pub async fn download(
             Err(e) => return Err(e), // expired/refused: fail fast, loudly
         }
     }
+    // The URL the redirects landed on: the captured URL may name nothing at
+    // all (`/download?stream=next`) while the final path names the file
+    // (`/chirp_next/next-20261023`).
+    let mut final_url: Option<String> = None;
     let (mut total_opt, mut supports_range, ctype, disp) = match range_verified {
         Some(verified) => (verified.or(seeded_total), verified.is_some(), None, None),
-        None => probe(&client, &opts, &url).await,
+        None => {
+            let info = probe_full(&client, &opts, &url).await;
+            // A Cloudflare browser check is not the file. Fail here, before
+            // anything is written, and say what the user has to do.
+            if info.challenged {
+                drop(_job);
+                return Err(cloudflare_challenge_err());
+            }
+            final_url = info.final_url.clone();
+            (
+                info.total,
+                info.supports_range,
+                info.content_type,
+                info.disposition,
+            )
+        }
     };
+    // Some CDNs use opaque manifest URLs. Route by the actual response
+    // type as well as extension, instead of saving playlist text as video.
+    if let Some(mime) = ctype.as_deref() {
+        let mime = mime.to_ascii_lowercase();
+        if mime.contains("mpegurl") || mime.contains("dash+xml") {
+            drop(_job);
+            return if mime.contains("dash+xml") {
+                download_dash(&url, dest, connections, opts, shared).await
+            } else {
+                download_hls(&url, &dest, connections, &opts, &shared).await
+            };
+        }
+    }
+    // …and by content when the type is generic (text/plain, octet-stream,
+    // xml) and the URL names no media file: the first bytes say #EXTM3U or
+    // <MPD for manifests the browser extension caught by sniffing. Manifests
+    // are small, so a multi-megabyte body is never sniffed (each extra
+    // request spends freshness on expiring signed links).
+    const MANIFEST_MAX: u64 = 2 * 1024 * 1024;
+    if range_verified.is_none()
+        && !has_direct_ext(&url)
+        && opaque_manifest_type(ctype.as_deref())
+        && total_opt.map_or(true, |t| t <= MANIFEST_MAX)
+    {
+        match sniff_manifest(&client, &opts, &url).await {
+            Some(ManifestKind::Dash) => {
+                drop(_job);
+                return download_dash(&url, dest, connections, opts, shared).await;
+            }
+            Some(ManifestKind::Hls) => {
+                drop(_job);
+                return download_hls(&url, &dest, connections, &opts, &shared).await;
+            }
+            None => {}
+        }
+    }
     // Pre-seeded totals imply resume support until proven otherwise; the
     // first response corrects this (single_stream updates it live).
     shared
@@ -3113,19 +4452,31 @@ pub async fn download(
             // URL yielded no usable name (`download_123.bin` or bare
             // `song` + video/mp4 → `song.mp4`).
             if let Some(cur) = dest.file_name().map(|s| s.to_string_lossy().to_string()) {
-                let fixed = if crate::model::is_fallback_filename(&cur) {
-                    ctype
+                // A redirect can land on a path that names the file even
+                // when the captured URL did not (`/download?stream=next` →
+                // `/chirp_next/next-20261023`).
+                let derived = if crate::model::is_fallback_filename(&cur) {
+                    final_url
                         .as_deref()
-                        .and_then(crate::model::ext_for_mime)
-                        .map(|ext| cur.trim_end_matches(".bin").to_string() + ext)
-                } else if !cur.contains('.') {
-                    ctype
-                        .as_deref()
-                        .and_then(crate::model::ext_for_mime)
-                        .map(|ext| cur.clone() + ext)
+                        .and_then(|u| derived_file_name(u, ctype.as_deref()))
                 } else {
                     None
                 };
+                let fixed = derived.or_else(|| {
+                    if crate::model::is_fallback_filename(&cur) {
+                        ctype
+                            .as_deref()
+                            .and_then(crate::model::ext_for_mime)
+                            .map(|ext| cur.trim_end_matches(".bin").to_string() + ext)
+                    } else if !cur.contains('.') {
+                        ctype
+                            .as_deref()
+                            .and_then(crate::model::ext_for_mime)
+                            .map(|ext| cur.clone() + ext)
+                    } else {
+                        None
+                    }
+                });
                 if let Some(fixed) = fixed {
                     dest.set_file_name(&fixed);
                     mutex_guard(&shared.resolved_name).replace(fixed);
@@ -3139,7 +4490,10 @@ pub async fn download(
         .unwrap_or(false);
     // On YouTube hosts always resolve first: the probe alone is
     // meaningless there (walls, page variants), the page/API decides.
-    let is_yt = url.contains("youtube.com") || url.contains("youtu.be");
+    // The caption endpoint is the exception: it serves a WebVTT file, not
+    // a page, and its URL carries the video's id — resolving it would
+    // download the video the captions belong to instead of the captions.
+    let is_yt = is_youtube_video_page(&url);
     // YouTube gates its 1080p+ streams behind the browser-only SABR protocol:
     // to any non-browser client they hand out roughly their first minute and
     // then 403 forever (verified live — changed headers, the row's own
@@ -3334,6 +4688,9 @@ pub async fn download(
                 }
             }
             None => {
+                if shared.challenged.load(Ordering::SeqCst) {
+                    return Err(cloudflare_challenge_err());
+                }
                 if shared.rate_limited.load(Ordering::SeqCst) {
                     return Err(anyhow!(
                         "YouTube is rate-limiting this network right now (bot check) — open the video in your browser, click the floating ⬇ Download this video button, and pick a quality there; the app will confirm the download"
@@ -3531,20 +4888,47 @@ pub async fn download(
     Ok(())
 }
 
-/// Locate `ffmpeg` on PATH (with `.exe` on Windows). `None` = not installed.
+/// Include common Unix tool locations when launched from a Dock or desktop.
+fn tool_dirs() -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = std::env::var_os("PATH").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default();
+    #[cfg(unix)]
+    {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+            let p = std::path::PathBuf::from(dir);
+            if !paths.contains(&p) { paths.push(p); }
+        }
+        if let Some(h) = dirs::home_dir() { paths.push(h.join(".local/bin")); }
+    }
+    paths
+}
+
+/// Locate `ffmpeg` (with `.exe` on Windows). `None` = not installed.
+///
+/// Source preference comes from Settings → Plugins → ffmpeg: the app's own
+/// copy, PATH, or a file the user picked.
 pub fn ffmpeg_path() -> Option<std::path::PathBuf> {
+    let managed = || ffmpeg_local_path().filter(|p| p.is_file());
+    // The chosen source first; when it is gone (a custom file moved or
+    // deleted, PATH changed) any other working ffmpeg beats none at all,
+    // which failed every merged 1080p+ download. yt-dlp falls back the same.
+    match FfmpegSource::from_settings() {
+        FfmpegSource::Custom => ffmpeg_custom_path().or_else(ffmpeg_on_path).or_else(managed),
+        FfmpegSource::Path => ffmpeg_on_path().or_else(managed),
+        FfmpegSource::Managed => managed().or_else(ffmpeg_on_path),
+    }
+}
+
+/// `ffmpeg` found on PATH only (the app never touches that copy).
+pub fn ffmpeg_on_path() -> Option<std::path::PathBuf> {
     let names: &[&str] = if cfg!(windows) {
         &["ffmpeg.exe", "ffmpeg"]
     } else {
         &["ffmpeg"]
     };
-    let Ok(path_var) = std::env::var("PATH") else {
-        return None;
-    };
-    for dir in std::env::split_paths(&path_var) {
+    for dir in tool_dirs() {
         for n in names {
             let cand = dir.join(n);
-            if cand.is_file() {
+            if crate::platform::executable_file(&cand) {
                 return Some(cand);
             }
         }
@@ -3565,18 +4949,15 @@ pub fn ffprobe_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = ffmpeg_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
         for n in names {
             let cand = dir.join(n);
-            if cand.is_file() {
+            if crate::platform::executable_file(&cand) {
                 return Some(cand);
             }
         }
     }
-    let Ok(path_var) = std::env::var("PATH") else {
-        return None;
-    };
-    for dir in std::env::split_paths(&path_var) {
+    for dir in tool_dirs() {
         for n in names {
             let cand = dir.join(n);
-            if cand.is_file() {
+            if crate::platform::executable_file(&cand) {
                 return Some(cand);
             }
         }
@@ -3642,6 +5023,7 @@ fn is_video_codec(codec: &str) -> bool {
 pub async fn ffprobe_resolution(video: &std::path::Path) -> Option<String> {
     let exe = ffprobe_path()?;
     let mut cmd = tokio::process::Command::new(exe);
+    cmd.kill_on_drop(true);
     #[cfg(windows)]
     {
         // No console flash for the helper process.
@@ -3712,15 +5094,14 @@ pub async fn ffmpeg_mux(
     audio: Option<&std::path::Path>,
     dest: &PathBuf,
 ) -> Result<()> {
-    let ff = ffmpeg_path().ok_or_else(|| {
-        anyhow!(
-            "ffmpeg not found — install it (https://ffmpeg.org/download.html, or `winget install ffmpeg`) and put it on PATH to merge video+audio qualities; progressive ≤720p rows download as single files without it"
-        )
-    })?;
+    let ff = ensure_ffmpeg(&reqwest::Client::new())
+        .await
+        .map_err(|e| anyhow!("cannot merge video + audio: {e:#}"))?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let mut cmd = tokio::process::Command::new(ff);
+    cmd.kill_on_drop(true);
     #[cfg(windows)]
     {
         // No console flash for the helper process.
@@ -3750,8 +5131,12 @@ pub async fn ffmpeg_mux(
 /// no copy is on PATH.
 const YTDLP_URL: &str = if cfg!(windows) {
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+} else if cfg!(target_os="macos") {
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
+} else if cfg!(target_arch="aarch64") {
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64"
 } else {
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
 };
 const YTDLP_BIN: &str = if cfg!(windows) {
     "yt-dlp.exe"
@@ -3766,11 +5151,10 @@ fn ytdlp_on_path() -> Option<std::path::PathBuf> {
     } else {
         &["yt-dlp"]
     };
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in std::env::split_paths(&path_var) {
+    for dir in tool_dirs() {
         for n in names {
             let cand = dir.join(n);
-            if cand.is_file() {
+            if crate::platform::executable_file(&cand) {
                 return Some(cand);
             }
         }
@@ -3780,14 +5164,7 @@ fn ytdlp_on_path() -> Option<std::path::PathBuf> {
 
 /// Where a self-fetched yt-dlp lives.
 fn ytdlp_local_path() -> Option<std::path::PathBuf> {
-    let base = if cfg!(windows) {
-        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
-    } else {
-        std::path::PathBuf::from(std::env::var_os("HOME")?)
-            .join(".local")
-            .join("share")
-    };
-    Some(base.join("download_craft").join("bin").join(YTDLP_BIN))
+    Some(crate::platform::helper_dir()?.join(YTDLP_BIN))
 }
 
 /// How the user wants yt-dlp sourced: a copy they picked, whatever is on
@@ -3826,6 +5203,11 @@ impl YtdlpSource {
     }
 }
 
+fn select_ytdlp(source:YtdlpSource, on_path:Option<PathBuf>, custom:Option<PathBuf>, local:Option<PathBuf>) -> (Option<PathBuf>,bool) {
+    let external=match source {YtdlpSource::Custom=>custom,YtdlpSource::Path=>on_path,YtdlpSource::Managed=>None};
+    if external.is_some(){(external,false)}else{let managed=local.is_some();(local,managed)}
+}
+
 /// The user's own yt-dlp, when they picked one *and* it is still on disk.
 fn ytdlp_custom_path() -> Option<std::path::PathBuf> {
     let raw = crate::model::ui_pref_str("ytdlp_custom_path", "");
@@ -3834,7 +5216,7 @@ fn ytdlp_custom_path() -> Option<std::path::PathBuf> {
         return None;
     }
     let p = std::path::PathBuf::from(raw);
-    p.is_file().then_some(p)
+    crate::platform::executable_file(&p).then_some(p)
 }
 
 /// The JS runtime yt-dlp needs to solve YouTube's player challenges. Only
@@ -3842,22 +5224,200 @@ fn ytdlp_custom_path() -> Option<std::path::PathBuf> {
 /// without one, extraction fails outright on many videos with yt-dlp's
 /// "The page needs to be reloaded" (verified live here: same URL and cookies,
 /// same release, works with `--js-runtimes node` and fails without it).
-fn js_runtime() -> Option<&'static str> {
-    let path_var = std::env::var("PATH").ok()?;
-    for (name, files) in [
-        ("node", ["node.exe", "node"]),
-        ("deno", ["deno.exe", "deno"]),
-        ("bun", ["bun.exe", "bun"]),
-    ] {
-        for dir in std::env::split_paths(&path_var) {
-            for f in files {
-                if dir.join(f).is_file() {
-                    return Some(name);
-                }
+fn js_runtime_path() -> Option<(&'static str, std::path::PathBuf)> {
+    // The app's own Deno (Settings → Plugins → Install) comes first.
+    if let Some(p) = deno_local_path().filter(|p| crate::platform::executable_file(p)) {
+        return Some(("deno", p));
+    }
+    for name in ["deno", "node"] {
+        let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+        for dir in tool_dirs() {
+            let path=dir.join(&file);
+            if crate::platform::executable_file(&path) {
+                let mut command=std::process::Command::new(&path);command.arg("--version");
+                let valid=crate::platform::version_output(command).map(|out|runtime_version_supported(name,&String::from_utf8_lossy(&out.stdout))).unwrap_or(false);
+                if valid {return Some((name,path));}
             }
         }
     }
     None
+}
+fn runtime_version_supported(name:&str,version:&str)->bool {
+    let word=version.split_whitespace().find(|w|w.chars().next().map(|c|c.is_ascii_digit()||c=='v').unwrap_or(false)).unwrap_or("");
+    let parts:Vec<u32>=word.trim_start_matches('v').split('.').map(|s|s.parse().unwrap_or(0)).collect();
+    let major=parts.first().copied().unwrap_or(0);let minor=parts.get(1).copied().unwrap_or(0);
+    match name {"node"=>major>=22,"deno"=>major>2||(major==2&&minor>=3),_=>false}
+}
+fn js_runtime() -> Option<&'static str> { js_runtime_path().map(|(name,_)| name) }
+
+/// Where the app keeps its own Deno (next to its yt-dlp).
+pub fn deno_local_path() -> Option<std::path::PathBuf> {
+    Some(crate::platform::helper_dir()?.join(if cfg!(windows) { "deno.exe" } else { "deno" }))
+}
+
+/// The Deno release the app installs.
+///
+/// The version is pinned on purpose. A moving "latest" URL would let the
+/// remote side decide what this app downloads and then executes.
+pub const DENO_VERSION: &str = "2.9.8";
+
+/// Deno's portable build for this machine: the download URL and the
+/// SHA-256 of the archive it has to have.
+///
+/// The hash is the one from the release's own `*.sha256sum` asset, and it
+/// is checked before the archive is unpacked: nothing is written and
+/// nothing is run that has not been verified.
+fn deno_zip() -> Option<(String, &'static str)> {
+    let (file, sha256) = if cfg!(all(windows, target_arch = "x86_64")) {
+        (
+            "deno-x86_64-pc-windows-msvc.zip",
+            "cba84b26e0df5ae7f74fc66b86a95b866872a86292ebd84fa1e959927edd93bf",
+        )
+    } else if cfg!(all(windows, target_arch = "aarch64")) {
+        (
+            "deno-aarch64-pc-windows-msvc.zip",
+            "b413b92b735b50c198e8fe3b85af1aa50e29d5f72e229aab701d132286e14cef",
+        )
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        (
+            "deno-aarch64-apple-darwin.zip",
+            "9f0bf660393da2eaff044cdc7444cb08c73f235849b61d224d825a194ce7c98e",
+        )
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        (
+            "deno-x86_64-apple-darwin.zip",
+            "4b2f5edd2639b7470f034238b321d7002d8dfb4726d8558f52c17afac370eb2c",
+        )
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        (
+            "deno-x86_64-unknown-linux-gnu.zip",
+            "e890975bc2549807bbcc0b584ffafda72cc7c93349dd99c80483dd784f6c4609",
+        )
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        (
+            "deno-aarch64-unknown-linux-gnu.zip",
+            "d49596c20b9788cf8f5d8ddf644103d4bde56ed239753f0bdb92ba9361d51905",
+        )
+    } else {
+        return None;
+    };
+    let url = format!(
+        "https://github.com/denoland/deno/releases/download/v{DENO_VERSION}/{file}"
+    );
+    Some((url, sha256))
+}
+
+/// One file out of a zip held in memory (stored or deflated, no zip64): what
+/// a single-executable release archive needs, with no system tools.
+fn zip_entry(zip: &[u8], name: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let u16_at = |i: usize| -> Result<usize> {
+        zip.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).ok_or_else(|| anyhow!("zip: truncated"))
+    };
+    let u32_at = |i: usize| -> Result<usize> {
+        zip.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize).ok_or_else(|| anyhow!("zip: truncated"))
+    };
+    // End of central directory: the last "PK\x05\x06" (comment can follow).
+    let eocd = (0..zip.len().saturating_sub(21))
+        .rev()
+        .take(70_000)
+        .find(|&i| zip[i..].starts_with(b"PK\x05\x06"))
+        .ok_or_else(|| anyhow!("zip: no directory"))?;
+    let count = u16_at(eocd + 10)?;
+    let mut at = u32_at(eocd + 16)?;
+    for _ in 0..count {
+        if !zip.get(at..).map(|b| b.starts_with(b"PK\x01\x02")).unwrap_or(false) {
+            return Err(anyhow!("zip: bad directory"));
+        }
+        let method = u16_at(at + 10)?;
+        let csize = u32_at(at + 20)?;
+        let usize_ = u32_at(at + 24)?;
+        let nlen = u16_at(at + 28)?;
+        let xlen = u16_at(at + 30)?;
+        let clen = u16_at(at + 32)?;
+        let local = u32_at(at + 42)?;
+        let entry = zip.get(at + 46..at + 46 + nlen).ok_or_else(|| anyhow!("zip: truncated"))?;
+        let entry = String::from_utf8_lossy(entry);
+        if entry.rsplit('/').next() == Some(name) {
+            if !zip.get(local..).map(|b| b.starts_with(b"PK\x03\x04")).unwrap_or(false) {
+                return Err(anyhow!("zip: bad entry"));
+            }
+            let data_at = local + 30 + u16_at(local + 26)? + u16_at(local + 28)?;
+            let data = zip.get(data_at..data_at + csize).ok_or_else(|| anyhow!("zip: truncated entry"))?;
+            let out = match method {
+                0 => data.to_vec(),
+                8 => {
+                    let mut out = Vec::with_capacity(usize_);
+                    flate2::read::DeflateDecoder::new(data).read_to_end(&mut out)?;
+                    out
+                }
+                m => return Err(anyhow!("zip: unsupported method {m}")),
+            };
+            if out.len() != usize_ {
+                return Err(anyhow!("zip: {name} unpacked to {} bytes, expected {usize_}", out.len()));
+            }
+            return Ok(out);
+        }
+        at += 46 + nlen + xlen + clen;
+    }
+    Err(anyhow!("zip: {name} not found"))
+}
+
+/// Install (or refresh) the app's own Deno, so yt-dlp can solve YouTube's
+/// player challenges without the user installing anything. Blocking: call it
+/// from a worker thread.
+pub fn deno_install_blocking() -> Result<std::path::PathBuf> {
+    let (url, expected_sha256) = deno_zip().ok_or_else(|| anyhow!("no Deno build for this system"))?;
+    let dst = deno_local_path().ok_or_else(|| anyhow!("no folder to keep Deno in"))?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let zip = rt.block_on(async {
+        let client = EngineOpts::default().build_client()?;
+        let resp = client.get(&url).send().await.map_err(|e| anyhow!("Deno download: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("Deno download: HTTP {}", resp.status()));
+        }
+        let bytes = resp.bytes().await.map_err(|e| anyhow!("Deno download: {e}"))?;
+        Ok::<_, anyhow::Error>(bytes)
+    })?;
+    if zip.len() < 5_000_000 {
+        return Err(anyhow!("Deno download: suspicious payload ({} bytes)", zip.len()));
+    }
+    // The archive is verified before it is unpacked, and the archive is
+    // unpacked before anything is written: a mismatch leaves the machine
+    // exactly as it was.
+    let got = crate::model::sha256_hex(&zip);
+    if !got.eq_ignore_ascii_case(expected_sha256) {
+        return Err(anyhow!(
+            "Deno download: checksum mismatch (expected {expected_sha256}, got {got}); nothing was installed"
+        ));
+    }
+    let exe = zip_entry(&zip, if cfg!(windows) { "deno.exe" } else { "deno" })?;
+    let magic_ok = if cfg!(windows) { exe.starts_with(b"MZ") } else { exe.starts_with(b"\x7fELF") || exe.starts_with(&[0xcf, 0xfa]) };
+    if !magic_ok {
+        return Err(anyhow!("Deno download: not an executable"));
+    }
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = dst.with_extension("part");
+    std::fs::write(&tmp, &exe)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, &dst)?;
+    // Must answer like a supported Deno, or it is not kept.
+    let mut cmd = std::process::Command::new(&dst);
+    cmd.arg("--version");
+    let ok = crate::platform::version_output(cmd)
+        .map(|o| runtime_version_supported("deno", &String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_file(&dst);
+        return Err(anyhow!("the downloaded Deno did not run"));
+    }
+    Ok(dst)
 }
 
 /// Whether a helper we fetched is old enough that YouTube has probably moved
@@ -3885,31 +5445,18 @@ fn ytdlp_preferred(opts: &EngineOpts) -> bool {
 /// `Err` means nothing is available and the caller should stay with the
 /// built-in engine.
 async fn ensure_ytdlp(client: &reqwest::Client) -> Result<std::path::PathBuf> {
-    match YtdlpSource::from_settings() {
-        // A pick the user made themselves wins for as long as it is on disk;
-        // if it has since been deleted we fall through to a copy that works.
-        YtdlpSource::Custom => {
-            if let Some(p) = ytdlp_custom_path() {
-                return Ok(p);
-            }
-        }
-        // Settings can pin the app to a PATH copy instead of its own.
-        YtdlpSource::Path => {
-            if let Some(p) = ytdlp_on_path() {
-                return Ok(p);
-            }
-        }
-        // "App's own copy": whatever else is on PATH is deliberately ignored.
-        YtdlpSource::Managed => {}
-    }
-    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep yt-dlp in"))?;
-    if dst.is_file() && !ytdlp_stale(&dst).await {
+    let source=YtdlpSource::from_settings();
+    let local=ytdlp_local_path().filter(|p|crate::platform::executable_file(p));
+    let (existing,managed)=select_ytdlp(source,ytdlp_on_path(),ytdlp_custom_path(),local);
+    if !managed { if let Some(path)=existing{return Ok(path);} }
+    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("No writable application data folder for yt-dlp"))?;
+    if crate::platform::executable_file(&dst) && !ytdlp_stale(&dst).await {
         return Ok(dst);
     }
     match fetch_ytdlp(client, &dst).await {
         Ok(()) => Ok(dst),
         // A failed refresh must not cost us a working older copy.
-        Err(_) if dst.is_file() => Ok(dst),
+        Err(_) if crate::platform::executable_file(&dst) => Ok(dst),
         Err(e) => Err(e),
     }
 }
@@ -3917,6 +5464,8 @@ async fn ensure_ytdlp(client: &reqwest::Client) -> Result<std::path::PathBuf> {
 /// Download the helper over `dst` (fetch to a sidecar, then rename, so a
 /// half-written executable can never be launched).
 async fn fetch_ytdlp(client: &reqwest::Client, dst: &std::path::Path) -> Result<()> {
+    static FETCH:tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard=FETCH.lock().await;
     if let Some(dir) = dst.parent() {
         tokio::fs::create_dir_all(dir).await?;
     }
@@ -3924,22 +5473,28 @@ async fn fetch_ytdlp(client: &reqwest::Client, dst: &std::path::Path) -> Result<
         .get(YTDLP_URL)
         .send()
         .await
-        .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
+        .map_err(|e| anyhow!("yt-dlp fetch: {e:#}"))?;
     if !resp.status().is_success() {
         return Err(anyhow!("yt-dlp fetch: HTTP {}", resp.status()));
     }
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
+        .map_err(|e| anyhow!("yt-dlp fetch: {e:#}"))?;
     if bytes.len() < 1_000_000 {
         return Err(anyhow!(
             "yt-dlp fetch: suspicious payload ({} bytes)",
             bytes.len()
         ));
     }
-    let tmp = dst.with_extension("part");
+    let tmp = dst.with_file_name(format!("yt-dlp.{}.part{}",std::process::id(),if cfg!(windows){".exe"}else{""}));
     tokio::fs::write(&tmp, &bytes).await?;
+    #[cfg(unix)]
+    {use std::os::unix::fs::PermissionsExt;tokio::fs::set_permissions(&tmp,std::fs::Permissions::from_mode(0o700)).await?;}
+    if ytdlp_version(&tmp).is_none() {
+        let _=tokio::fs::remove_file(&tmp).await;
+        return Err(anyhow!("Downloaded yt-dlp did not pass its version check; previous copy retained"));
+    }
     tokio::fs::rename(&tmp, dst).await?;
     Ok(())
 }
@@ -3971,6 +5526,11 @@ pub struct FfmpegInfo {
     pub path: Option<std::path::PathBuf>,
     pub version: Option<String>,
     pub size: Option<u64>,
+    pub probe_path: Option<std::path::PathBuf>,
+    /// `path` is the copy this app fetched and keeps in its own folder.
+    pub managed: bool,
+    /// A copy found on PATH (the app never touches that one).
+    pub on_path: Option<std::path::PathBuf>,
 }
 
 impl FfmpegInfo {
@@ -3979,7 +5539,11 @@ impl FfmpegInfo {
         if self.path.is_none() {
             return "not installed".to_string();
         }
-        let mut bits = vec!["on PATH".to_string()];
+        let mut bits = vec![if self.managed {
+            "own copy".to_string()
+        } else {
+            "on PATH".to_string()
+        }];
         if let Some(sz) = self.size {
             bits.push(crate::model::format_bytes(sz));
         }
@@ -4002,7 +5566,8 @@ fn ytdlp_version(exe: &std::path::Path) -> Option<String> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.arg("--version").output().ok()?;
+    cmd.arg("--version");
+    let out = crate::platform::version_output(cmd)?;
     if !out.status.success() {
         return None;
     }
@@ -4021,28 +5586,10 @@ pub fn ytdlp_info() -> YtdlpInfo {
     let on_path = ytdlp_on_path();
     let local = ytdlp_local_path();
     let custom = ytdlp_custom_path();
-    let managed_present = local.as_deref().map(|p| p.is_file()).unwrap_or(false);
+    let managed_present = local.as_deref().map(crate::platform::executable_file).unwrap_or(false);
     // Same order `ensure_ytdlp` uses, so what Settings shows is what a
     // YouTube download would really run.
-    let (path, managed) = match source {
-        YtdlpSource::Custom => match &custom {
-            Some(p) => (Some(p.clone()), false),
-            None if managed_present => (local.clone(), true),
-            None => (on_path.clone(), false),
-        },
-        YtdlpSource::Path => match &on_path {
-            Some(p) => (Some(p.clone()), false),
-            _ if managed_present => (local.clone(), true),
-            _ => (None, false),
-        },
-        YtdlpSource::Managed => {
-            if managed_present {
-                (local.clone(), true)
-            } else {
-                (on_path.clone(), false)
-            }
-        }
-    };
+    let (path, managed) = select_ytdlp(source,on_path.clone(),custom.clone(),local.clone().filter(|_|managed_present));
     let meta = path.as_deref().and_then(|p| std::fs::metadata(p).ok());
     let stale = match (managed, local.as_deref()) {
         (true, Some(p)) => std::fs::metadata(p)
@@ -4068,8 +5615,8 @@ pub fn ytdlp_managed_path() -> Option<std::path::PathBuf> {
     ytdlp_local_path()
 }
 
-/// ffmpeg, if there is one on PATH. Blocking (it runs `ffmpeg -version` to
-/// learn the version): call it from a worker thread.
+/// ffmpeg, as resolved by the Settings source choice. Blocking (it runs
+/// `ffmpeg -version` to learn the version): call it from a worker thread.
 pub fn ffmpeg_info() -> FfmpegInfo {
     let path = ffmpeg_path();
     let version = path.as_deref().and_then(ffmpeg_version);
@@ -4077,7 +5624,18 @@ pub fn ffmpeg_info() -> FfmpegInfo {
         .as_deref()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len());
-    FfmpegInfo { path, version, size }
+    let managed = match (&path, ffmpeg_local_path()) {
+        (Some(p), Some(local)) => *p == local,
+        _ => false,
+    };
+    FfmpegInfo {
+        path,
+        version,
+        size,
+        probe_path: ffprobe_path(),
+        managed,
+        on_path: ffmpeg_on_path(),
+    }
 }
 
 /// `ffmpeg -version` opens with "ffmpeg version 7.1-full_build-www.gyan.dev
@@ -4090,7 +5648,8 @@ fn ffmpeg_version(exe: &std::path::Path) -> Option<String> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.arg("-version").output().ok()?;
+    cmd.arg("-version");
+    let out = crate::platform::version_output(cmd)?;
     let text = String::from_utf8_lossy(&out.stdout);
     let first = text.lines().next()?.trim();
     let mut words = first.split_whitespace();
@@ -4101,7 +5660,339 @@ fn ffmpeg_version(exe: &std::path::Path) -> Option<String> {
         return None;
     }
     let v = words.next()?.to_string();
+    // Gyan/BtbN builds append their own build id ("9.0.2-full_build-www…");
+    // the card only needs the version proper.
+    let short = v.split('-').next().unwrap_or(&v);
+    let v = if short.starts_with(|c: char| c.is_ascii_digit()) && short.contains('.') {
+        short.to_string()
+    } else {
+        v
+    };
     (!v.is_empty()).then_some(v)
+}
+
+// ---------------------------------------------------------------- ffmpeg ----
+//
+// Merging separate video + audio legs is the one thing the built-in engine
+// cannot do itself. Like yt-dlp, ffmpeg can now be the app's own copy: fetched
+// once (static build, ~30 MB gzip → ~80 MB exe), then reused. A copy the user
+// installed keeps winning when they choose PATH or pick one themselves.
+
+/// Static builds the app fetches. They are single-file executables (gzip
+/// compressed), so no archive extraction and no DLLs next to them.
+const FFMPEG_GZ_URL: &str = if cfg!(windows) {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-win32-x64.gz"
+} else if cfg!(target_os = "macos") {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-arm64.gz"
+} else {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-x64.gz"
+};
+const FFPROBE_GZ_URL: &str = if cfg!(windows) {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-win32-x64.gz"
+} else if cfg!(target_os = "macos") {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-darwin-arm64.gz"
+} else {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-linux-x64.gz"
+};
+const FFMPEG_BIN: &str = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+const FFPROBE_BIN: &str = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+
+/// How the user wants ffmpeg sourced — same three-way choice as yt-dlp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfmpegSource {
+    Managed,
+    Path,
+    Custom,
+}
+
+impl Default for FfmpegSource {
+    fn default() -> Self {
+        // Matches `Settings::default()`.
+        FfmpegSource::Managed
+    }
+}
+
+impl FfmpegSource {
+    fn from_settings() -> Self {
+        match crate::model::ui_pref_str("ffmpeg_source", "").as_str() {
+            "path" => FfmpegSource::Path,
+            "custom" => FfmpegSource::Custom,
+            "managed" => FfmpegSource::Managed,
+            // Installs that predate the three-way choice: keep using the
+            // ffmpeg they already have on PATH instead of fetching 60 MB.
+            _ => {
+                if ffmpeg_on_path().is_some() {
+                    FfmpegSource::Path
+                } else {
+                    FfmpegSource::Managed
+                }
+            }
+        }
+    }
+}
+
+/// The user's own ffmpeg, when they picked one *and* it is still on disk.
+fn ffmpeg_custom_path() -> Option<std::path::PathBuf> {
+    let raw = crate::model::ui_pref_str("ffmpeg_custom_path", "");
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(raw);
+    p.is_file().then_some(p)
+}
+
+/// Where a self-fetched ffmpeg lives (same `bin` folder as yt-dlp).
+fn ffmpeg_local_path() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    { return crate::helpers::managed_ffmpeg_path(); }
+    #[cfg(windows)]
+    {
+    let base = {
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+    };
+    Some(base.join("download_craft").join("bin").join(FFMPEG_BIN))
+    }
+}
+
+/// Where the app's own ffmpeg lives, for Settings.
+pub fn ffmpeg_bin_dir() -> Option<std::path::PathBuf> {
+    ffmpeg_local_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+/// A usable ffmpeg, fetching the app's own copy when the source allows it and
+/// nothing else is present. Called right before a merge, so a first 1080p
+/// download sets itself up instead of failing with "install ffmpeg".
+pub async fn ensure_ffmpeg(client: &reqwest::Client) -> Result<std::path::PathBuf> {
+    if let Some(p) = ffmpeg_path() {
+        return Ok(p);
+    }
+    match FfmpegSource::from_settings() {
+        FfmpegSource::Custom => Err(anyhow!(
+            "the custom ffmpeg path in Settings no longer exists — pick it again under Settings → Download Engine"
+        )),
+        FfmpegSource::Path => Err(anyhow!(
+            "no ffmpeg on PATH — install it, or switch Settings → Download Engine to \u{201c}App's own copy\u{201d} and the app fetches one"
+        )),
+        FfmpegSource::Managed => {
+            // Unit tests never reach the network: the managed fetch belongs to
+            // the app, and a test box without ffmpeg must not download 60 MB.
+            #[cfg(test)]
+            {
+                let _ = client;
+                return Err(anyhow!(
+                    "managed ffmpeg is not fetched in tests"
+                ));
+            }
+            #[cfg(not(test))]
+            {
+                #[cfg(unix)]
+                { let _ = client; crate::helpers::install_ffmpeg() }
+                #[cfg(windows)]
+                { fetch_ffmpeg(client, false).await }
+            }
+        }
+    }
+}
+
+/// Fetch (or refresh) the app's own ffmpeg + ffprobe. ffprobe is best-effort:
+/// without it the file still plays, only the frame-size read-back is lost.
+async fn fetch_ffmpeg(client: &reqwest::Client, force: bool) -> Result<std::path::PathBuf> {
+    let dst = ffmpeg_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep ffmpeg in"))?;
+    fetch_gz_binary(client, FFMPEG_GZ_URL, &dst, "ffmpeg").await.map_err(|e| {
+        anyhow!("{e:#} — check the connection, or pick a copy in Settings → Download Engine")
+    })?;
+    if let Some(dir) = dst.parent() {
+        let probe = dir.join(FFPROBE_BIN);
+        // A refresh replaces the pair together; a lazy first fetch only needs
+        // ffprobe when it is not already there.
+        if force || !probe.is_file() {
+            let _ = fetch_gz_binary(client, FFPROBE_GZ_URL, &probe, "ffprobe").await;
+        }
+    }
+    Ok(dst)
+}
+
+/// Download a gzip-compressed static executable and unpack it next to `dst`.
+/// The payload lands in a sidecar first and is only renamed into place after
+/// the decompressed file is verified, so a half-written binary is never run.
+async fn fetch_gz_binary(
+    client: &reqwest::Client,
+    url: &str,
+    dst: &std::path::Path,
+    label: &str,
+) -> Result<()> {
+    if let Some(dir) = dst.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("{label} fetch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("{label} fetch: HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("{label} fetch: {e}"))?;
+    // Compressed builds are tens of MB; anything tiny is an error page.
+    if bytes.len() < 5_000_000 {
+        return Err(anyhow!(
+            "{label} fetch: suspicious payload ({} bytes)",
+            bytes.len()
+        ));
+    }
+    let dst = dst.to_path_buf();
+    let label_owned = label.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::io::{Read, Write};
+        let tmp = dst.with_extension("part");
+        let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut out = std::fs::File::create(&tmp)?;
+        std::io::copy(&mut dec, &mut out)?;
+        out.flush()?;
+        drop(out);
+        let mut head = [0u8; 2];
+        let mut f = std::fs::File::open(&tmp)?;
+        let n = f.read(&mut head)?;
+        let ok_magic = if cfg!(windows) {
+            n == 2 && &head == b"MZ"
+        } else {
+            n == 2 && &head == b"\x7fE"
+        };
+        if !ok_magic || std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0) < 10_000_000 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow!(
+                "{label_owned} unpack: payload is not a static executable"
+            ));
+        }
+        std::fs::rename(&tmp, &dst)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow!("{label} unpack: {e}"))??;
+    Ok(())
+}
+
+/// Re-fetch the app's own ffmpeg now (the Settings "Re-download" button).
+/// Blocking: call it from a worker thread.
+pub fn ffmpeg_refresh_blocking() -> Result<std::path::PathBuf> {
+    #[cfg(unix)]
+    { return crate::helpers::install_ffmpeg(); }
+    #[cfg(windows)]
+    {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let client = EngineOpts::default().build_client()?;
+        fetch_ffmpeg(&client, true).await
+    })
+    }
+}
+
+/// Dotted numbers of a version or release tag ("2026.08.19" → [2026, 8, 19],
+/// "b6.1.1" → [6, 1, 1], "9.0.2-full_build" → [9, 0, 2]).
+fn version_parts(v: &str) -> Vec<u64> {
+    let start = v.find(|c: char| c.is_ascii_digit()).unwrap_or(v.len());
+    let core = v[start..].split(|c: char| !(c.is_ascii_digit() || c == '.')).next().unwrap_or("");
+    core.split('.').filter_map(|p| p.parse().ok()).collect()
+}
+
+/// True when `have` is an older release than `latest` (missing parts count
+/// as 0, so "2026.08.19" < "2026.08.19.1"). Unparseable input is never
+/// called older: no update is better than a wrong one.
+pub fn version_older(have: &str, latest: &str) -> bool {
+    let (a, b) = (version_parts(have), version_parts(latest));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let n = a.len().max(b.len());
+    let at = |v: &[u64], i: usize| v.get(i).copied().unwrap_or(0);
+    (0..n).map(|i| (at(&a, i), at(&b, i))).find(|(x, y)| x != y).is_some_and(|(x, y)| x < y)
+}
+
+/// Newest release tag of a GitHub repo ("yt-dlp/yt-dlp"), or `None` offline.
+async fn latest_release_tag(client: &reqwest::Client, repo: &str) -> Option<String> {
+    let v: serde_json::Value = client
+        .get(format!("https://api.github.com/repos/{repo}/releases/latest"))
+        // GitHub's API rejects requests without a User-Agent.
+        .header(reqwest::header::USER_AGENT, format!("download_craft/{}", crate::model::APP_VERSION))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    v.get("tag_name").and_then(|t| t.as_str()).map(str::to_string)
+}
+
+/// Settings → Plugins on open: compare yt-dlp with its latest release and
+/// replace the app's own copy when it is older. A copy the user chose (PATH
+/// or custom) is theirs: it is reported, never overwritten. Returns the line
+/// the card shows ("" when nothing could be checked).
+pub fn ytdlp_update_check_blocking() -> String {
+    let info = ytdlp_info();
+    let Some(have) = info.version.clone() else { return String::new() };
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(_) => return String::new(),
+    };
+    rt.block_on(async {
+        let Ok(client) = EngineOpts::default().build_client() else { return String::new() };
+        let Some(latest) = latest_release_tag(&client, "yt-dlp/yt-dlp").await else {
+            return "Could not check for a newer yt-dlp (offline?).".to_string();
+        };
+        if !version_older(&have, &latest) {
+            return format!("yt-dlp {have} is the latest release.");
+        }
+        if !info.managed {
+            return format!(
+                "yt-dlp {latest} is available; this copy is {have}. Pick \"App-managed\" to have it kept up to date, or update your own copy."
+            );
+        }
+        let Some(dst) = ytdlp_local_path() else { return String::new() };
+        match fetch_ytdlp(&client, &dst).await {
+            Ok(()) => format!("Updated yt-dlp {have} → {latest}."),
+            Err(e) => format!("yt-dlp {latest} is available, but the update failed: {e:#}"),
+        }
+    })
+}
+
+/// Same for the app's own ffmpeg. Only a managed copy is compared: its
+/// releases come from the static-build project the app fetches from, which
+/// says nothing about a build the user installed (Gyan, BtbN, a package
+/// manager), so those are left alone.
+pub fn ffmpeg_update_check_blocking() -> String {
+    let info = ffmpeg_info();
+    if !info.managed {
+        return String::new();
+    }
+    let Some(have) = info.version.clone() else { return String::new() };
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(_) => return String::new(),
+    };
+    let latest = rt.block_on(async {
+        let client = EngineOpts::default().build_client().ok()?;
+        latest_release_tag(&client, "eugeneware/ffmpeg-static").await
+    });
+    let Some(latest) = latest else {
+        return "Could not check for a newer ffmpeg (offline?).".to_string();
+    };
+    if !version_older(&have, &latest) {
+        return format!("ffmpeg {have} is the latest build.");
+    }
+    match ffmpeg_refresh_blocking() {
+        Ok(_) => format!("Updated ffmpeg {have} → {}.", latest.trim_start_matches('b')),
+        Err(e) => format!("A newer ffmpeg is available, but the update failed: {e:#}"),
+    }
 }
 
 /// Replace the app's own copy of yt-dlp now — the Settings "Re-download"
@@ -4109,7 +6000,7 @@ fn ffmpeg_version(exe: &std::path::Path) -> Option<String> {
 /// existing one looks stale; the fetched file is parsed-checked by size only
 /// (yt-dlp ships as one executable).
 pub fn ytdlp_refresh_blocking() -> Result<std::path::PathBuf> {
-    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep yt-dlp in"))?;
+    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("No writable application data folder for yt-dlp"))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -4124,43 +6015,56 @@ pub fn ytdlp_refresh_blocking() -> Result<std::path::PathBuf> {
 /// `--cookies` reads), so yt-dlp inherits the signed-in YouTube session
 /// without touching the browser's locked profile database. Removed after the
 /// run, so no credentials linger on disk.
-async fn write_cookie_jar(cookie: &str, domain: &str) -> Option<std::path::PathBuf> {
+struct CookieJar(PathBuf);
+impl Drop for CookieJar {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+async fn write_cookie_jar(cookie: &str, domain: &str) -> Result<Option<CookieJar>> {
     if cookie.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut body = String::from("# Netscape HTTP Cookie File\n");
-    let mut rows = 0usize;
     for part in cookie.split(';') {
         let Some((name, value)) = part.trim().split_once('=') else {
             continue;
         };
         let name = name.trim();
-        let bad = |s: &str| s.contains('\t') || s.contains('\n') || s.contains('\r');
+        let bad = |s: &str| s.contains(['\t', '\n', '\r']);
         if name.is_empty() || bad(name) || bad(value) {
             continue;
         }
         body.push_str(&format!("{domain}\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n"));
-        rows += 1;
     }
-    if rows == 0 {
-        return None;
+    if body.lines().count() == 1 {
+        return Ok(None);
     }
-    // One jar per cookie set: the old pid-only name was shared by every
-    // concurrent download, so a YouTube job and a Facebook job could read each
-    // other's (wrong-domain) jar.
-    let tag = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        domain.hash(&mut h);
-        cookie.hash(&mut h);
-        h.finish()
-    };
-    let path = std::env::temp_dir().join(format!(
-        "download_craft_cookies_{}_{tag:x}.txt",
-        std::process::id()
-    ));
-    tokio::fs::write(&path, body).await.ok()?;
-    Some(path)
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..100 {
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "download_craft_cookies_{}_{tag}.txt",
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut f) => {
+                let jar = CookieJar(path);
+                std::io::Write::write_all(&mut f, body.as_bytes())?;
+                return Ok(Some(jar));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(anyhow!("Could not create a private cookie file"))
 }
 
 /// yt-dlp format expression for a menu preference: the best video at or below
@@ -4190,6 +6094,96 @@ fn ytdlp_format_with(pref: &str, can_merge: bool) -> String {
         (None, true) => "bv*+ba[ext=m4a]/bv*+ba/b".to_string(),
         (None, false) => "b".to_string(),
     }
+}
+
+/// Vimeo can expose a video-only media playlist as an otherwise valid
+/// format. Require a real audio leg or a muxed format with an audio codec.
+fn audio_required_format(pref: &str, can_merge: bool) -> String {
+    match (quality_cap(pref), can_merge) {
+        (Some(h), true) => format!("bv[height<={h}]+ba[ext=m4a]/bv[height<={h}]+ba/b[height<={h}][acodec!=none]/bv+ba/b[acodec!=none]"),
+        (Some(h), false) => format!("b[height<={h}][acodec!=none]/b[acodec!=none]"),
+        (None, true) => "bv+ba[ext=m4a]/bv+ba/b[acodec!=none]".to_string(),
+        (None, false) => "b[acodec!=none]".to_string(),
+    }
+}
+
+fn hls_external_audio(text: &str) -> bool {
+    text.lines().filter(|line| line.trim().starts_with("#EXT-X-MEDIA:")).any(|line| {
+        let attrs = hls_key_attrs(line.trim());
+        hls_attr(&attrs, "TYPE").map(|t| t.eq_ignore_ascii_case("AUDIO")).unwrap_or(false)
+            && hls_attr(&attrs, "URI").map(|u| !u.is_empty()).unwrap_or(false)
+    })
+}
+
+fn completed_media_check(json: &str, expected_secs: u64, require_audio: bool) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    if require_audio && !ffprobe_has_audio(json)? {
+        return Err(anyhow!("downloaded media has no audio track, although the source includes audio — capture the full master playlist or player page"));
+    }
+    if expected_secs > 0 {
+        let number = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64());
+        let duration = value.get("format").and_then(|v| v.get("duration")).and_then(number)
+            .or_else(|| value.get("streams").and_then(|v| v.as_array()).and_then(|s|
+                s.iter().filter_map(|v| v.get("duration").and_then(number)).filter(|d| d.is_finite()).reduce(f64::max)))
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .ok_or_else(|| anyhow!("could not verify the finished media duration"))?;
+        let expected = expected_secs as f64;
+        let tolerance = (expected * 0.03).max(2.0).min(expected * 0.25);
+        if duration < expected - tolerance {
+            return Err(anyhow!("incomplete media: downloaded {duration:.1}s but the player/source reports {expected_secs}s — capture the full master playlist or player page"));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_completed_media(dest: &std::path::Path, shared: &Arc<SharedState>) -> Result<()> {
+    let expected = shared.expected_duration.load(Ordering::SeqCst);
+    let audio = shared.expects_audio.load(Ordering::SeqCst);
+    if expected == 0 && !audio { return Ok(()); }
+    let Some(exe) = ffprobe_path() else {
+        shared.set_note("finished media could not be checked for duration/audio: ffprobe was not found".to_string());
+        return Ok(());
+    };
+    let resolved = mutex_guard(&shared.resolved_name).clone();
+    let actual = resolved.map(|name| dest.with_file_name(name)).unwrap_or_else(|| dest.to_path_buf());
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    cmd.args(["-v", "error", "-show_entries", "format=duration:stream=codec_type,duration", "-of", "json"])
+        .arg(actual).stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output()).await
+        .map_err(|_| anyhow!("finished media verification timed out"))??;
+    if !out.status.success() { return Err(anyhow!("could not inspect the finished media file")); }
+    completed_media_check(&String::from_utf8_lossy(&out.stdout), expected, audio)
+}
+
+fn ffprobe_has_audio(json: &str) -> Result<bool> {
+    let data: serde_json::Value = serde_json::from_str(json)?;
+    let streams = data.get("streams").and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("ffprobe returned no stream list"))?;
+    Ok(streams.iter().any(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio")))
+}
+
+async fn verify_vimeo_audio(dest: &std::path::Path) -> Result<()> {
+    // Strict format selection is always active; additionally inspect the
+    // finished file when the ffprobe companion is installed.
+    let Some(exe) = ffprobe_path() else { return Ok(()); };
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    cmd.args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "json"])
+        .arg(dest).stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output()).await
+        .map_err(|_| anyhow!("Vimeo audio verification timed out"))??;
+    if !out.status.success() { return Err(anyhow!("could not verify the downloaded Vimeo audio")); }
+    if !ffprobe_has_audio(&String::from_utf8_lossy(&out.stdout))? {
+        return Err(anyhow!("Vimeo download has no audio track — capture the full master manifest or Vimeo player URL instead of a video-only playlist"));
+    }
+    Ok(())
 }
 
 /// [`ytdlp_format_with`] with the merge capability of this machine.
@@ -4224,8 +6218,20 @@ const PROGRESS_MARK: &str = "dcp@";
 /// covers.
 fn ytdlp_progress_template() -> String {
     format!(
-        "download:{PROGRESS_MARK}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.height)s|%(info.width)s|%(info.format_id)s|%(info.vcodec)s"
+        "download:{PROGRESS_MARK}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.height)s|%(info.width)s|%(info.format_id)s|%(info.vcodec)s|%(progress.fragment_index)s|%(progress.fragment_count)s"
     )
+}
+
+/// Stable small id for a format id string (legs of a merged download differ).
+fn format_key(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let s = s.trim();
+    if s.is_empty() || s == "NA" {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish().max(1)
 }
 
 /// One progress line, parsed. A field is `None` when yt-dlp printed `NA`.
@@ -4243,6 +6249,12 @@ struct YtdlpProgress {
     /// photo format (which has a frame size but no video) and when yt-dlp
     /// cannot say. Only a video leg has a resolution to show.
     video: bool,
+    /// [`format_key`] of the format being fetched (0 = unknown): a change is
+    /// the only reliable sign that the next leg of a merged download began.
+    format: u64,
+    /// Fragment index/count of a fragmented (HLS/DASH) transfer.
+    frag_index: Option<f64>,
+    frag_count: Option<f64>,
 }
 
 /// Read a progress line, or `None` when this line is not one.
@@ -4252,18 +6264,27 @@ fn parse_progress_line(line: &str) -> Option<YtdlpProgress> {
     let at = line.find(PROGRESS_MARK)?;
     let mut field = line[at + PROGRESS_MARK.len()..].split('|');
     let num = |v: Option<&str>| v.map(str::trim).and_then(|v| v.parse::<f64>().ok());
-    let p = YtdlpProgress {
-        done: num(field.next()),
-        total: num(field.next()),
-        estimate: num(field.next()),
-        speed: num(field.next()),
-        height: num(field.next()),
-        width: num(field.next()),
-        // The format id is not used by the row; the codec after it decides
-        // whether the frame size means anything.
-        video: field.next().is_some() && field.next().map(is_video_codec).unwrap_or(false),
-    };
-    Some(p)
+    let done = num(field.next());
+    let total = num(field.next());
+    let estimate = num(field.next());
+    let speed = num(field.next());
+    let height = num(field.next());
+    let width = num(field.next());
+    let format = field.next().map(format_key).unwrap_or(0);
+    // The codec decides whether the frame size means anything.
+    let video = field.next().map(is_video_codec).unwrap_or(false);
+    Some(YtdlpProgress {
+        done,
+        total,
+        estimate,
+        speed,
+        height,
+        width,
+        video,
+        format,
+        frag_index: num(field.next()),
+        frag_count: num(field.next()).filter(|n| *n > 0.0),
+    })
 }
 
 /// "1280×720" when both sides are known, else "720p" from the height alone.
@@ -4303,21 +6324,41 @@ struct MergedProgress {
     last_total: u64,
     /// Whether the current leg has named its size.
     known: bool,
+    /// [`format_key`] of the current leg (0 = not named).
+    format: u64,
 }
 
 impl MergedProgress {
     /// Fold one line in and return `(downloaded, total)` to publish.
     fn step(&mut self, p: &YtdlpProgress) -> (u64, Option<u64>) {
         if let Some(done) = p.done.map(|d| d.max(0.0) as u64) {
-            if done + 1 < self.last {
+            // A new leg restarts its counter at 0. With several fragments in
+            // flight the counter also dips a little now and then, and reading
+            // every dip as a new leg added the whole count again each time:
+            // the "18 GB" an HLS download claimed after a resume. So a new leg
+            // is a new format id, or (ids unknown) a counter that fell back
+            // to under half of where it was.
+            let new_leg = if p.format != 0 && self.format != 0 {
+                p.format != self.format
+            } else {
+                done < self.last / 2
+            };
+            if new_leg {
                 self.base += self.last_total.max(self.last);
                 self.total_base += self.last_total;
                 self.last_total = 0;
                 self.known = false;
             }
-            self.last = done;
+            self.last = if new_leg { done } else { done.max(self.last) };
         }
-        if let Some(total) = p.total.or(p.estimate).filter(|t| *t > 0.0) {
+        if p.format != 0 {
+            self.format = p.format;
+        }
+        // A fragmented stream has no size, only an estimate that moves with
+        // every fragment (the "size keeps changing" report): leave it
+        // unknown, as IDM does, and let the fragment count drive the bar.
+        let size = if p.frag_count.is_some() { p.total } else { p.total.or(p.estimate) };
+        if let Some(total) = size.filter(|t| *t > 0.0) {
             self.last_total = total as u64;
             self.known = true;
         }
@@ -4363,6 +6404,64 @@ fn phase_for_line(line: &str) -> Option<&'static str> {
     None
 }
 
+/// Folder name for a helper's in-progress pieces, inside the save folder.
+const PARTS_DIR: &str = ".download_craft_parts";
+
+/// `(home, parts)` folders for a yt-dlp run saving to `dest`.
+fn ytdlp_dirs(dest: &std::path::Path) -> (PathBuf, PathBuf) {
+    let home = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let parts = home.join(PARTS_DIR);
+    (home, parts)
+}
+
+/// The bare file name yt-dlp is told to write (relative to `home`).
+fn ytdlp_out_name(dest: &std::path::Path) -> String {
+    dest.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download.mp4".to_string())
+}
+
+/// Create the parts folder and mark it hidden (Windows), best-effort.
+fn hide_dir(dir: &std::path::Path) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN);
+        }
+    }
+}
+
+/// Drop the parts folder once nothing is left in it (other downloads in the
+/// same folder may still be using it).
+fn tidy_parts_dir(dest: &std::path::Path) {
+    let (_, parts) = ytdlp_dirs(dest);
+    let _ = std::fs::remove_dir(parts);
+}
+
+fn valid_ytdlp_output(path: &std::path::Path, dest: &std::path::Path) -> bool {
+    if !path.is_file() || path.file_stem() != dest.file_stem() {
+        return false;
+    }
+    let parent = |p: &std::path::Path| {
+        p.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .canonicalize()
+            .ok()
+    };
+    matches!((parent(path),parent(dest)),(Some(a),Some(b)) if a==b)
+}
+
 async fn download_with_ytdlp(
     exe: &std::path::Path,
     url: &str,
@@ -4371,14 +6470,29 @@ async fn download_with_ytdlp(
     opts: &EngineOpts,
     shared: &Arc<SharedState>,
 ) -> Result<()> {
+    shared.external_helper.store(true, Ordering::SeqCst);
+    wait_if_paused(shared).await?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     // A file already sitting at the destination makes yt-dlp report
-    // "already downloaded" and exit without fetching anything.
-    let _ = tokio::fs::remove_file(dest).await;
-    let jar = write_cookie_jar(&opts.cookie, cookie_domain(url)).await;
+    // "already downloaded" and exit without fetching anything. It is the
+    // user's file though: unless overwrite was chosen, save a numbered copy
+    // (as the progressive path does) instead of deleting it.
+    let renamed;
+    let dest: &PathBuf = if opts.allow_rename && dest.exists() && !opts.overwrite_existing {
+        renamed = crate::model::conflict_free_dest(dest);
+        if let Some(name) = renamed.file_name().map(|s| s.to_string_lossy().to_string()) {
+            mutex_guard(&shared.resolved_name).replace(name);
+        }
+        &renamed
+    } else {
+        let _ = tokio::fs::remove_file(dest).await;
+        dest
+    };
+    let jar = write_cookie_jar(&opts.cookie, &cookie_domain(url)).await?;
     let mut cmd = tokio::process::Command::new(exe);
+    cmd.kill_on_drop(true);
     #[cfg(windows)]
     {
         // No console flash for the helper process.
@@ -4387,10 +6501,31 @@ async fn download_with_ytdlp(
     }
     // One lookup decides both the selector and whether yt-dlp may ask for a
     // merge at all (no ffmpeg = only a single muxed file can be delivered).
-    let merge_ffmpeg = ffmpeg_path();
+    // The app's own copy is fetched here when nothing else exists, so a first
+    // 1080p download sets itself up instead of quietly capping at 720p.
+    let mut merge_ffmpeg = ffmpeg_path();
+    if merge_ffmpeg.is_none() {
+        if let Ok(c) = opts.build_client() {
+            shared.set_phase("Fetching ffmpeg");
+            match ensure_ffmpeg(&c).await {
+                Ok(p) => merge_ffmpeg = Some(p),
+                Err(e) => shared.set_note(format!(
+                    "ffmpeg is unavailable ({e:#}) — downloading the best single-file quality instead"
+                )),
+            }
+        }
+    }
     cmd.arg("--no-playlist")
         .arg("--no-warnings")
+        .arg("--abort-on-unavailable-fragments")
+        .arg("--no-simulate")
+        .arg("--print")
+        .arg("before_dl:dcinfo@{\"duration\":%(duration)j,\"acodec\":%(acodec)j}")
+        .arg("--print").arg("after_move:dcfile@%(filepath)j")
         .arg("--newline")
+        // `--print` implies quiet mode, which hides progress: without this
+        // the window sat at 0 B / "Getting info" until the file was done.
+        .arg("--progress")
         .arg("--progress-template")
         .arg(ytdlp_progress_template())
         .arg("--retries")
@@ -4402,23 +6537,45 @@ async fn download_with_ytdlp(
         .arg("--merge-output-format")
         .arg("mp4")
         .arg("-f")
-        .arg(ytdlp_format_with(&opts.quality_pref, merge_ffmpeg.is_some()))
+        .arg(if vimeo_needs_audio(url) || opts.require_audio {
+            audio_required_format(&opts.quality_pref, merge_ffmpeg.is_some())
+        } else {
+            ytdlp_format_with(&opts.quality_pref, merge_ffmpeg.is_some())
+        })
         .arg("-o")
-        .arg(dest);
+        .arg(ytdlp_out_name(dest).replace('%',"%%"));
+    // Fragments and other in-progress pieces go to one hidden parts folder
+    // next to the file instead of dozens of ".part-FragN" files in the
+    // user's folder; only the finished file lands in it. Same drive, so the
+    // final move is a rename. (`-P temp:` is ignored for an absolute `-o`,
+    // hence home + a bare file name.)
+    let (home, parts) = ytdlp_dirs(dest);
+    cmd.arg("-P").arg(format!("home:{}", home.display()));
+    cmd.arg("-P").arg(format!("temp:{}", parts.display()));
+    hide_dir(&parts);
+    if vimeo_needs_audio(url) || is_playlist_url(url) || opts.require_audio {
+        // Missing fragments must fail rather than produce a shortened video.
+        cmd.arg("--abort-on-unavailable-fragments");
+    }
     if let Some(ff) = &merge_ffmpeg {
         cmd.arg("--ffmpeg-location").arg(ff);
     }
     // Without a JS runtime yt-dlp cannot solve YouTube's player challenges:
     // extraction fails on many videos and it reports only "The page needs to
     // be reloaded" (reproduced live against this very URL).
-    if let Some(rt) = js_runtime() {
-        cmd.arg("--js-runtimes").arg(rt);
+    if let Some((name,path)) = js_runtime_path() {
+        cmd.arg("--js-runtimes").arg(format!("{name}:{}",path.display()));
     }
     if let Some(jar) = &jar {
-        cmd.arg("--cookies").arg(jar);
+        cmd.arg("--cookies").arg(&jar.0);
     }
     if !opts.referer.trim().is_empty() {
         cmd.arg("--referer").arg(opts.referer.trim());
+    }
+    if opts.captured_headers.applies_to(url) {
+        for (name, value) in &opts.captured_headers.headers {
+            cmd.arg("--add-header").arg(format!("{name}:{value}"));
+        }
     }
     if !opts.proxy_url.trim().is_empty() {
         cmd.arg("--proxy").arg(opts.proxy_url.trim());
@@ -4430,7 +6587,11 @@ async fn download_with_ytdlp(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd.spawn().map_err(|e| anyhow!("yt-dlp launch: {e}"))?;
+    let process_tree=crate::platform::HelperProcessTree::attach(&child)
+        .map_err(|e|anyhow!("Could not supervise media helper processes: {e}"))?;
     // Nothing is on the wire until the player challenge is solved, so say what
     // is happening instead of showing a motionless 0%.
     shared.set_phase("Getting info");
@@ -4449,7 +6610,23 @@ async fn download_with_ytdlp(
         // folds the finished legs in so the bar keeps moving forward and the
         // size ends up being all legs together.
         let mut folded = MergedProgress::default();
+        let mut final_path=None;
         while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(json)=line.strip_prefix("dcfile@") {
+                final_path=serde_json::from_str::<String>(json).ok().map(PathBuf::from);
+                continue;
+            }
+            if let Some(json) = line.strip_prefix("dcinfo@") {
+                if let Ok(info) = serde_json::from_str::<serde_json::Value>(json) {
+                    if let Some(d) = info.get("duration").and_then(|v| v.as_f64()).filter(|d| d.is_finite() && *d > 0.0 && *d < 86400.0) {
+                        let _ = progress.expected_duration.compare_exchange(0, d.round().max(1.0) as u64, Ordering::SeqCst, Ordering::SeqCst);
+                    }
+                    if info.get("acodec").and_then(|v| v.as_str()).map(|a| !matches!(a, "none" | "NA" | "unknown" | "")).unwrap_or(false) {
+                        progress.expects_audio.store(true, Ordering::SeqCst);
+                    }
+                }
+                continue;
+            }
             let Some(p) = parse_progress_line(&line) else {
                 // Not a progress line: it may still name the stage the run is
                 // in ("[download] Destination:", "[Merger] …").
@@ -4472,6 +6649,10 @@ async fn download_with_ytdlp(
                     progress.set_resolution(r);
                 }
             }
+            if let (Some(i), Some(n)) = (p.frag_index, p.frag_count) {
+                progress.frag_count.store(n as u64, Ordering::SeqCst);
+                progress.frag_index.store((i.max(0.0) as u64).min(n as u64), Ordering::SeqCst);
+            }
             let (downloaded, total) = folded.step(&p);
             progress.downloaded.store(downloaded, Ordering::SeqCst);
             match total {
@@ -4486,6 +6667,7 @@ async fn download_with_ytdlp(
                 progress.speed_bps.store(speed as u64, Ordering::SeqCst);
             }
         }
+        final_path
     });
     let err_task = tokio::spawn(async move {
         let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -4512,11 +6694,10 @@ async fn download_with_ytdlp(
             Err(_) => continue,
         }
     };
-    let _ = out_task.await;
+    drop(process_tree);
+    let final_path = out_task.await.unwrap_or(None);
     let err_tail = err_task.await.unwrap_or_default();
-    if let Some(jar) = &jar {
-        let _ = tokio::fs::remove_file(jar).await;
-    }
+    drop(jar);
     let status = finish?;
     if !status.success() {
         // yt-dlp's own words are far more useful than an exit code.
@@ -4531,37 +6712,30 @@ async fn download_with_ytdlp(
         // broken link. Say what actually helps.
         if merge_ffmpeg.is_none() {
             msg.push_str(
-                " (this video has no single-file format at the quality you asked for - install ffmpeg to merge video+audio: Settings \u{25b8} Plugins \u{25b8} ffmpeg)",
+                " (this video has no single-file format at the quality you asked for - ffmpeg merges video+audio; pick \u{201c}App's own copy\u{201d} under Settings \u{25b8} Plugins \u{25b8} ffmpeg and the app fetches one)",
             );
         }
         return Err(anyhow!(msg));
     }
-    // It can still land the file under a different container extension.
+    // Postprocessing can change the extension. Only the exact file reported
+    // by this run, with the expected stem and directory, may be promoted.
     if !dest.is_file() {
-        let stem = dest
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if let Some(dir) = dest.parent() {
-            if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
-                while let Ok(Some(entry)) = rd.next_entry().await {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let usable = !name.ends_with(".part") && !name.ends_with(".ytdl");
-                    if usable && name.starts_with(&stem) && entry.path() != *dest {
-                        let _ = tokio::fs::rename(entry.path(), dest).await;
-                        break;
-                    }
-                }
-            }
+        if let Some(path)=final_path.filter(|p| valid_ytdlp_output(p,dest)) {
+            tokio::fs::rename(path,dest).await?;
         }
     }
     let len = tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0);
     if len == 0 {
         return Err(anyhow!("yt-dlp finished without writing a file"));
     }
+    if vimeo_needs_audio(url) {
+        verify_vimeo_audio(dest).await?;
+    }
     shared.downloaded.store(len, Ordering::SeqCst);
     shared.total.store(len, Ordering::SeqCst);
     shared.has_total.store(true, Ordering::SeqCst);
+    shared.frag_count.store(0, Ordering::SeqCst);
+    tidy_parts_dir(dest);
     // The file on disk is the ground truth: read its frame size back and, when
     // the video could not meet the menu cap, say so instead of letting a
     // 360p result pass for the 720p the user asked for.
@@ -4666,6 +6840,18 @@ async fn adaptive_leg(
 /// anything WebM/Opus becomes `.mkv` (same convention download managers use).
 /// Without `audio` this is a plain direct download through the same path.
 pub async fn download_adaptive(
+    video_url: String, audio_url: Option<String>, dest: PathBuf, connections: usize,
+    opts: EngineOpts, shared: Arc<SharedState>,
+) -> Result<()> {
+    if opts.expected_duration_secs > 0 { shared.expected_duration.store(opts.expected_duration_secs, Ordering::SeqCst); }
+    shared.expects_audio.store(opts.require_audio || audio_url.is_some(), Ordering::SeqCst);
+    download_adaptive_inner(video_url, audio_url, dest.clone(), connections, opts, shared.clone()).await?;
+    verify_completed_media(&dest, &shared).await?;
+    cleanup_completed_job(&dest, &shared);
+    Ok(())
+}
+
+async fn download_adaptive_inner(
     video_url: String,
     audio_url: Option<String>,
     mut dest: PathBuf,
@@ -4678,17 +6864,20 @@ pub async fn download_adaptive(
     let _job = claim_dest_job(&dest).ok_or_else(|| {
         anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
     })?;
-    // Merging needs ffmpeg: fail BEFORE any bytes move, not after two
-    // quarter-gigabyte legs finish. Progressive (single-file) qualities
-    // never reach this path, so this only gates real merges.
+    let client = opts.build_client()?;
+    // Merging needs ffmpeg: resolve (and, for the app's own copy, fetch it)
+    // BEFORE any bytes move, not after two quarter-gigabyte legs finish.
+    // Progressive (single-file) qualities never reach this path.
     if audio_url.as_deref().map(|u| u.starts_with("http")).unwrap_or(false)
         && ffmpeg_path().is_none()
     {
-        return Err(anyhow!(
-            "this quality needs merging (video-only + audio) but ffmpeg was not found — install it (`winget install ffmpeg`), restart the app so it lands on PATH, then resume; 720p and below download as single files without it"
-        ));
+        shared.set_phase("Fetching ffmpeg");
+        ensure_ffmpeg(&client).await.map_err(|e| {
+            anyhow!(
+                "this quality needs merging (video-only + audio), and {e:#}; 720p and below download as single files without it"
+            )
+        })?;
     }
-    let client = opts.build_client()?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -4762,6 +6951,19 @@ pub async fn download_adaptive(
     );
     let sv = Arc::new(SharedState::new());
     let sa = Arc::new(SharedState::new());
+    // The legs have their own state, so the job's Pause/Cancel must reach
+    // them: Pause is mirrored by the aggregator below, and this guard
+    // cancels both legs when the job ends or is aborted (the app's Cancel
+    // aborts this future, which used to leave the legs' detached range
+    // tasks downloading the whole stream).
+    struct CancelLegs(Arc<SharedState>, Arc<SharedState>);
+    impl Drop for CancelLegs {
+        fn drop(&mut self) {
+            self.0.cancelled.store(true, Ordering::SeqCst);
+            self.1.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+    let _cancel_legs = CancelLegs(sv.clone(), sa.clone());
     let v_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let a_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_audio = audio_url.is_some();
@@ -4802,6 +7004,14 @@ pub async fn download_adaptive(
     };
     let agg = async {
         loop {
+            let paused = shared.paused.load(Ordering::SeqCst);
+            let cancelled = shared.cancelled.load(Ordering::SeqCst);
+            for leg in [&sv, &sa] {
+                leg.paused.store(paused, Ordering::SeqCst);
+                if cancelled {
+                    leg.cancelled.store(true, Ordering::SeqCst);
+                }
+            }
             let sum = sv.downloaded.load(Ordering::SeqCst)
                 .saturating_add(sa.downloaded.load(Ordering::SeqCst));
             shared.downloaded.store(sum, Ordering::SeqCst);
@@ -4888,6 +7098,8 @@ struct DashRep {
     /// Exact segment count from a uniform SegmentTimeline (P3), preferred
     /// over duration math when present.
     timeline_count: Option<usize>,
+    /// (t0, d) of that timeline, for `$Time$` media templates.
+    timeline_origin: Option<(u64, u64)>,
 }
 
 fn xml_attr(tag: &str, name: &str) -> Option<String> {
@@ -4903,12 +7115,23 @@ fn xml_attr(tag: &str, name: &str) -> Option<String> {
             let q = rest.chars().next()?;
             if q == '"' || q == '\'' {
                 let end = rest[1..].find(q)?;
-                return Some(rest[1..1 + end].to_string());
+                // Attribute values are XML-escaped: a tokenized template
+                // "?a=1&amp;b=2" must be requested as "?a=1&b=2".
+                return Some(xml_unescape(&rest[1..1 + end]));
             }
         }
         search = &search[p + name.len()..];
     }
     None
+}
+
+/// The five predefined XML entities (`&amp;` last, so "&amp;lt;" stays "&lt;").
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn xml_child(block: &str, tag: &str) -> Option<String> {
@@ -4917,7 +7140,7 @@ fn xml_child(block: &str, tag: &str) -> Option<String> {
     let s = block.find(&open)?;
     let body = block[s..].find('>')? + s + 1;
     let e = block[body..].find(&close)? + body;
-    let t = block[body..e].trim().replace("&amp;", "&");
+    let t = xml_unescape(block[body..e].trim());
     if t.is_empty() {
         None
     } else {
@@ -5069,8 +7292,26 @@ fn timeline_count(block: &str, timescale: f64, period_dur_secs: Option<f64>) -> 
     Ok(Some(total))
 }
 
+/// Start time and duration (timeline units) of a uniform SegmentTimeline's
+/// first entry: segment `i` starts at `t0 + i·d`, which is what `$Time$`
+/// templates name. `timeline_count` has already rejected gaps and varying
+/// durations, so the first entry describes them all.
+fn timeline_origin(block: &str) -> Option<(u64, u64)> {
+    let p = block.find("<S ").or_else(|| block.find("<S/"))?;
+    let end = block[p..].find('>').map(|e| p + e).unwrap_or(block.len());
+    let tag = &block[p..end];
+    let d = xml_attr(tag, "d")?.parse::<u64>().ok().filter(|d| *d > 0)?;
+    let t0 = xml_attr(tag, "t").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    Some((t0, d))
+}
+
 fn dash_expand(tpl: &str, number: u64, rep_id: &str, bw: u64) -> String {
-    // $Number$, $Number%0Nd$, $RepresentationID$, $Bandwidth$.
+    dash_expand_at(tpl, number, rep_id, bw, None)
+}
+
+/// `dash_expand` plus `$Time$` (and `$Time%0Nd$`) for timeline templates.
+fn dash_expand_at(tpl: &str, number: u64, rep_id: &str, bw: u64, time: Option<u64>) -> String {
+    // $Number$, $Number%0Nd$, $RepresentationID$, $Bandwidth$, $Time$.
     // Byte-walk would corrupt multibyte template text, so iterate chars.
     let mut out = String::new();
     let chars: Vec<char> = tpl.chars().collect();
@@ -5090,6 +7331,11 @@ fn dash_expand(tpl: &str, number: u64, rep_id: &str, bw: u64) -> String {
                         out.push_str(&format!("{number:0>w$}"));
                     } else {
                         out.push_str(&number.to_string());
+                    }
+                } else if let (Some(t), true) = (time, tok == "Time" || tok.starts_with("Time%0")) {
+                    match tok.strip_prefix("Time%0").and_then(|f| f.strip_suffix('d')).and_then(|w| w.parse::<usize>().ok()) {
+                        Some(w) => out.push_str(&format!("{t:0>w$}")),
+                        None => out.push_str(&t.to_string()),
                     }
                 } else if tok == "RepresentationID" {
                     out.push_str(rep_id);
@@ -5247,6 +7493,13 @@ fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
                     .and_then(|t| tpl_secs(t))
                     .or(set_dur),
                 timeline_count: rep_tl.or(set_tl),
+                timeline_origin: if rep_tl.is_some() {
+                    timeline_origin(rblock)
+                } else if set_tl.is_some() {
+                    timeline_origin(&set_scan)
+                } else {
+                    None
+                },
             };
             if rep.mime.starts_with("video/") {
                 videos.push(rep);
@@ -5275,6 +7528,7 @@ async fn dash_fetch_blob(
     shared: &Arc<SharedState>,
     max_retries: u32,
 ) -> Result<Vec<u8>> {
+    let _host_slot = host_slot(&url, opts.per_host_conns).await;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -5348,10 +7602,13 @@ async fn dash_rep_download(
         // Templated representation: initialization segment (track headers)
         // first; the numbered media segments follow below.
         if let Some(init_tpl) = rep.seg_init.clone() {
-            let u = if init_tpl.starts_with("http") {
-                init_tpl
+            // Init templates use the same tokens ("$RepresentationID$/init.mp4");
+            // requesting them literally 404'd.
+            let init = dash_expand(&init_tpl, rep.start_number, rep_id, rep.bandwidth);
+            let u = if init.starts_with("http") {
+                init
             } else {
-                hls_abs(mpd_url, &init_tpl)
+                hls_abs(mpd_url, &init)
             };
             let blob = dash_fetch_blob(client, opts, u, shared, max_retries).await?;
             out.write_all(&blob).await.map_err(|e| anyhow!(io_message(&e)))?;
@@ -5370,7 +7627,8 @@ async fn dash_rep_download(
         let mut handles = Vec::with_capacity(n);
         for i in 0..n {
             let num = rep.start_number.saturating_add(i as u64);
-            let seg = dash_expand(&media_tpl, num, rep_id, rep.bandwidth);
+            let time = rep.timeline_origin.map(|(t0, d)| t0.saturating_add(d.saturating_mul(i as u64)));
+            let seg = dash_expand_at(&media_tpl, num, rep_id, rep.bandwidth, time);
             let u = if seg.starts_with("http") { seg } else { hls_abs(mpd_url, &seg) };
             let part = dest.with_extension(format!("dashpart{i}"));
             let client = client.clone();
@@ -5478,6 +7736,11 @@ pub async fn download_dash(
         })
         .and_then(|d| parse_pt_duration(&d));
     let (videos, audios) = parse_mpd(&xml)?;
+    if let Some(seconds) = mpd_dur.filter(|d| d.is_finite() && *d > 0.0) {
+        let _ = shared.expected_duration.compare_exchange(0, seconds.round().max(1.0) as u64, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    if !audios.is_empty() { shared.expects_audio.store(true, Ordering::SeqCst); }
+
     // Best video = most pixels (fallback: bandwidth); best audio = bandwidth.
     let v = videos
         .iter()
@@ -5485,6 +7748,14 @@ pub async fn download_dash(
         .ok_or_else(|| anyhow!("DASH manifest has no video track"))?
         .clone();
     let a = audios.iter().max_by_key(|r| r.bandwidth).cloned();
+    // Two representations mean a mux: make sure a merger exists before
+    // spending the bandwidth (the app's own copy is fetched on demand).
+    if a.is_some() && ffmpeg_path().is_none() {
+        shared.set_phase("Fetching ffmpeg");
+        ensure_ffmpeg(&client).await.map_err(|e| {
+            anyhow!("this DASH stream has separate video + audio, and {e:#}")
+        })?;
+    }
     // Container follows codecs (mp4 unless VP9/AV1/Opus → mkv), like pairs.
     let webmish = v.codecs.to_ascii_lowercase().contains("vp09")
         || v.codecs.to_ascii_lowercase().contains("av01")
@@ -5676,6 +7947,8 @@ async fn single_stream(
     // A 416 (offset rejected — total shrank or server forgot the file) is
     // only worth one clean restart; a second 416 means the URL itself is bad.
     let mut restarted_416 = false;
+    // A changed source (QR-02) is worth one clean restart as well.
+    let mut restarted_changed = false;
     loop {
         attempt += 1;
         let len_before = tokio::fs::metadata(dest.with_extension("dcpart"))
@@ -5714,6 +7987,22 @@ async fn single_stream(
                     continue;
                 }
                 let msg = e.to_string();
+                // QR-02: the saved bytes belong to a different version of
+                // the file. Drop them and download the current one from
+                // the start — never append one version to another.
+                if is_source_changed(&e) && !restarted_changed {
+                    restarted_changed = true;
+                    restarts += 1;
+                    discard_partials(dest);
+                    shared.downloaded.store(0, Ordering::SeqCst);
+                    if let Ok(mut g) = shared.part_done.lock() {
+                        if let Some(slot) = g.first_mut() {
+                            *slot = 0;
+                        }
+                    }
+                    stalled = 0;
+                    continue;
+                }
                 match classify_attempt(&msg) {
                     "cut" => cuts += 1,
                     "stalled" => stalls += 1,
@@ -5758,6 +8047,53 @@ async fn single_stream(
     }
 }
 
+/// Read at most `limit` bytes of a response body. Error and interstitial
+/// pages are small; a body that keeps coming is not one of them, so the
+/// rest of the response is dropped instead of downloaded.
+async fn read_prefix(resp: &mut reqwest::Response, limit: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < limit {
+        match resp.chunk().await {
+            Ok(Some(c)) => {
+                let take = (limit - buf.len()).min(c.len());
+                buf.extend_from_slice(&c[..take]);
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Refuse a response that is not the file: a Cloudflare browser check, or a
+/// web page where a file was expected. Both are caught BEFORE a single byte
+/// is written — saving a "Just a moment..." page as the download is worse
+/// than a clear failure.
+async fn refuse_web_page(
+    resp: &mut reqwest::Response,
+    dest: &std::path::Path,
+) -> Option<anyhow::Error> {
+    // Cloudflare marks its browser check explicitly.
+    if cloudflare_challenge_header(resp.headers()) {
+        return Some(cloudflare_challenge_err());
+    }
+    if !content_type_is_html(resp.headers()) {
+        return None;
+    }
+    // The body decides whether this is Cloudflare's check or an ordinary
+    // error page. A web page is never the download: the engine resolves
+    // media FROM a page, it never saves one.
+    let body = read_prefix(resp, 64 * 1024).await;
+    if cloudflare_challenge_body(&body) {
+        return Some(cloudflare_challenge_err());
+    }
+    Some(final_err(if expects_binary_file(dest) {
+        "the server answered with a web page, not a file — open the link in your browser and capture it with the Download Craft extension (no file was saved)".to_string()
+    } else {
+        "the server answered with a web page — Download Craft downloads media, not pages: open the link in your browser and capture the media from there (no file was saved)".to_string()
+    }))
+}
+
 async fn single_stream_once(
     client: &reqwest::Client,
     opts: &EngineOpts,
@@ -5776,6 +8112,22 @@ async fn single_stream_once(
         None
     };
     let mut start_at: u64 = resume_offset(dest, "dcpart", url, known_total, 1);
+
+    // QR-02: the saved prefix belongs to one exact version of the
+    // resource. Bind it before a single byte is appended: a strong
+    // validator travels as If-Range, and without one the saved bytes are
+    // only continued when an overlap window matches the server's copy.
+    let saved_validator = read_resume_meta(dest).and_then(|m| m.validator);
+    if start_at > 0 && saved_validator.is_none() {
+        // Legacy sidecar (or a server that sends no validator): nothing
+        // proves the saved bytes still belong to this resource.
+        if !overlap_matches(client, opts, url, &tmp, 0, start_at).await? {
+            discard_partials(dest);
+            write_resume_meta(dest, url, known_total, 1, None);
+            start_at = 0;
+            shared.downloaded.store(0, Ordering::SeqCst);
+        }
+    }
 
     // Always request a range (even from 0): some media servers truncate
     // plain 200 responses but serve full content for range requests.
@@ -5796,15 +8148,30 @@ async fn single_stream_once(
     } else {
         req.header(reqwest::header::RANGE, format!("bytes={start_at}-"))
     };
-    let resp = match req.send().await?.error_for_status() {
+    if start_at > 0 {
+        // The saved bytes are bound to a version: ask the server for that
+        // exact version. A changed resource answers 200 instead of 206.
+        if let Some(c) = saved_validator.as_ref().and_then(|v| v.condition()) {
+            req = req.header(reqwest::header::IF_RANGE, c);
+        }
+    }
+    let mut resp = req.send().await?;
+    // A browser check (Cloudflare) or a web page where a file was expected
+    // is never the download: refuse it before a single byte is written.
+    if let Some(e) = refuse_web_page(&mut resp, dest).await {
+        return Err(e);
+    }
+    let resp = match resp.error_for_status() {
         Ok(r) => r,
         Err(e) => {
             let mapped = http_status_err(url, e);
             if start_at == 0 && !is_final_http_error(&mapped) {
                 // server dislikes Range (but isn't refusing us): plain GET
-                opts.get(client, url)
-                    .send()
-                    .await?
+                let mut plain = opts.get(client, url).send().await?;
+                if let Some(e) = refuse_web_page(&mut plain, dest).await {
+                    return Err(e);
+                }
+                plain
                     .error_for_status()
                     .map_err(|e| http_status_err(url, e))?
             } else {
@@ -5828,7 +8195,62 @@ async fn single_stream_once(
 
     // If server ignored our Range, restart from 0.
     let is_partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    // QR-02: a 206 names the window it answered in Content-Range, and
+    // those bytes belong exactly there. A window that starts somewhere
+    // else would land them at the wrong offset, so it is refused.
+    if is_partial {
+        match content_range(resp.headers()) {
+            Some((first, last, total)) => {
+                if first != start_at {
+                    return Err(anyhow!(
+                        "server answered range {first}-{last} instead of {start_at}- — refusing to write bytes at the wrong offset"
+                    ));
+                }
+                if start_at > 0 {
+                    if let (Some(want), Some(got)) = (known_total, total) {
+                        if want != got {
+                            // The file changed size: the saved prefix
+                            // belongs to a different resource.
+                            return Err(source_changed());
+                        }
+                    }
+                }
+            }
+            None => {
+                if start_at > 0 {
+                    return Err(anyhow!(
+                        "server answered 206 without a usable Content-Range — refusing to resume"
+                    ));
+                }
+            }
+        }
+    }
+    // QR-02: the saved bytes must belong to the version now being served.
+    if start_at > 0 {
+        let current = verify_version(
+            client,
+            opts,
+            url,
+            &tmp,
+            0,
+            start_at,
+            saved_validator.as_ref(),
+            &resp,
+        )
+        .await?;
+        if let Some(v) = current.as_ref() {
+            bind_validator(dest, v);
+        }
+    }
     if !is_partial && start_at > 0 {
+        // The server sent the whole file (it ignored the Range, or the
+        // resource changed and If-Range made it answer 200). The body on
+        // disk must not keep a single byte of the old version.
+        //
+        // `start_at` is reset to 0 here, so the write path below takes its
+        // "not resuming" branch and truncates the part file. That branch also
+        // covers a fresh start over an existing part file, which used to keep
+        // the old tail.
         start_at = 0;
         shared.downloaded.store(0, Ordering::SeqCst);
     }
@@ -5862,16 +8284,21 @@ async fn single_stream_once(
 
     // Open for resume: keep existing bytes (seek/append below), no truncate.
     #[allow(clippy::suspicious_open_options)]
-    let mut file = tokio::fs::OpenOptions::new()
+    let mut raw = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .open(&tmp)
         .await?;
-    if start_at > 0 && is_partial {
-        file.seek(std::io::SeekFrom::Start(start_at)).await?;
-    } else if start_at > 0 {
-        file.set_len(0).await?;
+if start_at > 0 && is_partial {
+        raw.seek(std::io::SeekFrom::Start(start_at)).await?;
+    } else {
+        // Not resuming (fresh start, or the server ignored Range and
+        // `start_at` was reset to 0 above): drop the old bytes. Testing
+        // `start_at > 0` here could never be true after that reset, so a
+        // restart overwrote the front of the old part file and kept its tail.
+        raw.set_len(0).await?;
     }
+    let mut file = tokio::io::BufWriter::with_capacity(WRITE_BUF, raw);
 
     let per_conn_limit = opts.speed_limit_bps; // single connection gets full budget
     let _ = per_conn_limit;
@@ -5881,18 +8308,36 @@ async fn single_stream_once(
     // Clamped 15–120 s so slow-but-moving trickles are never killed.
     let stall_timeout = (opts.timeout_secs.max(15)).min(120);
     let mut stream = resp.bytes_stream();
+    // Any early exit still flushes what landed: the retry loop measures
+    // progress by the file's length, so buffered bytes must not be lost.
+    let mut failure: Option<anyhow::Error> = None;
     loop {
-        let next = tokio::time::timeout(
+        let next = match tokio::time::timeout(
             std::time::Duration::from_secs(stall_timeout),
             stream.next(),
         )
         .await
-        .map_err(|_| {
-            anyhow!("stalled (no data for {stall_timeout}s) — resuming")
-        })?;
+        {
+            Ok(n) => n,
+            Err(_) => {
+                failure = Some(anyhow!(
+                    "stalled (no data for {stall_timeout}s) — resuming"
+                ));
+                break;
+            }
+        };
         let Some(chunk) = next else { break };
-        wait_if_paused(&shared).await?;
-        let bytes = chunk.map_err(|e| anyhow!("network: {e}"))?;
+        if let Err(e) = wait_if_paused(&shared).await {
+            failure = Some(e);
+            break;
+        }
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                failure = Some(anyhow!("network: {e}"));
+                break;
+            }
+        };
         file.write_all(&bytes)
             .await
             .map_err(|e| anyhow!(io_message(&e)))?;
@@ -5906,6 +8351,9 @@ async fn single_stream_once(
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
+    if let Some(e) = failure {
+        return Err(e);
+    }
     // A clean-but-early socket close yields a short stream with NO error —
     // the classic Facebook/IG CDN failure ("connection ended early" in the
     // UI). When the total is known, verify the landed bytes and fail so the
@@ -5975,6 +8423,8 @@ async fn chunked_stream(
     resume_offset(dest, "dcpart", url, Some(total), 1);
     // One restart-from-zero per download (stale offset / shrunken file).
     let mut restarted = false;
+    // A changed source (QR-02) is worth one clean restart as well.
+    let mut restarted_changed = false;
     let mut stalled = 0u32;
     let mut attempt = 0u32;
     // Attempt telemetry for the final summary (see with_attempt_summary).
@@ -5988,6 +8438,19 @@ async fn chunked_stream(
     let mut refusals = 0u32;
     // Single part view for the dialogs (no lock held across awaits).
     let have_now = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+    // QR-02: the saved prefix belongs to one exact version of the
+    // resource. A strong validator travels as If-Range with every chunk;
+    // without one the saved bytes are only continued when an overlap
+    // window matches the server's copy.
+    let mut saved_validator = read_resume_meta(dest).and_then(|m| m.validator);
+    if have_now > 0 && saved_validator.is_none() {
+        if !overlap_matches(client, opts, url, &tmp, 0, have_now).await? {
+            discard_partials(dest);
+            write_resume_meta(dest, url, Some(total), 1, None);
+            saved_validator = None;
+            shared.downloaded.store(0, Ordering::SeqCst);
+        }
+    }
     {
         let mut totals = mutex_guard(&shared.part_total);
         let mut dones = mutex_guard(&shared.part_done);
@@ -5996,6 +8459,10 @@ async fn chunked_stream(
         totals.push((0, total));
         dones.push(have_now);
     }
+    // Progress restarts from what is really on disk: after a failed parallel
+    // run (its parts deleted) the counter still held those bytes and this
+    // stream added its own on top (40 MB + 50 MB on a 50 MB file).
+    shared.downloaded.store(have_now, Ordering::SeqCst);
     loop {
         attempt += 1;
         let offset = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
@@ -6013,7 +8480,7 @@ async fn chunked_stream(
         };
         let want = end.saturating_sub(offset).saturating_add(1);
         let len_before = offset;
-        match chunked_once(client, opts, url, &tmp, offset, end, want, stall_timeout, &shared, &limiter).await {
+        match chunked_once(client, opts, url, &tmp, offset, end, want, stall_timeout, &shared, &limiter, saved_validator.as_ref()).await {
             Ok(wrote) => {
                 stalled = 0;
                 refusals = 0;
@@ -6027,6 +8494,18 @@ async fn chunked_stream(
             Err(e) => {
                 if shared.cancelled.load(Ordering::SeqCst) || e.to_string() == "cancelled" {
                     return Err(e);
+                }
+                // QR-02: the saved bytes belong to a different version of
+                // the file. Drop them and fetch the current one from zero.
+                if is_source_changed(&e) && !restarted_changed {
+                    restarted_changed = true;
+                    restarts += 1;
+                    discard_partials(dest);
+                    write_resume_meta(dest, url, Some(total), 1, None);
+                    saved_validator = None;
+                    shared.downloaded.store(0, Ordering::SeqCst);
+                    stalled = 0;
+                    continue;
                 }
                 if is_final_http_error(&e) {
                     // Refusal on a live offset: throttle burst OR expiry.
@@ -6094,7 +8573,8 @@ async fn chunked_stream(
                             shared.total.store(t, Ordering::SeqCst);
                             shared.has_total.store(true, Ordering::SeqCst);
                             // Rebind resume state to the refreshed total.
-                            write_resume_meta(dest, url, Some(t), 1);
+                            let keep = read_resume_meta(dest).and_then(|m| m.validator);
+                            write_resume_meta(dest, url, Some(t), 1, keep.as_ref());
                         }
                     }
                     stalled = 0;
@@ -6148,12 +8628,23 @@ async fn chunked_once(
     stall_timeout: u64,
     shared: &Arc<SharedState>,
     limiter: &std::sync::Arc<RateLimiter>,
+    saved_validator: Option<&Validator>,
 ) -> Result<u64> {
-    let resp = opts
+    let mut req = opts
         .get(client, url)
-        .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
-        .send()
-        .await?;
+        .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"));
+    if offset > 0 {
+        // The saved bytes are bound to a version: ask for that exact one.
+        if let Some(c) = saved_validator.and_then(|v| v.condition()) {
+            req = req.header(reqwest::header::IF_RANGE, c);
+        }
+    }
+    let mut resp = req.send().await?;
+    // A browser check (Cloudflare) or a web page where a file was expected
+    // is never the download: refuse it before a single byte is written.
+    if let Some(e) = refuse_web_page(&mut resp, tmp).await {
+        return Err(e);
+    }
     let resp = resp
         .error_for_status()
         .map_err(|e| http_status_err(url, e))?;
@@ -6170,33 +8661,88 @@ async fn chunked_once(
     } else {
         shared.resumable.store(true, Ordering::SeqCst);
     }
+    if is_partial {
+        // QR-02: the answered window must start where we asked, otherwise
+        // the bytes belong at another offset.
+        match content_range(resp.headers()) {
+            Some((first, last, _)) => {
+                if first != offset || last > end {
+                    return Err(anyhow!(
+                        "server answered range {first}-{last} instead of {offset}-{end} — refusing to write bytes at the wrong offset"
+                    ));
+                }
+            }
+            None => {
+                if offset > 0 {
+                    return Err(anyhow!(
+                        "server answered 206 without a usable Content-Range — refusing to resume"
+                    ));
+                }
+            }
+        }
+    }
+    if offset > 0 {
+        // QR-02: the saved bytes must belong to the version now served.
+        let current =
+            verify_version(client, opts, url, tmp, 0, offset, saved_validator, &resp).await?;
+        if let Some(v) = current.as_ref() {
+            bind_validator(tmp, v);
+        }
+    } else if let Some(v) = Validator::read(resp.headers()) {
+        // Learn the version for the next resume.
+        bind_validator(tmp, &v);
+    }
     // Kept for the short error below: a zero-byte range with a 200/empty
     // body vs a cut 206 mean very different things (see probe_range_once).
     let resp_status = resp.status();
     let resp_len = resp.content_length();
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(tmp)
-        .await?;
+    let mut file = tokio::io::BufWriter::with_capacity(
+        WRITE_BUF,
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(tmp)
+            .await?,
+    );
     // Bytes to skip when slicing a 200 response down to our window.
     let mut to_skip = if is_partial { 0 } else { offset };
     let mut to_take = want;
     let mut wrote = 0u64;
     let mut stream = resp.bytes_stream();
+    // Any early exit still flushes what landed: the retry loops measure
+    // progress by the file's length, so buffered bytes must never be lost
+    // (a cut would otherwise replay the same offset forever).
+    let mut failure: Option<anyhow::Error> = None;
     loop {
         if to_take == 0 {
             break;
         }
-        let next = tokio::time::timeout(
+        let next = match tokio::time::timeout(
             std::time::Duration::from_secs(stall_timeout),
             stream.next(),
         )
         .await
-        .map_err(|_| anyhow!("stalled (no data for {stall_timeout}s) — resuming"))?;
+        {
+            Ok(n) => n,
+            Err(_) => {
+                failure = Some(anyhow!(
+                    "stalled (no data for {stall_timeout}s) — resuming"
+                ));
+                break;
+            }
+        };
         let Some(chunk) = next else { break };
-        wait_if_paused(shared).await?;
-        let bytes = chunk.map_err(|e| anyhow!("network: {e}"))?;
+        if let Err(e) = wait_if_paused(shared).await {
+            failure = Some(e);
+            break;
+        }
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                failure = Some(anyhow!("network: {e}"));
+                break;
+            }
+        };
         let mut data = &bytes[..];
         if to_skip > 0 {
             let cut = (to_skip as usize).min(data.len());
@@ -6226,6 +8772,9 @@ async fn chunked_once(
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
+    if let Some(e) = failure {
+        return Err(e);
+    }
     if wrote != want {
         // Zero-byte ranges name the cause: an empty/ignored range (200, no
         // body) means resume is impossible on this URL; a cut 206 means
@@ -6242,7 +8791,45 @@ async fn chunked_once(
     Ok(wrote)
 }
 
+/// Download a file as several parallel byte ranges and merge them.
+///
+/// QR-02: when the resource changes under the transfer the saved parts
+/// belong to a different version of the file. They are dropped and the
+/// current version is downloaded from the start — two versions of a file
+/// are never merged into one.
 async fn segmented(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    dest: &PathBuf,
+    total: u64,
+    connections: usize,
+    shared: Arc<SharedState>,
+    limiter: std::sync::Arc<RateLimiter>,
+) -> Result<()> {
+    let first = segmented_once(
+        client,
+        opts,
+        url,
+        dest,
+        total,
+        connections,
+        shared.clone(),
+        limiter.clone(),
+    )
+    .await;
+    match first {
+        Ok(()) => Ok(()),
+        Err(e) if is_source_changed(&e) => {
+            discard_partials(dest);
+            shared.downloaded.store(0, Ordering::SeqCst);
+            segmented_once(client, opts, url, dest, total, connections, shared, limiter).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn segmented_once(
     client: &reqwest::Client,
     opts: &EngineOpts,
     url: &str,
@@ -6261,6 +8848,9 @@ async fn segmented(
     // (P0); same-URL+total+conns still resumes via download_range seeding.
     resume_offset(dest, "dcpart", url, Some(total), connections);
 
+    // Every worker must validate against the same saved version. A fresh
+    // sibling can update the shared sidecar before a resumed worker reads it.
+    let saved_validator = read_resume_meta(dest).and_then(|m| m.validator);
     let chunk = total / connections as u64;
 
     let mut handles = Vec::new();
@@ -6291,6 +8881,7 @@ async fn segmented(
         let shared = shared.clone();
         let opts = opts.clone();
         let limiter = limiter.clone();
+        let saved_validator = saved_validator.clone();
         handles.push(tokio::spawn(async move {
             download_range(
                 &client,
@@ -6302,6 +8893,7 @@ async fn segmented(
                 limiter,
                 i,
                 shared,
+                saved_validator,
             )
             .await
         }));
@@ -6328,20 +8920,32 @@ async fn segmented(
         return Err(e);
     }
 
-    // Merge parts in order.
+    // Merge parts in order. A 1 MiB buffer on both sides keeps `copy` from
+    // paying an 8 KiB blocking-pool round trip per chunk (a 2 GB file is
+    // ~250k of them at the default size).
     let tmp = dest.with_extension("dcpart");
-    let mut out = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp)
-        .await?;
+    let mut out = tokio::io::BufWriter::with_capacity(
+        WRITE_BUF,
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .await?,
+    );
+    let mut buf = vec![0u8; WRITE_BUF];
     for i in 0..connections {
         let part = dest.with_extension(format!("dcpart{}", i));
         let mut f = tokio::fs::File::open(&part).await?;
-        tokio::io::copy(&mut f, &mut out).await?;
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut out, &buf[..n]).await?;
+        }
     }
-    out.flush().await?;
+    tokio::io::AsyncWriteExt::flush(&mut out).await?;
     drop(out);
     for i in 0..connections {
         let part = dest.with_extension(format!("dcpart{}", i));
@@ -6363,7 +8967,11 @@ async fn download_range(
     limiter: std::sync::Arc<RateLimiter>,
     part_idx: usize,
     shared: Arc<SharedState>,
+    saved_validator: Option<Validator>,
 ) -> Result<()> {
+    // One host-wide slot per open connection (Queue v2): with the cap set,
+    // three jobs to the same CDN can never open 3×8 sockets.
+    let _host_slot = host_slot(url, opts.per_host_conns).await;
     let max_retries = opts.max_retries.max(1);
     // Attempts that made ANY progress don't count toward the retry budget
     // (throttled CDNs drip-feed: each 1 MB trickle resets the stall count).
@@ -6401,6 +9009,7 @@ async fn download_range(
             limiter.clone(),
             part_idx,
             &shared,
+            saved_validator.as_ref(),
         )
         .await;
         match res {
@@ -6409,7 +9018,10 @@ async fn download_range(
                 if shared.cancelled.load(Ordering::SeqCst) {
                     return Err(e);
                 }
-                if e.to_string() == "cancelled" || is_final_http_error(&e) {
+                if e.to_string() == "cancelled" || is_final_http_error(&e) || is_source_changed(&e) {
+                    // A changed source (QR-02) is not a transport hiccup:
+                    // retrying the same part would append one version to
+                    // another. The caller restarts the whole file.
                     return Err(e);
                 }
                 // Attempts append, so file growth == progress.
@@ -6439,6 +9051,7 @@ async fn download_range_once(
     limiter: std::sync::Arc<RateLimiter>,
     part_idx: usize,
     shared: &Arc<SharedState>,
+    saved_validator: Option<&Validator>,
 ) -> Result<()> {
     let range_len = end.saturating_sub(start).saturating_add(1);
     // Resume offset: previous attempts (or an earlier throttled run) may
@@ -6451,14 +9064,31 @@ async fn download_range_once(
         orig
     };
     let from = start.saturating_add(have);
-    let resp = opts
+    // QR-02: the saved part bytes belong to one exact version of the
+    // resource. The binding lives in the sidecar next to the parts (the
+    // part file carries the same stem, so the sidecar path is the same).
+    if have > 0 && saved_validator.is_none() {
+        // Nothing proves the saved part belongs to this resource.
+        if !overlap_matches(client, opts, url, part, start, have).await? {
+            return Err(source_changed());
+        }
+    }
+    let mut req = opts
         .get(client, url)
-        .header(
-            reqwest::header::RANGE,
-            format!("bytes={from}-{end}"),
-        )
-        .send()
-        .await?
+        .header(reqwest::header::RANGE, format!("bytes={from}-{end}"));
+    if have > 0 {
+        // The saved bytes are bound to a version: ask for that exact one.
+        if let Some(c) = saved_validator.and_then(|v| v.condition()) {
+            req = req.header(reqwest::header::IF_RANGE, c);
+        }
+    }
+    let mut resp = req.send().await?;
+    // A browser check (Cloudflare) or a web page where a file was expected
+    // is never the download: refuse it before a single byte is written.
+    if let Some(e) = refuse_web_page(&mut resp, part).await {
+        return Err(e);
+    }
+    let resp = resp
         .error_for_status()
         .map_err(|e| http_status_err(url, e))?;
 
@@ -6466,21 +9096,80 @@ async fn download_range_once(
     // and sent the whole file: slice our window out of the stream instead of
     // writing garbage (or failing outright).
     let is_partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if is_partial {
+        // QR-02: the answered window must be exactly the requested one.
+        // Bytes that belong elsewhere would land at the wrong offset.
+        match content_range(resp.headers()) {
+            Some((first, last, _)) => {
+                if first != from || last != end {
+                    return Err(anyhow!(
+                        "server answered range {first}-{last} instead of {from}-{end} — refusing to write bytes at the wrong offset"
+                    ));
+                }
+            }
+            None => {
+                if have > 0 {
+                    return Err(anyhow!(
+                        "server answered 206 without a usable Content-Range — refusing to resume"
+                    ));
+                }
+            }
+        }
+    }
+    if have > 0 {
+        // QR-02: the saved bytes must belong to the version now served.
+        let current = verify_version(
+            client,
+            opts,
+            url,
+            part,
+            start,
+            have,
+            saved_validator,
+            &resp,
+        )
+        .await?;
+        if let Some(v) = current.as_ref() {
+            bind_validator(part, v);
+        }
+    } else if let Some(v) = Validator::read(resp.headers()) {
+        // Learn the version for the next resume.
+        bind_validator(part, &v);
+    }
     if !is_partial && have > 0 {
         let _ = tokio::fs::remove_file(part).await;
     }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(part)
-        .await?;
+    let mut file = tokio::io::BufWriter::with_capacity(
+        WRITE_BUF,
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(part)
+            .await?,
+    );
     let mut stream = resp.bytes_stream();
     // Bytes to skip/take when slicing a 200 response down to our window.
     let mut to_skip = if is_partial { 0 } else { start };
     let mut to_take = range_len;
-    while let Some(chunk) = stream.next().await {
-        wait_if_paused(shared).await?;
-        let bytes = chunk.map_err(|e| anyhow!("network: {e}"))?;
+    // Any early exit still flushes what landed: the retry loop measures
+    // progress by the part file's length, so buffered bytes must not be lost.
+    let mut failure: Option<anyhow::Error> = None;
+    loop {
+        let next = match stream.next().await {
+            Some(n) => n,
+            None => break,
+        };
+        if let Err(e) = wait_if_paused(shared).await {
+            failure = Some(e);
+            break;
+        }
+        let bytes = match next {
+            Ok(b) => b,
+            Err(e) => {
+                failure = Some(anyhow!("network: {e}"));
+                break;
+            }
+        };
         let mut data = &bytes[..];
         if to_skip > 0 {
             let cut = (to_skip as usize).min(data.len());
@@ -6514,6 +9203,9 @@ async fn download_range_once(
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
+    if let Some(e) = failure {
+        return Err(e);
+    }
     // A clean-but-early socket close yields a short stream with no error —
     // never accept a short part (the retry loop re-fetches the range).
     let wrote = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
@@ -6530,10 +9222,52 @@ async fn download_range_once(
 mod tests {
     use super::*;
 
+    /// A YouTube caption URL is a FILE, not a video page.
+    ///
+    /// The caption endpoint hands out a WebVTT when it is asked for one, and
+    /// its URL carries the video's id (`v=`) — so every YouTube-shaped test
+    /// calls it a page. Resolving it as one downloads the VIDEO the captions
+    /// belong to instead of the captions.
+    #[test]
+    fn a_youtube_caption_url_is_a_file_not_a_page() {
+        let cap = "https://www.youtube.com/api/timedtext?v=abc123&ei=x&caps=&asr=1\
+                   &opi=112&exp=yb&hl=en&ip=0.0.0.0&ipbits=0&expire=1&sparams=ip,ipbits,\
+                   expire,v,ei,caps,opi,expire&signature=sig&key=yt8&kind=asr&lang=en&fmt=vtt";
+        assert!(is_youtube_caption_url(cap), "a caption URL must be a file");
+        assert!(!is_youtube_video_page(cap), "a caption URL must not be resolved");
+        assert!(
+            !needs_resolve(cap, Some("text/vtt")),
+            "a caption file is downloaded as it is, never resolved into the video"
+        );
+        // The same URL without the caption format is still the caption
+        // endpoint: the path says what it is.
+        assert!(is_youtube_caption_url(
+            "https://www.youtube.com/api/timedtext?v=abc123&lang=en"
+        ));
+        assert!(is_youtube_caption_url(
+            "https://www.youtube.com/api/timedtext?v=abc123&fmt=srt"
+        ));
+        // A video page is still a page.
+        assert!(is_youtube_video_page("https://www.youtube.com/watch?v=abc123"));
+        assert!(is_youtube_video_page("https://youtu.be/abc123"));
+        assert!(is_youtube_video_page("https://www.youtube.com/embed/abc123"));
+        assert!(is_youtube_video_page("https://www.youtube.com/shorts/abc123"));
+        assert!(needs_resolve("https://www.youtube.com/watch?v=abc123", None));
+        assert!(needs_resolve("https://example.org/watch", Some("text/html")));
+        assert!(!needs_resolve("https://example.org/clip.mp4", Some("video/mp4")));
+        assert!(!is_youtube_video_page("https://vimeo.com/1"));
+        assert!(!is_youtube_caption_url("https://example.org/sub.vtt"));
+    }
+
     #[test]
     fn sanitize_names() {
         assert_eq!(sanitize_filename("a/b\\c:d.mp4"), "a_b_c_d.mp4");
         assert_eq!(sanitize_filename("   "), "download.bin");
+        // A long Bengali title (3 bytes a letter) keeps its quality tag.
+        let long = format!("{} [1080p].mp4", "খেজুর আর হুজুরের মধ্যে পার্থক্য কি ".repeat(3));
+        let short = sanitize_filename(&long);
+        assert!(short.len() <= 120, "{}", short.len());
+        assert!(short.ends_with(" [1080p].mp4"), "{short}");
         // multibyte truncation must not panic or split chars
         let long = format!("{}.mp4", "ف".repeat(200));
         let out = sanitize_filename(&long);
@@ -6696,6 +9430,197 @@ mod tests {
     }
 
     #[test]
+    fn zip_entry_reads_a_release_archive() {
+        use std::io::Write;
+        // One stored and one deflated file, laid out like a release zip.
+        fn zip(files: &[(&str, &[u8], bool)]) -> Vec<u8> {
+            let (mut out, mut dir) = (Vec::new(), Vec::new());
+            for (name, data, deflate) in files {
+                let body = if *deflate {
+                    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                    e.write_all(data).unwrap();
+                    e.finish().unwrap()
+                } else {
+                    data.to_vec()
+                };
+                let method: u16 = if *deflate { 8 } else { 0 };
+                let local = out.len() as u32;
+                out.extend_from_slice(b"PK\x03\x04");
+                out.extend_from_slice(&[20, 0, 0, 0]);
+                out.extend_from_slice(&method.to_le_bytes());
+                out.extend_from_slice(&[0; 8]); // time, date, crc
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(&body);
+                dir.extend_from_slice(b"PK\x01\x02");
+                dir.extend_from_slice(&[20, 0, 20, 0, 0, 0]);
+                dir.extend_from_slice(&method.to_le_bytes());
+                dir.extend_from_slice(&[0; 8]);
+                dir.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                dir.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                dir.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                dir.extend_from_slice(&[0; 12]); // extra, comment, disk, attrs
+                dir.extend_from_slice(&local.to_le_bytes());
+                dir.extend_from_slice(name.as_bytes());
+            }
+            let at = out.len() as u32;
+            let n = files.len() as u16;
+            out.extend_from_slice(&dir);
+            out.extend_from_slice(b"PK\x05\x06");
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&(dir.len() as u32).to_le_bytes());
+            out.extend_from_slice(&at.to_le_bytes());
+            out.extend_from_slice(&[0, 0]);
+            out
+        }
+        let exe = b"MZ portable runtime ".repeat(500);
+        let z = zip(&[("README.md", b"hi", false), ("deno/deno.exe", &exe, true)]);
+        assert_eq!(zip_entry(&z, "deno.exe").unwrap(), exe);
+        assert_eq!(zip_entry(&z, "README.md").unwrap(), b"hi");
+        assert!(zip_entry(&z, "missing").is_err());
+        assert!(zip_entry(&z[..z.len() / 2], "deno.exe").is_err());
+    }
+
+    #[test]
+    fn fragment_downloads_do_not_snowball_or_drift() {
+        let line = |s: &str| parse_progress_line(s).unwrap();
+        // Several fragments in flight: the counter dips now and then. Each
+        // dip used to count as a new leg and add the whole total again - an
+        // HLS movie claimed 18 GB downloaded after a resume.
+        let mut f = MergedProgress::default();
+        let mut last = 0;
+        for done in [500_000_000u64, 498_000_000, 520_000_000, 519_500_000, 530_000_000] {
+            let l = format!("dcp@{done}|NA|2300000000|6000000|960|1920|hls-3574|avc1|120|1340");
+            let (dl, total) = f.step(&line(&l));
+            assert!(dl >= last && dl <= 530_000_000, "{dl}");
+            last = dl;
+            // The estimate moves with every fragment: no size is published.
+            assert_eq!(total, None);
+        }
+        // The fragment fields are read.
+        let p = line("dcp@1|NA|5|1|NA|NA|hls-1|avc1|120|1340");
+        assert_eq!((p.frag_index, p.frag_count), (Some(120.0), Some(1340.0)));
+        assert_eq!(line("dcp@1|2|NA|1").frag_count, None);
+        // A different format id is the next leg, even when its counter has not
+        // dropped below half (the audio leg of a merge).
+        let mut g = MergedProgress::default();
+        g.step(&line("dcp@1000|1000|NA|1|720|1280|137|avc1"));
+        let (dl, total) = g.step(&line("dcp@900|900|NA|1|NA|NA|140|none"));
+        assert_eq!((dl, total), (1900, Some(1900)));
+    }
+
+    #[test]
+    fn resume_metadata_is_removed_only_for_completed_files() {
+        let dir = std::env::temp_dir().join(format!("dc-cleanup-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("movie.mp4");
+        let meta = resume_meta_path(&dest);
+        std::fs::write(&meta, "resume").unwrap();
+        cleanup_completed_resume(&dest);
+        assert!(meta.exists()); // interrupted, no finished file
+        std::fs::write(&dest, "complete").unwrap();
+        std::fs::write(dest.with_extension("dcpart"), "partial").unwrap();
+        cleanup_completed_resume(&dest);
+        assert!(meta.exists()); // active partial data still needs its binding
+        std::fs::remove_file(dest.with_extension("dcpart")).unwrap();
+        cleanup_completed_resume(&dest);
+        assert!(!meta.exists());
+        assert!(dest.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn general_fragments_need_a_complete_source() {
+        assert!(is_media_fragment("https://cdn.example.org/seg-003.ts"));
+        assert!(is_media_fragment("https://cdn.example.org/part.m4s"));
+        assert!(is_media_fragment("https://cdn.example.org/v.mp4?range=100-200"));
+        assert!(!is_media_fragment("https://cdn.example.org/short.mp4"));
+        assert!(!is_media_fragment("https://cdn.example.org/movie.ts"));
+        assert!(!is_media_fragment("https://cdn.example.org/file.zip?range=100-200"));
+        assert!(fragment_page("https://cdn.example.org/part.m4s", "").is_err());
+        assert_eq!(fragment_page("https://cdn.example.org/part.m4s", "https://example.org/watch/1").unwrap().as_deref(), Some("https://example.org/watch/1"));
+        assert_eq!(cookie_domain("https://player.example.org/watch/1"), ".player.example.org");
+    }
+
+    #[test]
+    fn generic_hls_separate_audio_is_detected_from_manifest_evidence() {
+        assert!(hls_external_audio("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"audio.m3u8\"\n"));
+        assert!(!hls_external_audio("#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,URI=\"subs.m3u8\"\n"));
+        assert!(!hls_external_audio("#EXTM3U\n#EXTINF:2,\nseg0.ts\n#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn completed_duration_checks_allow_short_and_silent_sources() {
+        let silent = r#"{"format":{"duration":"3.0"},"streams":[{"codec_type":"video"}]}"#;
+        assert!(completed_media_check(silent, 3, false).is_ok());
+        assert!(completed_media_check(silent, 0, false).is_ok());
+        assert!(completed_media_check(silent, 2700, false).unwrap_err().to_string().contains("incomplete media"));
+        assert!(completed_media_check(silent, 3, true).unwrap_err().to_string().contains("no audio"));
+        let sound = r#"{"format":{"duration":"2699.5"},"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}"#;
+        assert!(completed_media_check(sound, 2700, true).is_ok());
+        assert!(completed_media_check(r#"{"streams":[]}"#, 2700, false).is_err());
+    }
+
+    #[test]
+    fn vimeo_manifests_bypass_video_only_hls_concat() {
+        let manifest = "https://vod-adaptive-ak.vimeocdn.com/video/master.m3u8?token=signed";
+        let player = "https://player.vimeo.com/video/123?h=unlisted";
+        assert_eq!(vimeo_download_target(manifest, player).unwrap().as_deref(), Some(player));
+        assert_eq!(vimeo_download_target(manifest, "https://example.com/watch").unwrap().as_deref(), Some(manifest));
+        assert!(vimeo_download_target("https://vod-adaptive-ak.vimeocdn.com/video.mp4", "").is_err());
+        assert_eq!(vimeo_download_target("https://vod.vimeocdn.com/full.mp4", "").unwrap(), None);
+        assert!(!vimeo_needs_audio("https://vimeocdn.com.evil.test/master.m3u8"));
+    }
+
+    #[test]
+    fn vimeo_format_selection_requires_audio() {
+        assert_eq!(audio_required_format("", true), "bv+ba[ext=m4a]/bv+ba/b[acodec!=none]");
+        assert_eq!(audio_required_format("", false), "b[acodec!=none]");
+        assert!(audio_required_format("720p", true).contains("bv[height<=720]+ba"));
+        assert!(audio_required_format("720p", false).contains("[acodec!=none]"));
+    }
+
+    #[test]
+    fn vimeo_finished_file_must_have_an_audio_track() {
+        assert!(ffprobe_has_audio(r#"{"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}"#).unwrap());
+        assert!(!ffprobe_has_audio(r#"{"streams":[{"codec_type":"video"}]}"#).unwrap());
+        assert!(!ffprobe_has_audio(r#"{"streams":[]}"#).unwrap());
+        assert!(ffprobe_has_audio("invalid").is_err());
+    }
+
+    #[test]
+    fn vimeo_range_captures_are_not_full_files() {
+        assert!(is_vimeo_fragment("https://vod-adaptive-ak.vimeocdn.com/v2/range/prot/token/avf/v.mp4?range=3938712-4982381"));
+        assert!(is_vimeo_fragment("https://vod.vimeocdn.com/v2/range/prot/token/v.mp4"));
+        assert!(is_vimeo_fragment("https://vod.vimeocdn.com/v.mp4?range=0-99"));
+        assert!(!is_vimeo_fragment("https://vod.vimeocdn.com/full.mp4"));
+        assert!(!is_vimeo_fragment("https://vimeocdn.com.evil.test/v2/range/v.mp4"));
+        assert!(is_vimeo_video_page("https://player.vimeo.com/video/123?h=secret"));
+        assert!(is_vimeo_video_page("https://vimeo.com/123/secret"));
+        assert!(!is_vimeo_video_page("https://vimeo.com/user123"));
+        assert!(!is_vimeo_video_page("https://vimeo.com/"));
+        assert!(!is_vimeo_video_page("ftp://vimeo.com/123"));
+        assert_eq!(cookie_domain("https://player.vimeo.com/video/123?h=secret"), ".vimeo.com");
+    }
+
+    #[tokio::test]
+    async fn vimeo_fragment_without_player_fails_before_transfer() {
+        let shared = Arc::new(SharedState::new());
+        let result = download(
+            "https://vod.vimeocdn.com/v2/range/prot/token/v.mp4?range=0-99".to_string(),
+            std::env::temp_dir().join("downloadcraft-vimeo-fragment-guard.mp4"),
+            1, EngineOpts::default(), shared.clone(),
+        ).await;
+        assert!(result.unwrap_err().to_string().contains("playback fragment"));
+        assert_eq!(shared.downloaded.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn social_pages_are_used_for_audio_merges() {
         // A captured Facebook/Instagram representation is video-only; the page
         // is where the matching audio track lives. Only a page naming ONE video
@@ -6774,7 +9699,7 @@ mod tests {
 
         // Different URL: stale prefix discarded (the FB slice case).
         std::fs::write(&part, vec![7u8; 100]).unwrap();
-        write_resume_meta(&dest, url_a, Some(1000), 1);
+        write_resume_meta(&dest, url_a, Some(1000), 1, None);
         assert_eq!(resume_offset(&dest, "dcpart", url_b, Some(1000), 1), 0);
         assert!(!part.exists());
 
@@ -6791,7 +9716,7 @@ mod tests {
         assert!(!p0.exists());
 
         // meta_matches unit rules.
-        let m = ResumeMeta { url: url_a.into(), total: Some(1000), conns: 1 };
+        let m = ResumeMeta { url: url_a.into(), total: Some(1000), conns: 1, validator: None };
         assert!(meta_matches(&m, url_a, Some(1000), 1));
         assert!(!meta_matches(&m, url_b, Some(1000), 1));
         assert!(!meta_matches(&m, url_a, Some(999), 1));
@@ -6799,6 +9724,617 @@ mod tests {
         assert!(meta_matches(&m, url_a, None, 1)); // unknown: wildcard
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- QR-02: version-bound resume --------------------------------------
+    //
+    // A local file server whose served version can change under the engine:
+    // it carries an ETag (or a Last-Modified date), honours `If-Range`, and
+    // can answer with a deliberately wrong `Content-Range`.
+
+    #[derive(Clone)]
+    struct Versioned {
+        inner: std::sync::Arc<VersionedInner>,
+    }
+
+    struct VersionedInner {
+        state: std::sync::Mutex<VersionedState>,
+        /// (Range, If-Range) of every request the engine made.
+        seen: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
+    }
+
+    #[derive(Clone)]
+    struct VersionedState {
+        body: Vec<u8>,
+        etag: Option<String>,
+        modified: Option<String>,
+        /// Name a different window in `Content-Range`.
+        wrong_range: bool,
+        /// Answer 206 even when the `If-Range` condition does not match.
+        ignore_if_range: bool,
+    }
+
+    impl Versioned {
+        fn new(body: Vec<u8>, etag: Option<&str>, modified: Option<&str>) -> Self {
+            Self {
+                inner: std::sync::Arc::new(VersionedInner {
+                    state: std::sync::Mutex::new(VersionedState {
+                        body,
+                        etag: etag.map(str::to_string),
+                        modified: modified.map(str::to_string),
+                        wrong_range: false,
+                        ignore_if_range: false,
+                    }),
+                    seen: std::sync::Mutex::new(Vec::new()),
+                }),
+            }
+        }
+
+        /// Serve a different version from now on.
+        fn serve(&self, body: Vec<u8>, etag: Option<&str>, modified: Option<&str>) {
+            let mut g = mutex_guard(&self.inner.state);
+            g.body = body;
+            g.etag = etag.map(str::to_string);
+            g.modified = modified.map(str::to_string);
+        }
+
+        fn flags(&self, wrong_range: bool, ignore_if_range: bool) {
+            let mut g = mutex_guard(&self.inner.state);
+            g.wrong_range = wrong_range;
+            g.ignore_if_range = ignore_if_range;
+        }
+
+        fn requests(&self) -> Vec<(Option<String>, Option<String>)> {
+            mutex_guard(&self.inner.seen).clone()
+        }
+    }
+
+    async fn serve_versioned(mut s: tokio::net::TcpStream, v: Versioned) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match s.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&chunk[..n]);
+                    if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let head = String::from_utf8_lossy(&raw).into_owned();
+        let mut lines = head.lines();
+        let rl = lines.next().unwrap_or("").to_string();
+        let mut it = rl.split_whitespace();
+        let method = it.next().unwrap_or("").to_string();
+        let mut range: Option<(u64, u64)> = None;
+        let mut if_range: Option<String> = None;
+        for l in lines {
+            if l.trim().is_empty() {
+                break;
+            }
+            if let Some((k, val)) = l.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("range") {
+                    let v = val.trim().strip_prefix("bytes=").unwrap_or("").trim();
+                    if let Some((a, b)) = v.split_once('-') {
+                        if let Ok(start) = a.trim().parse::<u64>() {
+                            let end = b.trim().parse::<u64>().unwrap_or(u64::MAX);
+                            range = Some((start, end));
+                        }
+                    }
+                } else if k.trim().eq_ignore_ascii_case("if-range") {
+                    if_range = Some(val.trim().to_string());
+                }
+            }
+        }
+        let (body, etag, modified, wrong_range, ignore_if_range) = {
+            let g = mutex_guard(&v.inner.state);
+            (
+                g.body.clone(),
+                g.etag.clone(),
+                g.modified.clone(),
+                g.wrong_range,
+                g.ignore_if_range,
+            )
+        };
+        mutex_guard(&v.inner.seen).push((
+            range.map(|(a, _)| format!("bytes={a}-")),
+            if_range.clone(),
+        ));
+        let total = body.len() as u64;
+        let etag_h = etag
+            .as_ref()
+            .map(|e| format!("ETag: {e}\r\n"))
+            .unwrap_or_default();
+        let mod_h = modified
+            .as_ref()
+            .map(|m| format!("Last-Modified: {m}\r\n"))
+            .unwrap_or_default();
+        // Does the condition the client sent still describe what we serve?
+        let cond_ok = match (&if_range, &etag, &modified) {
+            (None, _, _) => true,
+            (Some(c), Some(e), _) => c == e,
+            (Some(c), None, Some(m)) => c == m,
+            (Some(_), None, None) => false,
+        };
+        let is_head = method.eq_ignore_ascii_case("HEAD");
+        let served = match range {
+            Some((start, end)) if start < total && (cond_ok || ignore_if_range) => {
+                let last = if end == u64::MAX {
+                    total - 1
+                } else {
+                    end.min(total - 1)
+                };
+                Some((start, last))
+            }
+            Some((start, _)) if start >= total => {
+                let r = format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\n{etag_h}{mod_h}Connection: close\r\n\r\n");
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.flush().await;
+                return;
+            }
+            _ => None,
+        };
+        match served {
+            Some((start, last)) => {
+                let slice = &body[start as usize..=last as usize];
+                let first = if wrong_range { start + 1 } else { start };
+                let r = format!("HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {first}-{last}/{total}\r\nContent-Length: {}\r\n{etag_h}{mod_h}Connection: close\r\n\r\n", slice.len());
+                let _ = s.write_all(r.as_bytes()).await;
+                if !is_head {
+                    let _ = s.write_all(slice).await;
+                }
+                let _ = s.flush().await;
+            }
+            None => {
+                let r = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n{etag_h}{mod_h}Connection: close\r\n\r\n", body.len());
+                let _ = s.write_all(r.as_bytes()).await;
+                if !is_head {
+                    let _ = s.write_all(&body).await;
+                }
+                let _ = s.flush().await;
+            }
+        }
+    }
+
+    async fn versioned_server(v: Versioned) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind versioned fixture");
+        let addr = listener.local_addr().expect("versioned addr");
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((s, _)) => {
+                        let v = v.clone();
+                        tokio::spawn(async move { serve_versioned(s, v).await });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        format!("http://{addr}/file")
+    }
+
+    fn versioned_body(len: usize, salt: u8) -> Vec<u8> {
+        (0..len).map(|i| ((i % 251) as u8).wrapping_add(salt)).collect()
+    }
+
+    #[tokio::test]
+    async fn resume_binds_strong_etag_and_sends_if_range() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("etag.bin");
+
+        // A saved prefix bound to version 1 of the resource.
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("resume with etag");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+
+        // The resume carried the binding as If-Range.
+        let seen = v.requests();
+        assert!(
+            seen.iter()
+                .any(|(_, ir)| ir.as_deref() == Some("\"v1\"")),
+            "the resume must send If-Range, saw: {seen:?}"
+        );
+        // ...and asked for the window that continues the saved prefix.
+        let expect = format!("bytes={PREFIX}-");
+        assert!(
+            seen.iter().any(|(r, _)| r.as_deref() == Some(expect.as_str())),
+            "the resume must continue at the saved offset, saw: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn changed_resource_restarts_instead_of_appending() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let v1 = versioned_body(LEN, 0);
+        let v2 = versioned_body(LEN, 90); // same size, different bytes
+        let v = Versioned::new(v1.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02b_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("changed.bin");
+
+        std::fs::write(dest.with_extension("dcpart"), &v1[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+        // The server now serves a different version of the same URL.
+        v.serve(v2.clone(), Some("\"v2\""), None);
+
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("changed resource must restart, not fail");
+        // The file must be the current version, byte for byte: not one byte
+        // of the old prefix may survive.
+        assert_eq!(std::fs::read(&dest).unwrap(), v2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wrong_validator_in_partial_is_refused() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let v1 = versioned_body(LEN, 0);
+        let v2 = versioned_body(LEN, 90);
+        let v = Versioned::new(v1.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02c_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("wrongvalidator.bin");
+
+        std::fs::write(dest.with_extension("dcpart"), &v1[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+        // A server that ignores If-Range and answers 206 with the NEW etag:
+        // the bytes belong to another version and must not be appended.
+        v.serve(v2.clone(), Some("\"v2\""), None);
+        v.flags(false, true);
+
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("wrong validator must restart");
+        assert_eq!(std::fs::read(&dest).unwrap(), v2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn segmented_parts_of_a_changed_resource_are_not_merged() {
+        const LEN: usize = 3 * 1024 * 1024; // >= 1 MiB forces the segmented path
+        const PREFIX: usize = 100 * 1024;
+        let v1 = versioned_body(LEN, 0);
+        let v2 = versioned_body(LEN, 90);
+        let v = Versioned::new(v1.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02i_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("segchanged.bin");
+
+        // Part 0 holds a prefix of version 1; the split matches the sidecar.
+        std::fs::write(dest.with_extension("dcpart0"), &v1[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            4,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+        // The server keeps answering ranges, but with the new version.
+        v.serve(v2.clone(), Some("\"v2\""), None);
+        v.flags(false, true);
+
+        download(
+            url.clone(),
+            dest.clone(),
+            4,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("segmented changed resource must restart");
+        // Two versions of a file must never be merged into one.
+        assert_eq!(std::fs::read(&dest).unwrap(), v2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_content_range_is_refused() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02d_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("badrange.bin");
+
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+        // The server names a window that is not the one we asked for.
+        v.flags(true, false);
+
+        let err = download(
+            url.clone(),
+            dest.clone(),
+            1,
+            EngineOpts {
+                max_retries: 1,
+                ..matrix_opts()
+            },
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect_err("a wrong Content-Range must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("wrong offset"),
+            "must name the offset problem, got: {msg}"
+        );
+        // Nothing was appended: the saved prefix is untouched.
+        let part = std::fs::read(dest.with_extension("dcpart")).unwrap();
+        assert_eq!(part.len(), PREFIX);
+        assert_eq!(part, body[..PREFIX]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_partial_without_validator_is_verified_by_overlap() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02e_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("legacy.bin");
+
+        // A legacy partial: correct bytes, but no sidecar at all.
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("legacy partial");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        // The engine proved the saved bytes with a small overlap window.
+        let seen = v.requests();
+        assert!(
+            seen.iter().any(|(r, _)| r
+                .as_deref()
+                .map(|r| r.starts_with("bytes=") && r.contains('-'))
+                .unwrap_or(false)),
+            "the overlap check must ask for a window, saw: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_partial_with_foreign_bytes_is_discarded() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02f_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("foreign.bin");
+
+        // A partial from a DIFFERENT version of the file, no sidecar.
+        std::fs::write(dest.with_extension("dcpart"), vec![0xABu8; PREFIX]).unwrap();
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("foreign partial must be replaced");
+        // Not one byte of the foreign prefix may survive.
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn old_sidecar_without_validator_field_still_loads() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02g_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("oldsidecar.bin");
+
+        // A sidecar written before the validator existed.
+        std::fs::write(
+            resume_meta_path(&dest),
+            format!("{{\"url\":\"{url}\",\"total\":{LEN},\"conns\":1}}"),
+        )
+        .unwrap();
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+
+        let meta = read_resume_meta(&dest).expect("old sidecar must still load");
+        assert!(meta.validator.is_none(), "old sidecar has no validator");
+        assert_eq!(meta.url, url);
+        assert_eq!(meta.total, Some(LEN as u64));
+
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("old sidecar resume");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn last_modified_is_used_when_no_etag_is_offered() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        const DATE: &str = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), None, Some(DATE));
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02h_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("lastmod.bin");
+
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: None,
+                modified: Some(DATE.into()),
+            }),
+        );
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("last-modified resume");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let seen = v.requests();
+        assert!(
+            seen.iter()
+                .any(|(_, ir)| ir.as_deref() == Some(DATE)),
+            "the resume must send If-Range with the date, saw: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validator_reads_only_strong_etags() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::ETAG,
+            reqwest::header::HeaderValue::from_static("W/\"weak\""),
+        );
+        // A weak ETag proves nothing about the bytes: it is not stored.
+        assert!(Validator::read(&h).is_none());
+        h.insert(
+            reqwest::header::ETAG,
+            reqwest::header::HeaderValue::from_static("\"strong\""),
+        );
+        let v = Validator::read(&h).expect("strong etag");
+        assert_eq!(v.etag.as_deref(), Some("\"strong\""));
+        assert_eq!(v.condition(), Some("\"strong\""));
+        assert!(v.same(&v.clone()));
+
+        let mut other = reqwest::header::HeaderMap::new();
+        other.insert(
+            reqwest::header::ETAG,
+            reqwest::header::HeaderValue::from_static("\"other\""),
+        );
+        let o = Validator::read(&other).expect("other etag");
+        assert!(!v.same(&o), "different etags are different versions");
+    }
+
+    #[test]
+    fn content_range_is_parsed_strictly() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            reqwest::header::HeaderValue::from_static("bytes 100-199/1000"),
+        );
+        assert_eq!(content_range(&h), Some((100, 199, Some(1000))));
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            reqwest::header::HeaderValue::from_static("bytes 0-99/*"),
+        );
+        assert_eq!(content_range(&h), Some((0, 99, None)));
+        for bad in ["bytes abc-def/10", "items 1-2/3", "bytes 1-2", "nonsense"] {
+            h.insert(
+                reqwest::header::CONTENT_RANGE,
+                reqwest::header::HeaderValue::from_str(bad).unwrap(),
+            );
+            assert_eq!(content_range(&h), None, "must refuse {bad}");
+        }
     }
 
     #[test]
@@ -7148,6 +10684,11 @@ mod tests {
         assert_eq!(dash_expand("seg-$Number$.m4s", 7, "v1", 8000), "seg-7.m4s");
         assert_eq!(dash_expand("seg-$Number%05d$.m4s", 7, "v1", 8000), "seg-00007.m4s");
         assert_eq!(dash_expand("$RepresentationID$/$Bandwidth$/s.m4s", 1, "vid", 8000), "vid/8000/s.m4s");
+        // $Time$ timelines and escaped query strings.
+        assert_eq!(dash_expand_at("v/$Time$.m4s", 3, "v1", 8000, Some(540000)), "v/540000.m4s");
+        assert_eq!(dash_expand_at("v/$Time%010d$.m4s", 3, "v1", 8000, Some(42)), "v/0000000042.m4s");
+        assert_eq!(timeline_origin(r#"<SegmentTimeline><S t="1000" d="180" r="9"/></SegmentTimeline>"#), Some((1000, 180)));
+        assert_eq!(xml_attr(r#"<SegmentTemplate media="s-$Number$.m4s?a=1&amp;b=2">"#, "media").as_deref(), Some("s-$Number$.m4s?a=1&b=2"));
         // MPD structure parse.
         let mpd = r#"<?xml version="1.0"?><MPD mediaPresentationDuration="PT60S" type="static"><Period><AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="30" duration="180" startNumber="1" media="v-$Number$.m4s" initialization="v-init.mp4"/><Representation id="v1" bandwidth="5000000" width="1920" height="1080" codecs="avc1.640028"></Representation></AdaptationSet><AdaptationSet mimeType="audio/mp4"><SegmentTemplate timescale="44" duration="100" media="a-$Number$.m4s" initialization="a-init.mp4"/><Representation id="a1" bandwidth="128000" codecs="mp4a.40.2"></Representation></AdaptationSet></Period></MPD>"#;
         let (vv, aa) = parse_mpd(mpd).expect("mpd");
@@ -7194,6 +10735,58 @@ mod tests {
     }
 
     #[test]
+    fn helper_versions_compare_as_release_numbers() {
+        assert!(version_older("2026.08.19", "2026.10.07"));
+        assert!(version_older("2026.08.19", "2026.08.19.1"));
+        assert!(!version_older("2026.10.07", "2026.08.19"));
+        assert!(!version_older("2026.08.19", "2026.08.19"));
+        assert!(version_older("6.0", "b6.1.1"));
+        assert!(!version_older("9.0.2-full_build-www.gyan.dev", "b6.1.1"));
+        assert!(!version_older("unknown", "2026.10.07"));
+        assert!(!version_older("2026.08.19", "nightly"));
+    }
+
+    #[test]
+    fn opaque_manifests_are_recognized_by_content() {
+        assert_eq!(manifest_kind_of(b"\xef\xbb\xbf#EXTM3U\n#EXTINF:4,\ns.ts"), Some(ManifestKind::Hls));
+        assert_eq!(manifest_kind_of(b"<?xml version=\"1.0\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">"), Some(ManifestKind::Dash));
+        assert_eq!(manifest_kind_of(b"<!doctype html><title>x</title>"), None);
+        assert_eq!(manifest_kind_of(b"\x00\x00\x00\x20ftypisom"), None);
+        assert!(opaque_manifest_type(None));
+        assert!(opaque_manifest_type(Some("text/plain; charset=utf-8")));
+        assert!(opaque_manifest_type(Some("application/octet-stream")));
+        assert!(!opaque_manifest_type(Some("video/mp4")));
+        assert!(!opaque_manifest_type(Some("text/html")));
+    }
+
+    #[test]
+    fn captured_headers_stay_on_their_site() {
+        assert_eq!(site_of_url("https://a.b.example.com/x").as_deref(), Some("example.com"));
+        assert_eq!(site_of_url("https://cdn.example.co.uk/x").as_deref(), Some("example.co.uk"));
+        assert_eq!(site_of_url("http://127.0.0.1:8080/x").as_deref(), Some("127.0.0.1"));
+        // Shared hosting: one customer's subdomain is not another's site.
+        assert_eq!(site_of_url("https://d111.cloudfront.net/a").as_deref(), Some("d111.cloudfront.net"));
+        assert_ne!(site_of_url("https://d111.cloudfront.net/a"), site_of_url("https://d222.cloudfront.net/a"));
+        let map = std::collections::BTreeMap::from([
+            ("Authorization".to_string(), "Bearer t".to_string()),
+            ("x-token".to_string(), "1".to_string()),
+            ("range".to_string(), "bytes=0-".to_string()),
+        ]);
+        let opts = EngineOpts {
+            captured_headers: CapturedHeaders::for_url("https://media.example.com/m/master", &map),
+            ..EngineOpts::default()
+        };
+        let client = opts.build_client().unwrap();
+        let same = opts.get(&client, "https://seg.example.com/s0.ts").build().unwrap();
+        assert_eq!(same.headers().get("authorization").unwrap(), "Bearer t");
+        assert_eq!(same.headers().get("x-token").unwrap(), "1");
+        assert!(same.headers().get("range").is_none());
+        let other = opts.get(&client, "https://ads.other.net/s0.ts").build().unwrap();
+        assert!(other.headers().get("authorization").is_none());
+        assert!(!CapturedHeaders::for_url("https://h.example/x", &std::collections::BTreeMap::new()).applies_to("https://h.example/x"));
+    }
+
+    #[test]
     fn hls_helpers() {
         // playlists recognised, mpd rejected from generic resolve
         assert!(is_playlist_url("https://cdn.example/v/playlist.m3u8?x=1"));
@@ -7231,10 +10824,12 @@ mod tests {
         let iv = 7u128.to_be_bytes();
         let plain: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
         let enc = aes_cbc_encrypt_test(&plain, &key, &iv);
-        assert_eq!(enc.len(), plain.len());
-        assert_ne!(enc, plain);
+        assert_eq!(enc.len(), plain.len() + 16, "aligned input gets a full padding block");
+        assert_ne!(&enc[..plain.len()], &plain[..]);
         let dec = aes128_cbc_decrypt(&enc, &key, &iv).expect("decrypt");
-        assert_eq!(dec, plain);
+        assert_eq!(dec, plain, "PKCS7 padding is removed");
+        let short: Vec<u8> = (0..250).map(|i| i as u8).collect();
+        assert_eq!(aes128_cbc_decrypt(&aes_cbc_encrypt_test(&short, &key, &iv), &key, &iv).unwrap(), short);
         assert!(aes128_cbc_decrypt(&enc[..enc.len() - 1], &key, &iv).is_err());
         assert!(aes128_cbc_decrypt(&enc, &[0u8; 16], &iv).is_ok()); // wrong key still yields blocks
     }
@@ -7275,8 +10870,13 @@ mod tests {
     /// endpoint, and a flaky endpoint that fails its first requests.
     /// Exercises the real engine over real sockets — no external network.
     /// Extra: HLS playlists/segments (plain + AES-128) and DASH manifests.
+    /// Encrypts like real HLS packagers: PKCS7-padded (a full block when the
+    /// input is already aligned), as RFC 8216 requires.
     fn aes_cbc_encrypt_test(plain: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
-        crate::aes128::cbc_encrypt(key, iv, plain)
+        let pad = 16 - plain.len() % 16;
+        let mut padded = plain.to_vec();
+        padded.extend(std::iter::repeat_n(pad as u8, pad));
+        crate::aes128::cbc_encrypt(key, iv, &padded)
     }
 
     async fn serve_conn(
@@ -7332,6 +10932,11 @@ mod tests {
                 "application/vnd.apple.mpegurl",
                 "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlo.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhi.m3u8\n".to_string(),
             )),
+            // Opaque manifest: extensionless URL, generic type (deep detection).
+            "/hls/opaque" => Some((
+                "text/plain",
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlo.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhi.m3u8\n".to_string(),
+            )),
             "/hls/lo.m3u8" | "/hls/hi.m3u8" => Some((
                 "application/vnd.apple.mpegurl",
                 "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:6.0,\ns0.ts\n#EXTINF:6.0,\ns1.ts\n#EXTINF:6.0,\ns2.ts\n#EXT-X-ENDLIST\n".to_string(),
@@ -7374,6 +10979,72 @@ mod tests {
             let _ = s.write_all(resp.as_bytes()).await;
             if !is_head {
                 let _ = s.write_all(t.as_bytes()).await;
+            }
+            let _ = s.flush().await;
+            return;
+        }
+        // Cloudflare browser-check fixtures (P1): the "Just a moment..."
+        // interstitial must fail the download, never be saved as the file.
+        // The route ignores the query string (the captured CHIRP link is
+        // `/download?stream=next`).
+        let route = path.split('?').next().unwrap_or("").to_string();
+        const CF_PAGE: &str = "<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><div id=\"cf-chl-widget\"><h1>Just a moment...</h1><p>Enable JavaScript and cookies to continue</p></div><script src=\"/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js\"></script></body></html>";
+        if route == "/cf-challenge" || route == "/cf-redirect" || route == "/cf-html" {
+            if route == "/cf-redirect" {
+                let r = "HTTP/1.1 302 Found\r\nLocation: /cf-challenge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.flush().await;
+                return;
+            }
+            let (status, extra) = if route == "/cf-html" {
+                // Same interstitial, but served with 200 and without the
+                // `Cf-Mitigated` header: only the body identifies it.
+                ("HTTP/1.1 200 OK", String::new())
+            } else {
+                (
+                    "HTTP/1.1 403 Forbidden",
+                    "Cf-Mitigated: challenge\r\nServer: cloudflare\r\n".to_string(),
+                )
+            };
+            let resp = format!(
+                "{status}\r\nContent-Type: text/html; charset=UTF-8\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                CF_PAGE.len()
+            );
+            let _ = s.write_all(resp.as_bytes()).await;
+            if !is_head {
+                let _ = s.write_all(CF_PAGE.as_bytes()).await;
+            }
+            let _ = s.flush().await;
+            return;
+        }
+        // Extensionless redirect target (the CHIRP shape): the file lives at
+        // `/chirp_next/next-20261023` - no extension, no Content-Disposition.
+        if route == "/extless" {
+            let r = "HTTP/1.1 302 Found\r\nLocation: /chirp_next/next-20261023\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = s.write_all(r.as_bytes()).await;
+            let _ = s.flush().await;
+            return;
+        }
+        if route == "/chirp_next/next-20261023" {
+            let len = body.len() as u64;
+            let (start, end) = range.unwrap_or((0, len.saturating_sub(1)));
+            let end = end.min(len.saturating_sub(1));
+            let window = &body[start as usize..=end as usize];
+            let (status, extra) = if range.is_some() && start < len {
+                (
+                    "HTTP/1.1 206 Partial Content",
+                    format!("Accept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{len}\r\n"),
+                )
+            } else {
+                ("HTTP/1.1 200 OK", "Accept-Ranges: bytes\r\n".to_string())
+            };
+            let resp = format!(
+                "{status}\r\nContent-Type: application/x-msdownload\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                window.len()
+            );
+            let _ = s.write_all(resp.as_bytes()).await;
+            if !is_head {
+                let _ = s.write_all(window).await;
             }
             let _ = s.flush().await;
             return;
@@ -8119,9 +11790,12 @@ mod tests {
         assert!(is_youtube_page("https://youtu.be/x"));
         assert!(!is_youtube_page("https://vimeo.com/1"));
 
+        // These assembly fixtures contain deterministic random bytes, not
+        // playable media. Exercise the transfer/assembly layer directly;
+        // completed-media validation has separate real-file regressions.
         // 7. HLS plain VOD: master → best variant → parallel segments → exact.
         let dest = dir.join("hls.bin");
-        download(
+        download_inner(
             format!("{base}/hls/pl.m3u8"),
             dest.clone(),
             6,
@@ -8132,9 +11806,23 @@ mod tests {
         .expect("hls vod");
         assert_eq!(std::fs::read(&dest).unwrap(), want);
 
+        // 7b. Opaque HLS: text/plain at an extensionless URL is sniffed and
+        // assembled as a stream, never saved as playlist text.
+        let dest = dir.join("hlsopaque.bin");
+        download_inner(
+            format!("{base}/hls/opaque"),
+            dest.clone(),
+            6,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("opaque hls");
+        assert_eq!(std::fs::read(&dest).unwrap(), want);
+
         // 8. HLS AES-128: key fetch + per-segment decrypt → exact.
         let dest = dir.join("hlsaes.bin");
-        download(
+        download_inner(
             format!("{base}/hls-enc/pl.m3u8"),
             dest.clone(),
             6,
@@ -8147,7 +11835,7 @@ mod tests {
 
         // 8b. HLS key rotation (P3): s0/s1 under k1, s2 under k2+IV.
         let dest = dir.join("hlsrot.bin");
-        download(
+        download_inner(
             format!("{base}/hls-rot/pl.m3u8"),
             dest.clone(),
             6,
@@ -8160,7 +11848,7 @@ mod tests {
 
         // 8c. HLS EXT-X-MAP (P3): init section leads the assembled file.
         let dest = dir.join("hlsmap.bin");
-        download(
+        download_inner(
             format!("{base}/hls-map/pl.m3u8"),
             dest.clone(),
             6,
@@ -8176,7 +11864,7 @@ mod tests {
 
         // 9. DASH video-only manifest → assembled track delivered.
         let dest = dir.join("dashv.bin");
-        download(
+        download_inner(
             format!("{base}/dash/vonly.mpd"),
             dest.clone(),
             4,
@@ -8190,7 +11878,7 @@ mod tests {
         // 9b. DASH SegmentTemplate (init + 3 media segments): parallel
         // fetch with strictly ordered assembly (init must lead).
         let dest = dir.join("dashtpl.bin");
-        download(
+        download_inner(
             format!("{base}/dash/tpl.mpd"),
             dest.clone(),
             6,
@@ -8206,7 +11894,7 @@ mod tests {
         // 9c. DASH SegmentTimeline (`r="2"` → 3 segments, no MPD duration):
         // count comes from the timeline, assembly identical to 9b.
         let dest = dir.join("dashtl.bin");
-        download(
+        download_inner(
             format!("{base}/dash/tl.mpd"),
             dest.clone(),
             6,
@@ -8249,5 +11937,492 @@ mod tests {
 
         srv.abort();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Live HLS: the recorder follows a playlist that grows, appends each new
+    /// segment exactly once, stops at ENDLIST, and lands the bytes as `.ts`
+    /// (the name the container really is).
+    #[tokio::test]
+    async fn live_hls_records_until_endlist() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind live fixture");
+        let addr = listener.local_addr().expect("live fixture addr");
+        let c = calls.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let c = c.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 2048];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .trim_start_matches('/')
+                        .to_string();
+                    let (body, ctype) = if path.starts_with("live.m3u8") {
+                        let call = c.fetch_add(1, Ordering::SeqCst);
+                        let pl = if call == 0 {
+                            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\ns0.ts\n#EXTINF:2.0,\ns1.ts\n"
+                        } else {
+                            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:2.0,\ns2.ts\n#EXTINF:2.0,\ns3.ts\n#EXT-X-ENDLIST\n"
+                        };
+                        (pl.as_bytes().to_vec(), "application/vnd.apple.mpegurl")
+                    } else {
+                        (
+                            format!("SEG:{path};").into_bytes(),
+                            "video/mp2t",
+                        )
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(head.as_bytes()).await;
+                    let _ = s.write_all(&body).await;
+                    let _ = s.flush().await;
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("dc_live_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("stream.mp4");
+        let shared = Arc::new(SharedState::new());
+        let opts = EngineOpts {
+            timeout_secs: 5,
+            max_retries: 2,
+            ..Default::default()
+        };
+        download_hls(
+            &format!("http://{addr}/live.m3u8"),
+            &dest,
+            1,
+            &opts,
+            &shared,
+        )
+        .await
+        .expect("live capture finishes on ENDLIST");
+
+        assert!(shared.live.load(Ordering::SeqCst), "row must know it is live");
+        // MPEG-TS bytes keep an honest extension, and the row follows it.
+        let ts = dest.with_extension("ts");
+        assert!(ts.is_file(), "expected {}", ts.display());
+        assert!(!dest.exists(), "the .mp4 name must not lie");
+        let got = String::from_utf8_lossy(&std::fs::read(&ts).unwrap()).to_string();
+        assert_eq!(got, "SEG:s0.ts;SEG:s1.ts;SEG:s2.ts;SEG:s3.ts;");
+        assert_eq!(
+            mutex_guard(&shared.resolved_name).as_deref(),
+            Some("stream.ts")
+        );
+        assert!(shared.has_total.load(Ordering::SeqCst));
+        assert_eq!(
+            shared.total.load(Ordering::SeqCst),
+            std::fs::metadata(&ts).unwrap().len()
+        );
+
+        srv.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Live playlists refresh with the target duration, so the wait must be
+    /// parsed from the tag and stay in a sane range.
+    #[test]
+    fn live_helpers() {
+        assert_eq!(hls_target_duration("#EXT-X-TARGETDURATION:9\n"), 9);
+        assert_eq!(hls_target_duration("#EXT-X-TARGETDURATION:2.0\n"), 2);
+        assert_eq!(hls_target_duration("#EXTM3U\n"), 6);
+        assert_eq!(host_of("https://www.Example.com:8443/a.m3u8"), "example.com");
+        assert_eq!(host_of("not a url"), "");
+    }
+
+    /// A Cloudflare browser check must fail the download with an actionable
+    /// message and leave NO file behind - the "Just a moment..." page is not
+    /// the file. An extensionless redirect target (no disposition, no
+    /// extension) must be named after the URL the redirect landed on.
+    #[tokio::test]
+    async fn cloudflare_challenge_fails_and_extensionless_target_is_named() {
+        use std::sync::atomic::AtomicUsize;
+        const LEN: usize = 64 * 1024;
+        let body: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let body = std::sync::Arc::new(body);
+        let flaky_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let fb_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cf fixture");
+        let addr = listener.local_addr().expect("cf fixture addr");
+        let srv = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((s, _)) => {
+                        let b = body.clone();
+                        let f = flaky_hits.clone();
+                        let h = fb_hits.clone();
+                        tokio::spawn(async move { serve_conn(s, b, f, h).await });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let base = format!("http://{addr}");
+        let dir = std::env::temp_dir().join(format!("dc_cf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. The header-marked challenge (403 + `Cf-Mitigated: challenge`).
+        let dest = dir.join("chirp.bin");
+        let err = download(
+            format!("{base}/cf-challenge"),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect_err("a browser check must fail the download");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("browser check"),
+            "the refusal must name the browser check, got: {msg}"
+        );
+        assert!(
+            msg.contains("browser") && msg.contains("extension"),
+            "the refusal must say what to do, got: {msg}"
+        );
+        assert!(!dest.exists(), "no file may be written for a challenge");
+        assert!(
+            !dest.with_extension("dcpart").exists(),
+            "no partial file may be written for a challenge"
+        );
+
+        // 2. The same challenge behind a redirect (the captured CHIRP shape:
+        //    /download?stream=next -> /chirp_next/next-20261023).
+        let dest = dir.join("chirp2.bin");
+        let err = download(
+            format!("{base}/cf-redirect?stream=next"),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect_err("a challenged redirect must fail the download");
+        assert!(
+            format!("{err:#}").contains("browser check"),
+            "the refusal must name the browser check, got: {err:#}"
+        );
+        assert!(!dest.exists(), "no file may be written for a challenge");
+
+        // 3. The interstitial served with 200 and without the header: only
+        //    the body identifies it.
+        let dest = dir.join("chirp3.bin");
+        let err = download(
+            format!("{base}/cf-html"),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect_err("an interstitial page must fail the download");
+        assert!(
+            format!("{err:#}").contains("browser check"),
+            "the refusal must name the browser check, got: {err:#}"
+        );
+        assert!(!dest.exists(), "no file may be written for a challenge");
+
+        // 4. An extensionless redirect target with no disposition is named
+        //    after the URL the redirect landed on - never after the captured
+        //    one, which names nothing at all.
+        let dest = dir.join("download_1700000000.bin");
+        let shared = Arc::new(SharedState::new());
+        download(
+            format!("{base}/extless"),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            shared.clone(),
+        )
+        .await
+        .expect("extensionless target");
+        let named = dir.join("next-20261023");
+        assert!(
+            named.is_file(),
+            "the final URL's segment must name the file, got: {:?}",
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert!(!dest.exists(), "the fallback name must not be used");
+        assert_eq!(std::fs::read(&named).unwrap().len(), LEN);
+        assert_eq!(
+            mutex_guard(&shared.resolved_name).as_deref(),
+            Some("next-20261023")
+        );
+
+        srv.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The interstitial markers and the refusal rules themselves: an HTML
+    /// response never gets an invented extension, and only a row that wants
+    /// a file refuses a web page.
+    #[test]
+    fn cloudflare_markers_and_naming_rules() {
+        // The header is the reliable signal.
+        let mut h = reqwest::header::HeaderMap::new();
+        assert!(!cloudflare_challenge_header(&h));
+        h.insert(
+            "cf-mitigated",
+            reqwest::header::HeaderValue::from_static("challenge"),
+        );
+        assert!(cloudflare_challenge_header(&h));
+
+        // The body markers of Cloudflare's own templates.
+        for page in [
+            "<html><head><title>Just a moment...</title></head><body>Enable JavaScript and cookies to continue</body></html>",
+            "<h1>Checking your browser before accessing</h1>",
+            "<div id=\"cf-chl-widget\"></div>",
+            "<script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/jsd/v1\"></script>",
+            "<title>Attention Required! | Cloudflare</title>",
+        ] {
+            assert!(
+                cloudflare_challenge_body(page),
+                "must recognize the interstitial: {page}"
+            );
+        }
+        // A normal page is not a challenge.
+        for page in [
+            "<html><body>Hello</body></html>",
+            "MZ binary payload",
+            "<html><head><title>Archive</title></head><body>CHIRP builds</body></html>",
+            // A page that merely mentions the words must not be mistaken for
+            // the interstitial (a video titled "Just a moment", say).
+            "<html><body><h1>Just a moment</h1><p>a talk about pausing</p></body></html>",
+        ] {
+            assert!(
+                !cloudflare_challenge_body(page),
+                "must not mistake a normal body for a challenge: {page}"
+            );
+        }
+
+        // A row that wants a file refuses a web page; a row that wants an
+        // HTML page keeps it.
+        assert!(expects_binary_file(std::path::Path::new("download_1.bin")));
+        assert!(expects_binary_file(std::path::Path::new("next-20261023")));
+        assert!(expects_binary_file(std::path::Path::new("movie.mp4")));
+        assert!(!expects_binary_file(std::path::Path::new("page.html")));
+        assert!(!expects_binary_file(std::path::Path::new("page.htm")));
+
+        // The derived name comes from the final URL, never from an HTML type.
+        assert_eq!(
+            derived_file_name("https://archive.chirpmyradio.com/chirp_next/next-20261023", None),
+            Some("next-20261023".to_string())
+        );
+        assert_eq!(
+            derived_file_name(
+                "https://archive.chirpmyradio.com/chirp_next/next-20261023",
+                Some("application/zip")
+            ),
+            Some("next-20261023.zip".to_string())
+        );
+        assert_eq!(
+            derived_file_name(
+                "https://archive.chirpmyradio.com/chirp_next/next-20261023",
+                Some("text/html")
+            ),
+            Some("next-20261023".to_string()),
+            "an HTML response never gets an invented extension"
+        );
+        // A URL with nothing usable keeps the clearly-fallback name.
+        assert_eq!(
+            derived_file_name("https://archive.chirpmyradio.com/download?stream=next", None),
+            None
+        );
+        assert_eq!(derived_file_name("https://archive.chirpmyradio.com/", None), None);
+    }
+
+    /// Queue v2: "connections per server" is one process-wide allowance per
+    /// host, so a burst of jobs aimed at the same server can never hold more
+    /// sockets than the user allows — and another host is never blocked by it.
+    #[tokio::test]
+    async fn per_host_cap_limits_concurrency() {
+        // 0 is the default and means "no extra cap": no permit at all.
+        assert!(host_slot("https://capoff.test/a", 0).await.is_none());
+
+        let held = host_slot("https://capone.test/a", 1)
+            .await
+            .expect("first connection takes the only slot");
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(120),
+            host_slot("https://capone.test/b", 1),
+        )
+        .await;
+        assert!(blocked.is_err(), "a second connection must wait its turn");
+
+        // Finishing the first hands the slot to the waiting one.
+        drop(held);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            host_slot("https://capone.test/c", 1),
+        )
+        .await
+        .expect("the freed slot lets the next connection in")
+        .expect("permit");
+        drop(next);
+
+        // A cap on one host never throttles a different host.
+        let a = host_slot("https://host-a.test/x", 1).await.expect("h1");
+        let b = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            host_slot("https://host-b.test/x", 1),
+        )
+        .await
+        .expect("another host is not blocked")
+        .expect("h2 permit");
+        drop((a, b));
+    }
+}
+
+#[cfg(test)]
+mod platform_helper_tests {
+    use super::*;
+    #[test]
+    fn supported_runtime_versions_are_not_just_executable_names(){
+        assert!(runtime_version_supported("node","v22.0.0"));
+        assert!(!runtime_version_supported("node","v18.20.0"));
+        assert!(runtime_version_supported("deno","deno 2.3.0"));
+        assert!(!runtime_version_supported("deno","deno 2.2.9"));
+        assert!(!runtime_version_supported("node","unrecognized"));
+    }
+    #[test]
+    fn helper_status_and_download_selection_use_the_same_precedence(){
+        let system=Some(PathBuf::from("system"));let local=Some(PathBuf::from("managed"));let custom=Some(PathBuf::from("custom"));
+        assert_eq!(select_ytdlp(YtdlpSource::Managed,system.clone(),None,None),(None,false));
+        assert_eq!(select_ytdlp(YtdlpSource::Managed,system.clone(),None,local.clone()),(local.clone(),true));
+        assert_eq!(select_ytdlp(YtdlpSource::Custom,system.clone(),custom.clone(),local.clone()),(custom,false));
+        assert_eq!(select_ytdlp(YtdlpSource::Custom,system.clone(),None,local.clone()),(local.clone(),true));
+        assert_eq!(select_ytdlp(YtdlpSource::Path,system.clone(),None,local.clone()),(system,false));
+        assert_eq!(select_ytdlp(YtdlpSource::Path,None,None,local.clone()),(local,true));
+    }
+}
+
+#[cfg(test)]
+mod audit_cookie_tests {
+    use super::*;
+    #[tokio::test]
+    async fn audit_concurrent_cookie_jars_are_independent_and_private() {
+        let a=write_cookie_jar("session=secret", ".example.com").await.unwrap().unwrap();
+        let b=write_cookie_jar("session=secret", ".example.com").await.unwrap().unwrap();
+        assert_ne!(a.0,b.0,"same-site jobs must not share a credential file");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a.0).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        drop(a);
+        assert!(b.0.is_file(),"finishing one job must not remove another job's cookies");
+        let path=b.0.clone();
+        drop(b);
+        assert!(!path.exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod audit_helper_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    static NEXT: AtomicU64=AtomicU64::new(0);
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let p=std::env::temp_dir().join(format!("dc-helper-test-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+            std::fs::create_dir_all(&p).unwrap();Self(p)
+        }
+        fn script(&self,body:&str) -> PathBuf {
+            let p=self.0.join("helper.py");
+            std::fs::write(&p,format!("#!/usr/bin/env python3\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p,std::fs::Permissions::from_mode(0o700)).unwrap();p
+        }
+    }
+    impl Drop for Temp { fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);} }
+    #[tokio::test]
+    async fn helper_progress_stays_visible_despite_print_quiet_mode() {
+        // `--print` makes yt-dlp quiet; without `--progress` the window showed
+        // 0 B until the end. The fake refuses to run without the flag.
+        let temp=Temp::new();let dest=temp.0.join("clip.mp4");
+        let exe=temp.script("import sys,pathlib,json\nif '--progress' not in sys.argv: sys.exit(3)\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_suffix('.mp4')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
+        download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(),b"video bytes");
+    }
+    #[tokio::test]
+    async fn exact_reported_output_is_used_and_neighboring_files_are_untouched() {
+        let temp=Temp::new();let dest=temp.0.join("clip.mp4");
+        let neighbor=temp.0.join("clip-notes.txt");std::fs::write(&neighbor,b"keep me").unwrap();
+        let exe=temp.script("import sys,pathlib,json\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_suffix('.mkv')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
+        download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(),b"video bytes");
+        assert_eq!(std::fs::read(&neighbor).unwrap(),b"keep me");
+        std::fs::remove_file(&dest).unwrap();
+        let exe=temp.script("import sys,pathlib,json\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_name('clip-notes.txt')\nprint('dcfile@'+json.dumps(str(p)))");
+        assert!(download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.is_err());
+        assert!(!dest.exists());assert_eq!(std::fs::read(&neighbor).unwrap(),b"keep me");
+    }
+    #[tokio::test]
+    async fn aborting_a_download_kills_the_child_and_removes_private_cookies() {
+        let temp=Temp::new();let pidfile=temp.0.join("pid");let jarfile=temp.0.join("jar-path");
+        let exe=temp.script(&format!("import sys,pathlib,os,time\npathlib.Path({:?}).write_text(str(os.getpid()))\npathlib.Path({:?}).write_text(sys.argv[sys.argv.index('--cookies')+1])\ntime.sleep(60)",pidfile.to_str().unwrap(),jarfile.to_str().unwrap()));
+        let childfile=temp.0.join("child-pid");
+        let body=std::fs::read_to_string(&exe).unwrap().replace("time.sleep(60)",
+            &format!("import subprocess\nchild=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\npathlib.Path({:?}).write_text(str(child.pid))\ntime.sleep(60)",childfile.to_str().unwrap()));
+        std::fs::write(&exe,body).unwrap();
+        let dest=temp.0.join("video.mp4");
+        let shared=Arc::new(SharedState::new());let state=shared.clone();
+        let task=tokio::spawn(async move {
+            let opts=EngineOpts{cookie:"session=secret".into(),..EngineOpts::default()};
+            download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&opts,&state).await
+        });
+        for _ in 0..200 {
+            if childfile.is_file() {break;}
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(childfile.is_file(),"mock helper and merger must launch");
+        assert!(shared.external_helper.load(Ordering::SeqCst));
+        let childpid=std::fs::read_to_string(&childfile).unwrap();
+        let pid=std::fs::read_to_string(&pidfile).unwrap();
+        let jar=PathBuf::from(std::fs::read_to_string(&jarfile).unwrap());assert!(jar.is_file());
+        task.abort();let _=task.await;
+        assert!(!jar.exists(),"abort must remove credentials");
+        let mut gone=false;
+        for _ in 0..100 {
+            let status=std::process::Command::new("kill").args(["-0",pid.trim()]).stderr(std::process::Stdio::null()).status().unwrap();
+            if !status.success() {gone=true;break;}
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gone,"aborted helper must not keep downloading");
+        let mut child_stopped=false;
+        for _ in 0..100 {
+            let out=std::process::Command::new("ps").args(["-o","stat=","-p",childpid.trim()]).output().unwrap();
+            let state=String::from_utf8_lossy(&out.stdout);
+            if state.trim().is_empty() || state.trim().starts_with('Z') {child_stopped=true;break;}
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(child_stopped,"an aborted helper's merger must stop too");
+    }
+    #[test]
+    fn browser_platform_hint_matches_the_configured_user_agent() {
+        for (ua,want) in [("Mozilla Macintosh Chrome/126.0","macOS"),("Mozilla X11 Linux Chrome/126.0","Linux"),("Mozilla Windows Chrome/126.0","Windows")] {
+            let opts=EngineOpts{user_agent:ua.into(),..EngineOpts::default()};
+            let req=opts.get(&reqwest::Client::new(),"https://example.com").build().unwrap();
+            assert_eq!(req.headers().get("sec-ch-ua-platform").unwrap(),&format!("\"{want}\""));
+        }
     }
 }

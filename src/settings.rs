@@ -62,6 +62,24 @@ struct Settings {
     ytdlp_source: String,
     /// The executable picked for "custom"; empty until one is chosen.
     ytdlp_custom_path: String,
+    /// ffmpeg: "managed" (fetched on demand), "path", or "custom".
+    ffmpeg_source: String,
+    /// The ffmpeg executable picked for "custom"; empty until chosen.
+    ffmpeg_custom_path: String,
+    /// Max simultaneous connections per host across all downloads (0 = off).
+    per_host_conns: usize,
+    // Archives
+    /// Unpack a finished download when it is an archive (ZIP / RAR / 7z).
+    auto_extract: bool,
+    /// Keep the archive after a successful extraction.
+    extract_keep_original: bool,
+    /// Where the files go: "same" (next to the archive), "subfolder" (a
+    /// folder named after the archive) or "custom".
+    extract_target: String,
+    /// The folder used when `extract_target` is "custom".
+    extract_custom_dir: String,
+    /// Ask before extracting instead of doing it silently.
+    extract_ask: bool,
     // Updates
     update_check_on: bool,
 }
@@ -70,11 +88,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "dark".to_string(),
-            close_to_tray: true,
+            close_to_tray: cfg!(windows),
             show_complete: true,
             save_dir: dirs::download_dir()
                 .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "C:\\Downloads".to_string()),
+                .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned()),
             category_folders: true,
             connections_default: 8,
             speed_limit_kbps: 0,
@@ -95,7 +113,15 @@ impl Default for Settings {
             ytdlp_prefer_path: false,
             ytdlp_source: "managed".to_string(),
             ytdlp_custom_path: String::new(),
-            update_check_on: false,
+            ffmpeg_source: "managed".to_string(),
+            ffmpeg_custom_path: String::new(),
+            per_host_conns: 0,
+            auto_extract: false,
+            extract_keep_original: true,
+            extract_target: "subfolder".to_string(),
+            extract_custom_dir: String::new(),
+            extract_ask: false,
+            update_check_on: true,
         }
     }
 }
@@ -105,11 +131,19 @@ fn ui_path() -> Option<std::path::PathBuf> {
 }
 
 fn load() -> Settings {
-    let mut s = Settings::default();
     let v: serde_json::Value = ui_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null);
+    load_from(&v)
+}
+
+/// Read the settings out of a parsed `ui.json`.
+///
+/// Split out of `load` so an older file can be replayed in a test without
+/// touching the file this machine really uses.
+fn load_from(v: &serde_json::Value) -> Settings {
+    let mut s = Settings::default();
     let g = |k: &str| v.get(k);
     let str_in = |k: &str, dst: &mut String| {
         if let Some(x) = g(k).and_then(|x| x.as_str()) {
@@ -125,8 +159,25 @@ fn load() -> Settings {
     str_in("antivirus_cmd", &mut s.antivirus_cmd);
     str_in("finish_action", &mut s.finish_action);
     str_in("rename_template", &mut s.rename_template);
+    match g("extract_target").and_then(|x| x.as_str()) {
+        Some(v @ ("same" | "subfolder" | "custom")) => s.extract_target = v.to_string(),
+        _ => {}
+    }
+    if let Some(x) = g("extract_custom_dir").and_then(|x| x.as_str()) {
+        s.extract_custom_dir = x.to_string();
+    }
+    if let Some(b) = g("auto_extract").and_then(|x| x.as_bool()) {
+        s.auto_extract = b;
+    }
+    if let Some(b) = g("extract_keep_original").and_then(|x| x.as_bool()) {
+        s.extract_keep_original = b;
+    }
+    if let Some(b) = g("extract_ask").and_then(|x| x.as_bool()) {
+        s.extract_ask = b;
+    }
+    if let Some(p) = g("ffmpeg_custom_path").and_then(|v|v.as_str()) { s.ffmpeg_custom_path=p.to_string(); }
     if let Some(b) = g("close_to_tray").and_then(|x| x.as_bool()) {
-        s.close_to_tray = b;
+        s.close_to_tray = cfg!(windows) && b;
     }
     if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
         s.show_complete = b;
@@ -152,6 +203,24 @@ fn load() -> Settings {
     }
     if let Some(x) = g("ytdlp_custom_path").and_then(|x| x.as_str()) {
         s.ytdlp_custom_path = x.to_string();
+    }
+    match g("ffmpeg_source").and_then(|x| x.as_str()) {
+        Some(v @ ("managed" | "path" | "custom")) => s.ffmpeg_source = v.to_string(),
+        // Same migration as the engine: an older install that already has
+        // ffmpeg on PATH keeps using it rather than fetching a second copy.
+        _ => {
+            s.ffmpeg_source = if crate::engine::ffmpeg_on_path().is_some() {
+                "path".to_string()
+            } else {
+                "managed".to_string()
+            }
+        }
+    }
+    if let Some(x) = g("ffmpeg_custom_path").and_then(|x| x.as_str()) {
+        s.ffmpeg_custom_path = x.to_string();
+    }
+    if let Some(n) = g("per_host_conns").and_then(|x| x.as_u64()) {
+        s.per_host_conns = (n as usize).clamp(0, 64);
     }
     if let Some(n) = g("connections_default").and_then(|x| x.as_u64()) {
         s.connections_default = (n as usize).clamp(1, 16);
@@ -201,6 +270,8 @@ fn load() -> Settings {
 
 /// Read-modify-write: overlay our keys onto whatever is on disk now.
 fn save(s: &Settings) -> bool {
+    let _guard=crate::model::fs_lock("ui-settings");
+    if !_guard.owned() { return false; }
     let Some(path) = ui_path() else { return false };
     let mut v: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
@@ -210,11 +281,25 @@ fn save(s: &Settings) -> bool {
         Some(o) => o,
         None => return false,
     };
+    apply_settings(obj, s);
+    serde_json::to_string_pretty(&v)
+        .ok()
+        .and_then(|j| crate::model::atomic_write(&path, j.as_bytes()).ok())
+        .is_some()
+}
+
+/// Overlay the settings onto the object that will be written to disk.
+///
+/// Split out of `save` so the set of written keys can be checked by a test:
+/// the list below is the whole of what this app writes, and it holds no
+/// credential. A provider token lives in memory only and has no key here.
+fn apply_settings(obj: &mut serde_json::Map<String, serde_json::Value>, s: &Settings) {
     let set = |o: &mut serde_json::Map<String, serde_json::Value>, k: &str, v: serde_json::Value| {
         o.insert(k.to_string(), v);
     };
     set(obj, "theme", s.theme.clone().into());
     set(obj, "close_to_tray", s.close_to_tray.into());
+    set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "show_complete", s.show_complete.into());
     set(obj, "save_dir", s.save_dir.clone().into());
     set(obj, "category_folders", s.category_folders.into());
@@ -231,6 +316,18 @@ fn save(s: &Settings) -> bool {
     set(obj, "ytdlp_prefer_path", s.ytdlp_prefer_path.into());
     set(obj, "ytdlp_source", s.ytdlp_source.clone().into());
     set(obj, "ytdlp_custom_path", s.ytdlp_custom_path.clone().into());
+    set(obj, "ffmpeg_source", s.ffmpeg_source.clone().into());
+    set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
+    set(obj, "per_host_conns", (s.per_host_conns as u64).into());
+    // There is one overlay now, so the style and the side that owned it are
+    // gone. The save merges onto the file that is already on disk, so the
+    // old keys have to be dropped here or they would survive every save.
+    crate::model::drop_obsolete_ui_keys(obj);
+    set(obj, "auto_extract", s.auto_extract.into());
+    set(obj, "extract_keep_original", s.extract_keep_original.into());
+    set(obj, "extract_target", s.extract_target.clone().into());
+    set(obj, "extract_custom_dir", s.extract_custom_dir.clone().into());
+    set(obj, "extract_ask", s.extract_ask.into());
     set(obj, "update_check_on", s.update_check_on.into());
     set(obj, "folder_rules", serde_json::to_value(&s.folder_rules).unwrap_or_default());
     set(
@@ -238,10 +335,6 @@ fn save(s: &Settings) -> bool {
         "speed_windows",
         serde_json::to_value(&s.speed_windows).unwrap_or_default(),
     );
-    serde_json::to_string_pretty(&v)
-        .ok()
-        .and_then(|j| crate::model::atomic_write(&path, j.as_bytes()).ok())
-        .is_some()
 }
 
 struct SettingsApp {
@@ -250,6 +343,8 @@ struct SettingsApp {
     centered: bool,
     notice: String,
     browser_msg: String,
+    /// What the browser said about the extension when the user asked.
+    ext_info: String,
     /// Last theme actually applied, so picking one in Appearance repaints
     /// this window at once (and "system" keeps tracking the OS).
     theme_applied: String,
@@ -259,6 +354,9 @@ struct SettingsApp {
     ytdlp: Option<crate::engine::YtdlpInfo>,
     ytdlp_msg: String,
     ytdlp_busy: bool,
+    /// The app's own JavaScript runtime (Deno) being installed: the answer
+    /// is the installed path or the reason it failed.
+    deno_rx: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
     ytdlp_rx: Option<
         std::sync::mpsc::Receiver<(
             String,
@@ -269,6 +367,11 @@ struct SettingsApp {
     /// ffmpeg is only used to merge separate video+audio streams; its card
     /// says whether there is one, and how new it is.
     ffmpeg: Option<crate::engine::FfmpegInfo>,
+    ffmpeg_msg: String,
+    ffmpeg_busy: bool,
+    /// The tools install (run on the yt-dlp channel) is writing ffmpeg.
+    ffmpeg_installing: bool,
+    ffmpeg_rx: Option<std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)>>,
     /// Which plugin cards are expanded (yt-dlp starts open, like the concept).
     plugins_open: [bool; 2],
     // Open/closed state of the Download-Engine cards. The pane is long, so every
@@ -279,6 +382,18 @@ struct SettingsApp {
     open_network: bool,
     open_complete: bool,
     open_windows: bool,
+    open_archives: bool,
+    /// Appearance cards (the concept opens both by default).
+    open_theme: bool,
+    open_window: bool,
+    /// Browser Integration cards (Chromium family, Firefox) expanded.
+    browser_open: [bool; 2],
+    /// Native host registered per browser, asked when the pane first opens
+    /// (and again after a repair).
+    host_status: Option<Vec<(&'static str, bool)>>,
+    /// Updates page cards expanded.
+    open_updates: bool,
+    open_version: bool,
 }
 
 /// Probe the helper, and optionally re-download it first, off the UI thread.
@@ -292,7 +407,7 @@ fn ytdlp_probe(
         if force {
             msg = match crate::engine::ytdlp_refresh_blocking() {
                 Ok(p) => format!("Fetched the newest build into {}", p.display()),
-                Err(e) => format!("Re-download failed: {e}"),
+                Err(e) => format!("Re-download failed: {e:#}"),
             };
         }
         let info = crate::engine::ytdlp_info();
@@ -302,14 +417,71 @@ fn ytdlp_probe(
     rx
 }
 
+/// Probe ffmpeg, and optionally re-fetch the app's own copy first, off the UI
+/// thread (both run a process; the fetch downloads ~60 MB).
+fn ffmpeg_probe(
+    force: bool,
+) -> std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut msg = String::new();
+        if force {
+            msg = match crate::engine::ffmpeg_refresh_blocking() {
+                Ok(p) => format!("Fetched ffmpeg into {}", p.display()),
+                Err(e) => format!("Re-download failed: {e:#}"),
+            };
+        }
+        let info = crate::engine::ffmpeg_info();
+        let _ = tx.send((msg, info));
+    });
+    rx
+}
+
+/// Status plus a latest-release check (and in-place update of the app's own
+/// copy), off the UI thread.
+fn ytdlp_update_probe(
+) -> std::sync::mpsc::Receiver<(String, crate::engine::YtdlpInfo, crate::engine::FfmpegInfo)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let msg = crate::engine::ytdlp_update_check_blocking();
+        let _ = tx.send((msg, crate::engine::ytdlp_info(), crate::engine::ffmpeg_info()));
+    });
+    rx
+}
+
+fn ffmpeg_update_probe() -> std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let msg = crate::engine::ffmpeg_update_check_blocking();
+        let _ = tx.send((msg, crate::engine::ffmpeg_info()));
+    });
+    rx
+}
+
 /// The native "open file" dialog, for picking a yt-dlp executable.
 fn pick_executable() -> Option<std::path::PathBuf> {
-    let picked = rfd::FileDialog::new()
-        .set_title("Pick a yt-dlp executable")
-        .add_filter("yt-dlp", &["exe"])
-        .add_filter("All files", &["*"])
-        .pick_file();
-    picked.filter(|p| p.is_file())
+    pick_tool("yt-dlp")
+}
+
+fn pick_tool(name:&str) -> Option<std::path::PathBuf> {
+    let dialog=rfd::FileDialog::new().set_title(format!("Pick {name}"));
+    #[cfg(windows)] let dialog=dialog.add_filter("Executable", &["exe"]);
+    dialog.pick_file().filter(|p|crate::platform::executable_file(p))
+}
+fn ffmpeg_install_probe() -> std::sync::mpsc::Receiver<(String,crate::engine::YtdlpInfo,crate::engine::FfmpegInfo)> {
+    let (tx,rx)=std::sync::mpsc::channel();
+    std::thread::spawn(move||{
+        let message=match crate::helpers::install_ffmpeg(){Ok(_)=>"FFmpeg and ffprobe installed and ready.".into(),Err(e)=>format!("FFmpeg install failed: {e:#}")};
+        let _=tx.send((message,crate::engine::ytdlp_info(),crate::engine::ffmpeg_info()));
+    });rx
+}
+
+/// The native "open file" dialog, for picking an ffmpeg executable.
+fn pick_ffmpeg() -> Option<std::path::PathBuf> {
+    let dialog = rfd::FileDialog::new().set_title("Pick an ffmpeg executable");
+    #[cfg(windows)]
+    let dialog = dialog.add_filter("Executable", &["exe"]);
+    dialog.pick_file().filter(|p| crate::platform::executable_file(p))
 }
 
 fn install_one(browser: &str) -> String {
@@ -321,24 +493,46 @@ fn install_one(browser: &str) -> String {
 
 /// Entry point for `--settings`.
 pub fn run() -> eframe::Result<()> {
+    // `--pane <n>` opens a page directly (e.g. 2 = Plugins).
+    let args: Vec<String> = std::env::args().collect();
+    let pane = args
+        .iter()
+        .position(|a| a == "--pane")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|p| *p < PANES.len())
+        .unwrap_or(0);
     let app = SettingsApp {
-        pane: 0,
+        pane,
         s: load(),
         centered: false,
         notice: String::new(),
         browser_msg: String::new(),
+        ext_info: String::new(),
         theme_applied: String::new(),
         ytdlp: None,
         ytdlp_msg: String::new(),
         ytdlp_busy: false,
+        deno_rx: None,
         ytdlp_rx: None,
         ffmpeg: None,
+        ffmpeg_msg: String::new(),
+        ffmpeg_busy: false,
+        ffmpeg_installing: false,
+        ffmpeg_rx: None,
         plugins_open: [true, false],
         open_storage: false,
         open_perf: false,
         open_network: false,
         open_complete: false,
         open_windows: false,
+        open_archives: false,
+        open_theme: true,
+        open_window: true,
+        browser_open: [true, false],
+        host_status: None,
+        open_updates: true,
+        open_version: true,
     };
     // Separate OS window (own process via `--settings`): never embedded in
     // the main GUI. 640 wide is the concept's window width.
@@ -383,13 +577,38 @@ impl eframe::App for SettingsApp {
             crate::tray::set_titlebar_dark(crate::app::theme_is_dark(ctx, &self.s.theme));
             self.theme_applied = resolved;
         }
+        // Come to the front while placing: opened from the main window, the
+        // new process otherwise stayed behind it (as the complete dialog did).
+        if !self.centered {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         if !self.centered && crate::model::center_window(ctx, egui::vec2(640.0, 520.0)) {
             self.centered = true;
         }
-        // The helper's status is asked for when the pane is first opened.
+        // The helpers' status is asked for when the pane is first opened,
+        // together with a check against their latest releases (the app's own
+        // copies are updated in place; the user's copies are only reported).
         if self.pane == PANE_YTDLP && self.ytdlp.is_none() && self.ytdlp_rx.is_none() {
-            self.ytdlp_rx = Some(ytdlp_probe(false));
+            self.ytdlp_rx = Some(ytdlp_update_probe());
             self.ytdlp_busy = true;
+            if self.ffmpeg_rx.is_none() {
+                self.ffmpeg_rx = Some(ffmpeg_update_probe());
+                self.ffmpeg_busy = true;
+            }
+        }
+        if let Some(rx) = &self.deno_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.deno_rx = None;
+                self.ytdlp_msg = match res {
+                    Ok(_) => "JavaScript runtime installed (Deno) — YouTube's player challenges are solved now.".into(),
+                    Err(e) => format!("Could not install the JavaScript runtime: {e}"),
+                };
+                // Re-read the status so the Runtime chip shows it.
+                if self.ytdlp_rx.is_none() {
+                    self.ytdlp_rx = Some(ytdlp_probe(false));
+                    self.ytdlp_busy = true;
+                }
+            }
         }
         if let Some(rx) = &self.ytdlp_rx {
             if let Ok((msg, info, ffmpeg)) = rx.try_recv() {
@@ -400,6 +619,17 @@ impl eframe::App for SettingsApp {
                 self.ffmpeg = Some(ffmpeg);
                 self.ytdlp_rx = None;
                 self.ytdlp_busy = false;
+                self.ffmpeg_installing = false;
+            }
+        }
+        if let Some(rx) = &self.ffmpeg_rx {
+            if let Ok((msg, info)) = rx.try_recv() {
+                if !msg.is_empty() {
+                    self.ffmpeg_msg = msg;
+                }
+                self.ffmpeg = Some(info);
+                self.ffmpeg_rx = None;
+                self.ffmpeg_busy = false;
             }
         }
 
@@ -450,7 +680,9 @@ impl eframe::App for SettingsApp {
                 );
                 foot_ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
                 if button(&mut foot_ui, "Save", false).clicked() {
-                    self.notice = if save(&self.s) {
+                    let saved=save(&self.s);
+                    if saved && self.ytdlp_rx.is_none() {self.ytdlp_rx=Some(ytdlp_probe(false));self.ytdlp_busy=true;}
+                    self.notice = if saved {
                         "Saved ✓ (the main app picks it up live)".to_string()
                     } else {
                         "Could not write settings.".to_string()
@@ -493,8 +725,15 @@ impl eframe::App for SettingsApp {
 
         // The plugin probe runs on a worker thread: keep repainting while it
         // is pending so its answer appears without a mouse move.
-        if self.ytdlp_busy {
+        if self.ytdlp_busy || self.ffmpeg_busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+
+        // Escape closes the window, the way it closes the main window's
+        // dialogs. The settings that were saved stay saved; the ones that
+        // were not saved are not - the Save button is what writes them.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }
@@ -602,6 +841,9 @@ fn hint(ui: &mut Ui, s: &str) {
 }
 
 /// 11 px secondary paragraph.
+///
+/// The extension-setup steps use this: they are instructions, not hints, so
+/// they read a step louder than a muted line of explanation.
 fn para(ui: &mut Ui, s: &str) {
     wrapped(ui, s, reg(11.0), tok().text2);
 }
@@ -650,27 +892,6 @@ fn button(ui: &mut Ui, label: &str, primary: bool) -> Response {
         Stroke::new(1.0, bd),
         StrokeKind::Inside,
     );
-    p.galley(rect.center() - galley.size() / 2.0, galley, fg);
-    resp
-}
-
-/// `--theme-opt` pill: fully rounded, accent-filled when selected.
-fn pill(ui: &mut Ui, label: &str, active: bool) -> Response {
-    let t = tok();
-    let fg = if active { Color32::WHITE } else { t.text2 };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), reg(11.0), fg);
-    let size = Vec2::new(galley.size().x + 28.0, 26.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let (bg, bd) = if active {
-        (t.accent, t.accent)
-    } else {
-        (if resp.hovered() { t.btn_hover } else { t.btn }, t.btn_bd)
-    };
-    let p = ui.painter();
-    p.rect(rect, 13.0, bg, Stroke::new(1.0, bd), StrokeKind::Inside);
     p.galley(rect.center() - galley.size() / 2.0, galley, fg);
     resp
 }
@@ -770,39 +991,6 @@ fn field(ui: &mut Ui, buf: &mut String, width: Option<f32>, hint: &str) -> Respo
     out.inner
 }
 
-/// `.toggle`: 32×18 track, 14 px white thumb; the whole row is clickable.
-fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
-    let t = tok();
-    let w = ui.available_width().max(80.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 18.0), Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let anim = ui.ctx().animate_bool_with_time(resp.id, *on, 0.15);
-    let track = Rect::from_min_size(
-        egui::pos2(rect.left(), rect.center().y - 9.0),
-        Vec2::new(32.0, 18.0),
-    );
-    let p = ui.painter();
-    p.rect_filled(track, 9.0, blend(t.track, t.accent, anim));
-    p.circle_filled(
-        egui::pos2(track.left() + 9.0 + 14.0 * anim, track.center().y),
-        7.0,
-        Color32::WHITE,
-    );
-    p.text(
-        egui::pos2(track.right() + 8.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        reg(12.0),
-        t.text,
-    );
-    if resp.clicked() {
-        *on = !*on;
-        true
-    } else {
-        false
-    }
-}
-
 /// `.checkbox`: 14×14 box (12×12 compact), accent fill + tick when checked.
 /// `full` stretches the click row to the pane width, otherwise it shrinks.
 fn checkbox(
@@ -872,6 +1060,287 @@ fn checkbox(
     } else {
         false
     }
+}
+
+// ---------- Appearance: theme tiles + switch row ----------
+
+/// Which preview a theme tile shows.
+#[derive(Clone, Copy)]
+enum TileKind {
+    System,
+    Dark,
+    Light,
+}
+
+/// Signed side of the directed line `a`→`b` (positive = egui's left half-plane).
+fn line_side(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    dx * (p.y - a.y) - dy * (p.x - a.x)
+}
+
+/// Sutherland–Hodgman clip of the rect `r` to one half-plane of `a`→`b`. The
+/// result is convex, so it goes straight into `Shape::convex_polygon`.
+fn clip_half(r: Rect, a: egui::Pos2, b: egui::Pos2, keep_pos: bool) -> Vec<egui::Pos2> {
+    let s = |p: egui::Pos2| {
+        let v = line_side(p, a, b);
+        if keep_pos {
+            v
+        } else {
+            -v
+        }
+    };
+    let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+    let mut out = Vec::with_capacity(6);
+    for i in 0..4 {
+        let cur = pts[i];
+        let nxt = pts[(i + 1) % 4];
+        let (sc, sn) = (s(cur), s(nxt));
+        if sc >= 0.0 {
+            out.push(cur);
+        }
+        if (sc > 0.0 && sn < 0.0) || (sc < 0.0 && sn > 0.0) {
+            let t = sc / (sc - sn);
+            out.push(egui::pos2(
+                cur.x + (nxt.x - cur.x) * t,
+                cur.y + (nxt.y - cur.y) * t,
+            ));
+        }
+    }
+    out
+}
+
+/// Fill `rect` with `color`, optionally clipped to a half-plane.
+fn face_rect(
+    p: &egui::Painter,
+    rect: Rect,
+    color: Color32,
+    clip: Option<(egui::Pos2, egui::Pos2, bool)>,
+) {
+    match clip {
+        None => {
+            p.rect_filled(rect, 0.0, color);
+        }
+        Some((a, b, kp)) => {
+            let pts = clip_half(rect, a, b, kp);
+            if pts.len() >= 3 {
+                p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+            }
+        }
+    }
+}
+
+/// One mini application window (the mock's `.tp`): head bar with three dots, a
+/// sidebar and four content lines, the last one accent. `clip` carves it to one
+/// half of the System tile's diagonal.
+fn draw_face(
+    p: &egui::Painter,
+    r: Rect,
+    light: bool,
+    clip: Option<(egui::Pos2, egui::Pos2, bool)>,
+) {
+    let c = |hex: u32| Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
+    let (bg, head, hbd, side, sbd, line, dot) = if light {
+        (
+            0xffffff, 0xf8fafc, 0xe2e8f0, 0xeef2f7, 0xe2e8f0, 0xdbe3ec, 0xcbd5e1,
+        )
+    } else {
+        (
+            0x0f172a, 0x0b1220, 0x1b2637, 0x1e293b, 0x0b1220, 0x334155, 0x334155,
+        )
+    };
+    let accent = c(0x3b82f6);
+
+    face_rect(p, r, c(bg), clip);
+    let head_h = (r.height() * 0.17).clamp(7.0, 12.0);
+    face_rect(
+        p,
+        Rect::from_min_max(r.min, egui::pos2(r.max.x, r.min.y + head_h)),
+        c(head),
+        clip,
+    );
+    face_rect(
+        p,
+        Rect::from_min_max(
+            egui::pos2(r.min.x, r.min.y + head_h - 1.0),
+            egui::pos2(r.max.x, r.min.y + head_h),
+        ),
+        c(hbd),
+        clip,
+    );
+    let side_w = r.width() * 0.24;
+    face_rect(
+        p,
+        Rect::from_min_max(
+            egui::pos2(r.min.x, r.min.y + head_h),
+            egui::pos2(r.min.x + side_w, r.max.y),
+        ),
+        c(side),
+        clip,
+    );
+    face_rect(
+        p,
+        Rect::from_min_max(
+            egui::pos2(r.min.x + side_w, r.min.y + head_h),
+            egui::pos2(r.min.x + side_w + 1.0, r.max.y),
+        ),
+        c(sbd),
+        clip,
+    );
+    // Head dots are circles, so a clipped tile only keeps the ones fully inside.
+    for i in 0..3 {
+        let dc = egui::pos2(r.min.x + 4.0 + i as f32 * 4.0, r.min.y + head_h / 2.0);
+        let keep = match clip {
+            None => true,
+            Some((a, b, kp)) => {
+                let v = line_side(dc, a, b);
+                if kp {
+                    v > 1.5
+                } else {
+                    v < -1.5
+                }
+            }
+        };
+        if keep {
+            p.circle_filled(dc, 1.7, c(dot));
+        }
+    }
+    let main_x = r.min.x + side_w + 4.0;
+    let main_w = (r.max.x - 5.0 - main_x).max(6.0);
+    let top = r.min.y + head_h + 4.5;
+    let step = ((r.max.y - 4.0 - top) / 4.0).max(3.0);
+    for (i, wr) in [0.60_f32, 0.90, 0.75, 0.45].iter().enumerate() {
+        let lr = Rect::from_min_size(
+            egui::pos2(main_x, top + step * i as f32),
+            Vec2::new((main_w * wr).max(4.0), 2.5),
+        );
+        face_rect(p, lr, if i == 3 { accent } else { c(line) }, clip);
+    }
+}
+
+/// One theme tile (the mock's `.theme-tile`): a mini-window preview, the name
+/// under it and an accent check badge when it is the active theme.
+fn theme_tile(
+    ui: &mut Ui,
+    salt: &str,
+    w: f32,
+    h: f32,
+    kind: TileKind,
+    name: &str,
+    active: bool,
+) -> Response {
+    let t = tok();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+    let resp = ui
+        .interact(rect, ui.id().with(("theme_tile", salt)), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let p = ui.painter();
+    let pad = 4.0;
+    p.rect(
+        rect,
+        8.0,
+        t.input,
+        Stroke::new(
+            1.0,
+            if active {
+                t.accent
+            } else if resp.hovered() {
+                t.muted
+            } else {
+                t.border
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    if active {
+        p.rect_stroke(rect, 8.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+    }
+    // Preview box (`.tp`): a dark base so a clipped corner never flashes white.
+    let prev = Rect::from_min_size(
+        egui::pos2(rect.min.x + pad, rect.min.y + pad),
+        Vec2::new(w - pad * 2.0, (h - pad * 2.0 - 19.0).max(24.0)),
+    );
+    p.rect_filled(prev, 5.0, Color32::from_rgb(0x0f, 0x17, 0x2a));
+    let inner = prev.shrink(1.0);
+    match kind {
+        TileKind::System => {
+            // Light left of the diagonal, dark right of it.
+            let a = egui::pos2(inner.min.x + inner.width() * 0.62, inner.min.y);
+            let b = egui::pos2(inner.min.x + inner.width() * 0.38, inner.max.y);
+            draw_face(p, inner, true, None);
+            draw_face(p, inner, false, Some((a, b, false)));
+        }
+        TileKind::Dark => draw_face(p, inner, false, None),
+        TileKind::Light => draw_face(p, inner, true, None),
+    }
+    p.rect_stroke(prev, 5.0, Stroke::new(1.0, t.border), StrokeKind::Inside);
+    if active {
+        let bc = egui::pos2(prev.max.x - 8.0, prev.min.y + 8.0);
+        p.circle_filled(bc, 7.5, t.accent);
+        let s = Stroke::new(1.6, Color32::WHITE);
+        p.line_segment([bc + Vec2::new(-3.2, -0.2), bc + Vec2::new(-1.0, 2.2)], s);
+        p.line_segment([bc + Vec2::new(-1.0, 2.2), bc + Vec2::new(3.4, -2.6)], s);
+    }
+    p.text(
+        egui::pos2(rect.min.x + pad + 3.0, rect.max.y - pad - 2.0),
+        Align2::LEFT_BOTTOM,
+        name,
+        reg(10.5),
+        if active { t.text } else { t.text2 },
+    );
+    resp
+}
+
+/// A settings row with its label + hint on the left and a toggle on the right
+/// (the mock's `.opt-row`). Only the switch is clickable.
+fn switch_row(ui: &mut Ui, salt: &str, on: &mut bool, label: &str, hint: &str) -> bool {
+    let t = tok();
+    let w = ui.available_width().max(120.0);
+    let sw = 34.0;
+    let text_w = (w - sw - 14.0).max(80.0);
+    let lg = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), reg(11.5), t.text);
+    let hg = ui
+        .painter()
+        .layout(hint.to_owned(), reg(9.5), t.muted, text_w);
+    let h = (lg.size().y + 3.0 + hg.size().y).max(26.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+    let track = Rect::from_min_size(
+        egui::pos2(rect.max.x - sw, rect.center().y - 9.5),
+        Vec2::new(sw, 19.0),
+    );
+    let id = ui.id().with(("switch", salt));
+    let resp = ui
+        .interact(
+            Rect::from_min_max(
+                egui::pos2(track.min.x - 4.0, rect.min.y),
+                egui::pos2(rect.max.x, rect.max.y),
+            ),
+            id,
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let anim = ui.ctx().animate_bool_with_time(id, *on, 0.15);
+    let p = ui.painter();
+    let top = rect.center().y - h / 2.0;
+    p.galley(egui::pos2(rect.min.x, top), lg.clone(), t.text);
+    p.galley(
+        egui::pos2(rect.min.x, top + lg.size().y + 3.0),
+        hg,
+        t.muted,
+    );
+    p.rect_filled(track, 9.5, blend(t.track, t.accent, anim));
+    p.circle_filled(
+        egui::pos2(track.left() + 9.5 + 15.0 * anim, track.center().y),
+        7.0,
+        Color32::WHITE,
+    );
+    if resp.clicked() {
+        *on = !*on;
+        return true;
+    }
+    false
 }
 
 // ---------- Download Engine: cards + field rows ----------
@@ -1820,7 +2289,7 @@ fn runtime_note(ui: &mut Ui, runtime: Option<&str>) {
 fn runtime_tail(runtime: Option<&str>) -> (&'static str, bool) {
     match runtime {
         Some(_) => ("— solves YouTube's player challenge", false),
-        None => ("— none found; install Node.js", true),
+        None => ("— needs Node.js 22+ or Deno 2.3+", true),
     }
 }
 
@@ -1851,27 +2320,56 @@ impl SettingsApp {
     // ---------- Appearance ----------
     fn pane_appearance(&mut self, ui: &mut Ui) {
         h2(ui, "Appearance");
-        lbl(ui, "Theme:");
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            for (key, name) in [("system", "System"), ("dark", "Dark"), ("light", "Light")] {
-                if pill(ui, name, self.s.theme == key).clicked() {
-                    self.s.theme = key.to_string();
-                }
-            }
-        });
-        ui.add_space(14.0);
-        toggle(
-            ui,
-            &mut self.s.close_to_tray,
-            "Minimize to system tray instead of quitting",
-        );
-        ui.add_space(10.0);
+
         hint(
             ui,
-            "Fonts, radius, and accent stay identical — only the palette changes.",
+            "Fonts, radius and accent stay identical — only the palette changes.",
         );
+        ui.add_space(10.0);
+
+        // ---- Theme: three mini-window tiles (the concept's visual picker) ----
+        let current = self.s.theme.clone();
+        let mut picked: Option<String> = None;
+        let mut open_theme = self.open_theme;
+        card(ui, "Theme", None, &mut open_theme, |ui| {
+            let gap = 8.0;
+            let tile_w = ((ui.available_width() - gap * 2.0) / 3.0).max(72.0);
+            let tile_h = 92.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (key, name, kind) in [
+                    ("system", "System", TileKind::System),
+                    ("dark", "Dark", TileKind::Dark),
+                    ("light", "Light", TileKind::Light),
+                ] {
+                    if theme_tile(ui, key, tile_w, tile_h, kind, name, current == key).clicked() {
+                        picked = Some(key.to_string());
+                    }
+                }
+            });
+        });
+        self.open_theme = open_theme;
+        if let Some(k) = picked {
+            self.s.theme = k;
+        }
+
+        // ---- Window behaviour ----
+        #[cfg(windows)]
+        {
+            let mut tray = self.s.close_to_tray;
+            let mut open_window = self.open_window;
+            card(ui, "Window", None, &mut open_window, |ui| {
+                switch_row(
+                    ui,
+                    "close_to_tray",
+                    &mut tray,
+                    "Minimize to system tray instead of quitting",
+                    "Closing the window keeps downloads running in the background.",
+                );
+            });
+            self.open_window = open_window;
+            self.s.close_to_tray = tray;
+        }
     }
 
     // ---------- Download Engine ----------
@@ -1892,7 +2390,7 @@ impl SettingsApp {
                 iw,
                 true,
                 false,
-                "C:\\Downloads",
+                if cfg!(windows){"C:\\Downloads"}else{"~/Downloads"},
             );
             c.add_space(6.0);
             if icon_sq(&mut c, "\u{e2c7}", 28.0, 6.0)
@@ -1941,6 +2439,17 @@ impl SettingsApp {
             if slider_row(&mut c, "speed_limit", &mut lim, 0.0, 10000.0) {
                 s.speed_limit_kbps = lim.round() as u64;
             }
+            let mut c = field_row(
+                ui,
+                "per_host",
+                "Connections per server",
+                None,
+                Some("0 = no extra cap"),
+            );
+            let mut per_host = s.per_host_conns as f64;
+            if slider_row(&mut c, "per_host", &mut per_host, 0.0, 32.0) {
+                s.per_host_conns = per_host.round() as usize;
+            }
         });
 
         // ---- Network ----
@@ -1984,9 +2493,9 @@ impl SettingsApp {
             let mut c = field_row(
                 ui,
                 "av",
-                "Antivirus command",
+                "After-download command",
                 None,
-                Some("{file} is replaced with the downloaded file path."),
+                Some("Executable and arguments; {file} is passed as the file path. Shell operators are not supported."),
             );
             let w = c.available_width();
             input_box(
@@ -1996,13 +2505,13 @@ impl SettingsApp {
                 w,
                 true,
                 false,
-                "\"C:\\Program Files\\Defender\\MpCmdRun.exe\" -Scan -ScanType 3 -File {file}",
+                if cfg!(windows) { r#""C:\Program Files\Defender\MpCmdRun.exe" -Scan -ScanType 3 -File {file}"# } else { r#"clamscan "{file}""# },
             );
             let mut c = field_row(ui, "finish", "When a download finishes", None, None);
             segmented(
                 &mut c,
                 "finish",
-                &["nothing", "shutdown", "sleep", "hibernate"],
+                if cfg!(target_os="macos") { &["nothing", "shutdown", "sleep"] } else { &["nothing", "shutdown", "sleep", "hibernate"] },
                 &mut s.finish_action,
             );
         });
@@ -2039,6 +2548,85 @@ impl SettingsApp {
                     limit_kbps: 0,
                 });
             }
+        });
+        // ---- Archives ----
+        card(ui, "Archives", None, &mut self.open_archives, |ui| {
+            checkbox(
+                ui,
+                &mut s.auto_extract,
+                "Unpack finished ZIP / RAR / 7z downloads",
+                14.0,
+                11.5,
+                true,
+            );
+            ui.add_space(4.0);
+            hint(
+                ui,
+                "Extracted files are only written, never started. Nothing is allowed to leave the folder the files go to, and an archive that expands wildly is refused.",
+            );
+            ui.add_space(10.0);
+            checkbox(
+                ui,
+                &mut s.extract_ask,
+                "Ask before extracting",
+                14.0,
+                11.5,
+                true,
+            );
+            ui.add_space(8.0);
+            let mut c = field_row(ui, "extract_to", "Extract into", None, None);
+            segmented(
+                &mut c,
+                "extract_to",
+                &["same", "subfolder", "custom"],
+                &mut s.extract_target,
+            );
+            ui.add_space(6.0);
+            hint(
+                ui,
+                match s.extract_target.as_str() {
+                    "same" => "Next to the archive, in the same folder.",
+                    "custom" => "Into the folder you pick below.",
+                    _ => "Into a new folder named after the archive.",
+                },
+            );
+            if s.extract_target == "custom" {
+                ui.add_space(8.0);
+                let mut c = field_row(ui, "extract_dir", "Extract folder", None, None);
+                let iw = (c.available_width() - 34.0).max(60.0);
+                input_box(
+                    &mut c,
+                    "extract_dir",
+                    &mut s.extract_custom_dir,
+                    iw,
+                    true,
+                    false,
+                    "choose a folder",
+                );
+                c.add_space(6.0);
+                if icon_sq(&mut c, "\u{e2c7}", 28.0, 6.0)
+                    .on_hover_text("Browse…")
+                    .clicked()
+                {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        s.extract_custom_dir = p.to_string_lossy().to_string();
+                    }
+                }
+            }
+            ui.add_space(10.0);
+            checkbox(
+                ui,
+                &mut s.extract_keep_original,
+                "Keep the archive after extracting",
+                14.0,
+                11.5,
+                true,
+            );
+            ui.add_space(4.0);
+            hint(
+                ui,
+                "With this off the archive is removed only after the extraction finished without errors.",
+            );
         });
     }
 
@@ -2105,7 +2693,7 @@ impl SettingsApp {
             (Some(_), _) => format!("from PATH · {size}"),
         };
         let custom_missing = !custom.trim().is_empty()
-            && !info.as_ref().map(|i| i.custom_ok).unwrap_or(false);
+            && !crate::platform::executable_file(std::path::Path::new(custom.trim()));
 
         let w = ui.available_width();
         let mut want_open = open;
@@ -2172,7 +2760,7 @@ impl SettingsApp {
                         let managed_sub = managed_dir
                             .as_ref()
                             .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "your Windows app data folder".to_string());
+                            .unwrap_or_else(|| "your application data folder".to_string());
                         let (hit, _) = loc_option(
                             ui,
                             source == "managed",
@@ -2206,7 +2794,7 @@ impl SettingsApp {
                         ui.add_space(6.0);
 
                         let custom_sub = if custom.trim().is_empty() {
-                            "pick any yt-dlp.exe on this PC".to_string()
+                            if cfg!(windows) { "pick yt-dlp.exe on this computer" } else { "pick an executable yt-dlp file" }.to_string()
                         } else if custom_missing {
                             format!("{custom}  — not there any more")
                         } else {
@@ -2239,7 +2827,7 @@ impl SettingsApp {
                                 let from = if i.managed {
                                     "App's own copy"
                                 } else if i.path.is_some() {
-                                    "yt-dlp on PATH"
+                                    if !custom.trim().is_empty() && i.path.as_deref()==Some(std::path::Path::new(custom.trim())) { "Custom yt-dlp" } else { "System yt-dlp" }
                                 } else {
                                     "Nothing installed yet"
                                 };
@@ -2270,7 +2858,7 @@ impl SettingsApp {
                                 // e5d5 renders as a refresh arrow in this build
                                 // of Material Icons — which is what re-fetching
                                 // the helper means anyway.
-                                if btn_icon(ui, "\u{e5d5}", "Re-download", true).clicked() {
+                                if btn_icon(ui, "\u{e5d5}", if info.as_ref().and_then(|i|i.path.as_ref()).is_some(){"Update yt-dlp"}else{"Download yt-dlp"}, true).clicked() {
                                     redownload = true;
                                 }
                             });
@@ -2293,6 +2881,36 @@ impl SettingsApp {
                             runtime_note(ui, rt);
                         }
 
+                        // One click installs a portable Deno into the app's own
+                        // tools folder (like yt-dlp itself): no web page, no
+                        // installer, no PATH changes.
+                        let installing = self.deno_rx.is_some();
+                        let own = crate::engine::deno_local_path().map(|p| p.is_file()).unwrap_or(false);
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let label = if own {
+                                "Update JavaScript runtime"
+                            } else if rt.is_some() {
+                                "Install app's own runtime"
+                            } else {
+                                "Install JavaScript runtime"
+                            };
+                            let b = ui.add_enabled_ui(!installing, |ui| btn_icon(ui, "\u{e2c4}", label, rt.is_none() && !own)).inner;
+                            if b.on_hover_text("Downloads a portable Deno (about 45 MB) next to yt-dlp — nothing else to set up").clicked() {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(crate::engine::deno_install_blocking().map_err(|e| format!("{e:#}")));
+                                });
+                                self.deno_rx = Some(rx);
+                                self.ytdlp_msg = "Installing the JavaScript runtime (Deno)…".into();
+                            }
+                            if installing {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            } else if own {
+                                txt(ui, "✓ Installed (app's own copy)", reg(10.0), pl().success);
+                            }
+                        });
                         if !msg.is_empty() {
                             ui.add_space(7.0);
                             wrapped(ui, msg.as_str(), reg(10.0), t.accent);
@@ -2314,26 +2932,57 @@ impl SettingsApp {
             if set_custom.is_none() {
                 self.s.ytdlp_source = src.to_string();
                 // Keep the old switch truthful for anything still reading it,
-                // then re-ask so the status line matches the new choice.
+                // then re-ask so the status line matches the new choice. The
+                // probe reads ui.json, so the choice is committed first (as
+                // the ffmpeg card does); otherwise it described the old one
+                // until Save.
                 self.s.ytdlp_prefer_path = src == "path";
-                self.ytdlp_rx = Some(ytdlp_probe(false));
-                self.ytdlp_busy = true;
-                self.ytdlp_msg.clear();
+                crate::model::ui_pref_set_str("ytdlp_source", src);
+                self.run_ytdlp_job(|| ytdlp_probe(false));
             }
         }
         if let Some(p) = set_custom {
             self.s.ytdlp_custom_path = p;
             self.s.ytdlp_source = "custom".to_string();
             self.s.ytdlp_prefer_path = false;
-            self.ytdlp_rx = Some(ytdlp_probe(false));
-            self.ytdlp_busy = true;
-            self.ytdlp_msg.clear();
+            crate::model::ui_pref_set_str("ytdlp_source", "custom");
+            crate::model::ui_pref_set_str("ytdlp_custom_path", &self.s.ytdlp_custom_path);
+            self.run_ytdlp_job(|| ytdlp_probe(false));
         }
         if redownload {
-            self.ytdlp_rx = Some(ytdlp_probe(true));
-            self.ytdlp_busy = true;
-            self.ytdlp_msg.clear();
+            self.run_ytdlp_job(|| ytdlp_probe(true));
         }
+    }
+
+    /// Start a yt-dlp card job unless one still runs: replacing its receiver
+    /// dropped that job's result ("Updated yt-dlp X → Y") and cleared the
+    /// busy state while it was still writing the executable.
+    fn run_ytdlp_job(
+        &mut self,
+        job: impl FnOnce() -> std::sync::mpsc::Receiver<(String, crate::engine::YtdlpInfo, crate::engine::FfmpegInfo)>,
+    ) {
+        if self.ytdlp_rx.is_some() {
+            self.ytdlp_msg = "Still finishing the previous step — try again in a moment.".to_string();
+            return;
+        }
+        self.ytdlp_rx = Some(job());
+        self.ytdlp_busy = true;
+        self.ytdlp_msg.clear();
+    }
+
+    /// Same for the ffmpeg card; the tools install (which runs on the yt-dlp
+    /// channel) also writes ffmpeg, so it blocks these too.
+    fn run_ffmpeg_job(
+        &mut self,
+        job: impl FnOnce() -> std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)>,
+    ) {
+        if self.ffmpeg_rx.is_some() || self.ffmpeg_installing {
+            self.ffmpeg_msg = "Still finishing the previous step — try again in a moment.".to_string();
+            return;
+        }
+        self.ffmpeg_rx = Some(job());
+        self.ffmpeg_busy = true;
+        self.ffmpeg_msg.clear();
     }
 
     /// ffmpeg: the concept's second card, closed by default — with real
@@ -2342,6 +2991,11 @@ impl SettingsApp {
         let t = tok();
         let ff = self.ffmpeg.clone();
         let open = self.plugins_open[1];
+        let source = self.s.ffmpeg_source.clone();
+        let custom = self.s.ffmpeg_custom_path.clone();
+        let busy = self.ffmpeg_busy;
+        let msg = self.ffmpeg_msg.clone();
+        let managed_dir = crate::engine::ffmpeg_bin_dir();
         let found = ff.as_ref().and_then(|f| f.path.clone());
         let pill = match ff.as_ref().and_then(|f| f.version.as_deref()) {
             Some(v) => format!("v{v}"),
@@ -2354,7 +3008,13 @@ impl SettingsApp {
 
         let w = ui.available_width();
         let mut want_open = open;
-        let mut reveal: Option<std::path::PathBuf> = None;
+        let mut set_source: Option<&'static str> = None;
+        let mut set_custom: Option<String> = None;
+        let mut redownload = false;
+        let mut install = false;
+        let mut recheck = false;
+        let mut custom_pick: Option<std::path::PathBuf> = None;
+        let mut clear_custom = false;
 
         let edge = if open {
             blend(t.border, t.accent, 0.5)
@@ -2406,17 +3066,91 @@ impl SettingsApp {
                         capabilities(ui, &FFMPEG_CAPS);
                         ui.add_space(13.0);
 
-                        sec_head(ui, "Windows build");
-                        let (status, warn) = match (&ff, &found) {
-                            (None, _) => ("Checking what you have…".to_string(), false),
-                            (Some(_), Some(_)) => {
-                                ("Active: the ffmpeg on your PATH".to_string(), false)
+                        sec_head(ui, "ffmpeg location");
+                        let managed_sub = managed_dir
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "your application data folder".to_string());
+                        let (hit, _) = loc_option(
+                            ui,
+                            source == "managed",
+                            "App's own copy",
+                            Some("On demand"),
+                            &managed_sub,
+                            true,
+                            None,
+                        );
+                        if hit {
+                            set_source = Some("managed");
+                        }
+                        ui.add_space(6.0);
+
+                        let path_sub = match ff.as_ref().and_then(|f| f.on_path.as_deref()) {
+                            Some(p) => p.display().to_string(),
+                            None => "no ffmpeg found on PATH".to_string(),
+                        };
+                        let (hit, _) = loc_option(
+                            ui,
+                            source == "path",
+                            "System PATH",
+                            None,
+                            &path_sub,
+                            true,
+                            None,
+                        );
+                        if hit {
+                            set_source = Some("path");
+                        }
+                        ui.add_space(6.0);
+
+                        let custom_missing =
+                            !custom.trim().is_empty() && !std::path::Path::new(&custom).is_file();
+                        let custom_sub = if custom.trim().is_empty() {
+                            if cfg!(windows) { "pick an ffmpeg.exe on this computer" } else { "pick an executable ffmpeg file" }.to_string()
+                        } else if custom_missing {
+                            format!("{custom}  — not there any more")
+                        } else {
+                            custom.clone()
+                        };
+                        let (hit, browse) = loc_option(
+                            ui,
+                            source == "custom",
+                            "Custom path",
+                            None,
+                            &custom_sub,
+                            true,
+                            Some("Browse…"),
+                        );
+                        if browse {
+                            if let Some(p) = pick_ffmpeg() {
+                                set_custom = Some(p.to_string_lossy().to_string());
+                                set_source = Some("custom");
                             }
-                            (Some(_), None) => (
-                                "Not found — run \u{201c}winget install ffmpeg\u{201d}, then reopen this window"
-                                    .to_string(),
-                                true,
-                            ),
+                        } else if hit {
+                            set_source = Some("custom");
+                        }
+                        ui.add_space(9.0);
+
+                        let (status, warn) = match &ff {
+                            None => ("Checking what you have…".to_string(), false),
+                            Some(f) => {
+                                let from = if f.managed {
+                                    "App's own copy"
+                                } else if f.path.is_some() {
+                                    "ffmpeg on PATH"
+                                } else {
+                                    "Nothing installed yet"
+                                };
+                                let what = match (&f.version, f.path.is_some()) {
+                                    (Some(v), true) => format!(" — ffmpeg {v} detected"),
+                                    (None, true) => " — it did not answer -version".to_string(),
+                                    _ => " — the app fetches one on the next merge".to_string(),
+                                };
+                                (
+                                    format!("Active: {from}{what}"),
+                                    f.path.is_none() || custom_missing,
+                                )
+                            }
                         };
                         loc_status(ui, &status, warn);
                         if let Some(p) = &found {
@@ -2430,49 +3164,218 @@ impl SettingsApp {
                         }
                         ui.add_space(13.0);
 
+                        ui.add_enabled_ui(!self.ytdlp_busy,|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                // Same gaps as the action row below (these
+                                // buttons were drawn touching each other).
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                                if crate::helpers::install_supported() && button(ui,"Download tools",true).clicked(){install=true;}
+                                if button(ui,"Choose FFmpeg…",false).clicked(){custom_pick=pick_tool("FFmpeg");}
+                                if button(ui,"Check again",false).clicked(){recheck=true;}
+                                if !self.s.ffmpeg_custom_path.is_empty() && button(ui,"Use automatic detection",false).clicked(){clear_custom=true;}
+                            });
+                        });
+                        if self.ytdlp_busy {ui.add(egui::Spinner::new().size(14.0));}
+                        if !self.ytdlp_msg.is_empty(){wrapped(ui,&self.ytdlp_msg,reg(10.0),t.accent);}
+                        if let Some(info)=&ff { if info.path.is_some() && info.probe_path.is_none(){wrapped(ui,if cfg!(windows){"ffprobe is missing. Install it next to FFmpeg."}else{"ffprobe is missing. Download tools installs the matching pair."},reg(10.0),pl().warning);} }
+                        if cfg!(target_os="macos"){hint(ui,"System alternative: brew install ffmpeg. Homebrew locations are detected automatically.");}
+                        #[cfg(target_os="linux")]
+                        hint(ui,"System alternatives: Ubuntu/Debian: sudo apt install ffmpeg; Fedora: sudo dnf install ffmpeg-free. Download tools needs no administrator access.");
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.add_enabled_ui(found.is_some(), |ui| {
-                                if btn_icon(ui, "\u{e2c7}", "Show in folder", false).clicked() {
-                                    reveal = found.clone();
+                            ui.add_enabled_ui(!busy, |ui| {
+                                if btn_icon(ui, "\u{e5d5}", "Re-download", true).clicked() {
+                                    redownload = true;
                                 }
                             });
+                            if btn_icon(ui, "\u{e2c7}", "Show in folder", false).clicked() {
+                                if let Some(dir) = crate::engine::ffmpeg_bin_dir() {
+                                    let _ = std::fs::create_dir_all(&dir);
+                                    crate::app::open_path(&dir, false);
+                                }
+                            }
+                            if busy {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     txt(
                                         ui,
-                                        "used only to merge video + audio",
+                                        "merges video + audio; no re-encoding",
                                         reg(9.0),
                                         t.muted,
                                     );
                                 },
                             );
                         });
+                        if !msg.is_empty() {
+                            ui.add_space(7.0);
+                            wrapped(ui, msg.as_str(), reg(10.0), t.accent);
+                        }
                     });
             });
 
         self.plugins_open[1] = want_open;
-        if let Some(p) = reveal {
-            crate::app::open_path(&p, true);
+        if let Some(src) = set_source {
+            if set_custom.is_none() {
+                self.s.ffmpeg_source = src.to_string();
+                crate::model::ui_pref_set_str("ffmpeg_source", src);
+                self.run_ffmpeg_job(|| ffmpeg_probe(false));
+            }
+        }
+        if let Some(p) = set_custom {
+            self.s.ffmpeg_source = "custom".to_string();
+            self.s.ffmpeg_custom_path = p;
+            crate::model::ui_pref_set_str("ffmpeg_source", "custom");
+            crate::model::ui_pref_set_str("ffmpeg_custom_path", &self.s.ffmpeg_custom_path);
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
+        }
+        if install && self.ytdlp_rx.is_none() && self.ffmpeg_rx.is_none() {
+            self.s.ffmpeg_source = "managed".to_string();
+            crate::model::ui_pref_set_str("ffmpeg_source", "managed");
+            self.ffmpeg_installing = true;
+            self.run_ytdlp_job(ffmpeg_install_probe);
+        }
+        if recheck {
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
+        }
+        if let Some(path) = custom_pick {
+            let path = path.to_string_lossy().into_owned();
+            self.s.ffmpeg_source = "custom".to_string();
+            self.s.ffmpeg_custom_path = path.clone();
+            crate::model::ui_pref_set_str("ffmpeg_source", "custom");
+            crate::model::ui_pref_set_str("ffmpeg_custom_path", &path);
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
+        }
+        if clear_custom {
+            self.s.ffmpeg_source = "path".to_string();
+            self.s.ffmpeg_custom_path.clear();
+            crate::model::ui_pref_set_str("ffmpeg_source", "path");
+            crate::model::ui_pref_set_str("ffmpeg_custom_path", "");
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
+        }
+        if redownload {
+            // Re-download means "use the copy this app keeps up to date", so
+            // the choice is committed now (the probe and the engine both read
+            // ui.json, not this form's unsaved state).
+            self.s.ffmpeg_source = "managed".to_string();
+            crate::model::ui_pref_set_str("ffmpeg_source", "managed");
+            self.run_ffmpeg_job(|| ffmpeg_probe(true));
         }
     }
 
-    // ---------- Browser Integration ----------
+    // ---------- Browser Integration (one card per extension, like Plugins) ----------
     fn pane_browser(&mut self, ui: &mut Ui) {
         let t = tok();
         h2(ui, "Browser Integration");
-        para(
+        hint(
             ui,
-            "Load browser-extension/ unpacked once — its ID is pinned, no pasting needed.",
+            "The extension catches videos and downloads; the app's connection repairs itself on every launch.",
         );
-        ui.add_space(6.0);
-        para(
+        ui.add_space(12.0);
+        if self.host_status.is_none() {
+            self.host_status = Some(
+                ["chrome", "edge", "brave", "opera", "firefox"]
+                    .iter()
+                    .map(|b| (*b, crate::app::native_host_status(b)))
+                    .collect(),
+            );
+        }
+        self.browser_card(ui, 0);
+        ui.add_space(10.0);
+        self.browser_card(ui, 1);
+        ui.add_space(16.0);
+
+        // ---- Set up the extension ----
+        h2(ui, "Set up the extension");
+        hint(
             ui,
-            "One-time setup: host auto-repairs on every launch — buttons below are manual repair only.",
+            "One-time setup: load the extension folder in your browser. The host is repaired on every launch.",
         );
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            for (firefox,label) in [(false,"Open Chrome/Brave extension folder"),(true,"Open Firefox extension folder")] {
+                if button(ui,label,false).clicked(){match crate::platform::extension_directory(firefox){Ok(dir)=>crate::app::open_path(&dir,false),Err(e)=>self.browser_msg=e}}
+            }
+        });
         ui.add_space(6.0);
-        para(ui, &format!("Extension ID: {}", crate::app::EXTENSION_ID));
+        ui.horizontal_wrapped(|ui| {
+            if button(ui, "Create Chrome package (.zip)", false).clicked() {
+                self.browser_msg = match crate::extension::package(false) {
+                    Ok(p) => format!(
+                        "Chrome package written to {}. Unpack it and load the folder with \"Load unpacked\".",
+                        p.display()
+                    ),
+                    Err(e) => format!("The package could not be created: {e}"),
+                };
+            }
+            if button(ui, "Create Firefox package (.xpi)", false).clicked() {
+                self.browser_msg = match crate::extension::package(true) {
+                    Ok(p) => format!(
+                        "Firefox package written to {}. Load it with \"Load Temporary Add-on…\".",
+                        p.display()
+                    ),
+                    Err(e) => format!("The package could not be created: {e}"),
+                };
+            }
+        });
+        ui.add_space(6.0);
+        if button(ui, "Test desktop ↔ extension connection", false).clicked() {
+            let registered: Vec<&str> = ["chrome", "edge", "firefox", "brave", "opera"]
+                .into_iter()
+                .filter(|b| crate::extension::native_host_registered(b))
+                .collect();
+            self.browser_msg = match crate::extension::test_native_host() {
+                Ok(reply) => {
+                    let where_ = if registered.is_empty() {
+                        "No browser has the native host registered yet — use the Install buttons below."
+                            .to_string()
+                    } else {
+                        format!("The host is registered for: {}.", registered.join(", "))
+                    };
+                    format!("The native host answered ({reply}). {where_}")
+                }
+                Err(e) => format!("The connection test failed: {e}"),
+            };
+        }
+        ui.add_space(10.0);
+        if button(ui, "Check whether the browser has the extension", false).clicked() {
+            self.ext_info = match crate::extension::prepare(false) {
+                Ok(status) => match status.installed {
+                    Some(true) => format!(
+                        "Installed and enabled — {} (version {})",
+                        status.profile_note, status.version
+                    ),
+                    Some(false) => format!(
+                        "Found but not enabled — {} (version {})",
+                        status.profile_note, status.version
+                    ),
+                    None => format!(
+                        "No Chrome, Edge, Brave or Vivaldi profile with this extension was found. The folder is {}.",
+                        status.dir.display()
+                    ),
+                },
+                Err(e) => format!("The extension folder could not be prepared: {e}"),
+            };
+        }
+        if !self.ext_info.is_empty() {
+            ui.add_space(4.0);
+            wrapped(ui, self.ext_info.as_str(), reg(10.0), t.muted);
+        }
+        ui.add_space(12.0);
+        para(ui, "Loading it in Chrome:");
+        ui.add_space(4.0);
+        for (i, step) in crate::extension::install_steps(false, std::path::Path::new("the folder above"))
+            .iter()
+            .enumerate()
+        {
+            para(ui, &format!("{}. {}", i + 1, step));
+            ui.add_space(2.0);
+        }
+        ui.add_space(12.0);
+        para(ui, &format!("Chrome/Brave extension ID: {}", crate::app::EXTENSION_ID));
         ui.add_space(16.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
@@ -2483,8 +3386,138 @@ impl SettingsApp {
             }
         });
         if !self.browser_msg.is_empty() {
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             wrapped(ui, self.browser_msg.as_str(), reg(10.0), t.muted);
+        }
+    }
+
+    /// Card 0: Chrome, Edge, Brave and Opera (one Chromium extension).
+    /// Card 1: Firefox.
+    fn browser_card(&mut self, ui: &mut Ui, idx: usize) {
+        let t = tok();
+        let firefox = idx == 1;
+        let browsers: &[(&str, &str)] = if firefox {
+            &[("firefox", "Firefox")]
+        } else {
+            &[("chrome", "Chrome"), ("edge", "Edge"), ("brave", "Brave"), ("opera", "Opera")]
+        };
+        let status = self.host_status.clone().unwrap_or_default();
+        let connected = browsers
+            .iter()
+            .filter(|(k, _)| status.iter().any(|(b, ok)| b == k && *ok))
+            .count();
+        let open = self.browser_open[idx];
+        let (glyph, brand, name) = if firefox {
+            ("\u{e80b}", Color32::from_rgb(0xff, 0x8a, 0x3d), "Firefox")
+        } else {
+            ("\u{e87b}", t.accent, "Chrome · Edge · Brave · Opera")
+        };
+        let pill = if connected > 0 { "connected" } else { "not set up" };
+        let meta = format!("{connected} of {} linked", browsers.len());
+        let w = ui.available_width();
+        let mut want_open = open;
+        let mut repair: Option<&'static str> = None;
+        let mut open_folder = false;
+        let mut copy_id = false;
+        let edge = if open { blend(t.border, t.accent, 0.5) } else { t.border };
+        egui::Frame::new()
+            .fill(t.card)
+            .stroke(Stroke::new(1.0_f32, edge))
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::ZERO)
+            .show(ui, |ui| {
+                ui.set_width(w);
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let inner = ui.max_rect();
+                if plugin_head(ui, inner.width(), glyph, brand, name, pill, &meta, open).clicked() {
+                    want_open = !open;
+                }
+                if !open {
+                    return;
+                }
+                let y = ui.cursor().top();
+                ui.painter().hline(
+                    inner.left()..=inner.right(),
+                    y,
+                    Stroke::new(1.0_f32, blend(t.card, t.border, 0.6)),
+                );
+                egui::Frame::new()
+                    .inner_margin(egui::Margin { left: 13, right: 13, top: 12, bottom: 16 })
+                    .show(ui, |ui| {
+                        ui.set_width(inner.width() - 26.0);
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                        sec_head(ui, "Extension");
+                        wrapped(
+                            ui,
+                            if firefox {
+                                "about:debugging → This Firefox → Load Temporary Add-on, then pick manifest.json in this folder (or install the .xpi)."
+                            } else {
+                                "chrome://extensions → turn on Developer mode → Load unpacked, then pick this folder. The same folder works in Edge, Brave and Opera."
+                            },
+                            reg(10.0),
+                            t.text2,
+                        );
+                        if !firefox {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("ID  {}", crate::app::EXTENSION_ID))
+                                        .font(egui::FontId::monospace(9.0))
+                                        .color(t.muted),
+                                )
+                                .selectable(true),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                            if btn_icon(ui, "\u{e2c7}", "Open extension folder", true).clicked() {
+                                open_folder = true;
+                            }
+                            if !firefox && btn_icon(ui, "\u{e14d}", "Copy extension ID", false).clicked() {
+                                copy_id = true;
+                            }
+                        });
+                        ui.add_space(12.0);
+                        sec_head(ui, "Connection to the app");
+                        for (key, label) in browsers {
+                            let ok = status.iter().any(|(b, s)| b == key && *s);
+                            loc_status(
+                                ui,
+                                &if ok {
+                                    format!("{label} — linked to Download Craft")
+                                } else {
+                                    format!("{label} — not linked yet")
+                                },
+                                !ok,
+                            );
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                            for (key, label) in browsers {
+                                if btn_icon(ui, "\u{e869}", &format!("Repair {label}"), false).clicked() {
+                                    repair = Some(*key);
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        hint(ui, "Repair re-registers the app for that browser; restart the browser afterwards.");
+                    });
+            });
+        self.browser_open[idx] = want_open;
+        if open_folder {
+            match crate::platform::extension_directory(firefox) {
+                Ok(dir) => crate::app::open_path(&dir, false),
+                Err(e) => self.browser_msg = e,
+            }
+        }
+        if copy_id {
+            ui.ctx().copy_text(crate::app::EXTENSION_ID.to_string());
+            self.browser_msg = "Extension ID copied.".to_string();
+        }
+        if let Some(b) = repair {
+            self.browser_msg = install_one(b);
+            self.host_status = None; // re-check on the next frame
         }
     }
 
@@ -2571,20 +3604,133 @@ impl SettingsApp {
     fn pane_updates(&mut self, ui: &mut Ui) {
         let t = tok();
         h2(ui, "Updates");
-        checkbox(
-            ui,
-            &mut self.s.update_check_on,
-            "Check for updates on launch",
-            14.0,
-            12.0,
-            true,
-        );
+        hint(ui, "Download Craft itself, and the helpers it keeps for you.");
         ui.add_space(10.0);
-        wrapped(
-            ui,
-            "Checks GitHub releases; never downloads automatically.",
-            reg(11.0),
-            t.muted,
+
+        let mut open_updates = self.open_updates;
+        let mut check = self.s.update_check_on;
+        card(ui, "Download Craft", Some(&format!("v{}", crate::model::APP_VERSION)), &mut open_updates, |ui| {
+            switch_row(
+                ui,
+                "update_check_on",
+                &mut check,
+                "Check for updates on launch",
+                "Asks GitHub for a newer release; never downloads one by itself.",
+            );
+        });
+        self.open_updates = open_updates;
+        self.s.update_check_on = check;
+
+        let mut open_version = self.open_version;
+        let mut go_plugins = false;
+        card(ui, "Helpers", None, &mut open_version, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+            wrapped(
+                ui,
+                "yt-dlp and ffmpeg are checked against their latest releases whenever Plugins opens; the copies this app keeps are updated in place, your own copies are only reported.",
+                reg(9.5),
+                t.muted,
+            );
+            ui.add_space(2.0);
+            if btn_icon(ui, "\u{e9b0}", "Open Plugins", false).clicked() {
+                go_plugins = true;
+            }
+        });
+        self.open_version = open_version;
+        if go_plugins {
+            self.pane = PANE_YTDLP;
+        }
+    }
+}
+
+#[cfg(test)]
+mod settings_file_tests {
+    use super::*;
+
+    /// A provider token lives in memory only. The settings file has no
+    /// key for it, and no value that could carry one.
+    ///
+    /// This is the guard for the rule that a token is never written to a
+    /// settings file, a queue file or a download row.
+    #[test]
+    fn the_settings_file_has_no_place_for_a_credential() {
+        let mut obj = serde_json::Map::new();
+        apply_settings(&mut obj, &Settings::default());
+
+        // No key that could hold a provider token.
+        for key in obj.keys() {
+            let k = key.to_lowercase();
+            assert!(
+                !k.contains("token") && !k.contains("secret") && !k.contains("password"),
+                "the settings file grew a credential-shaped key: {key}"
+            );
+        }
+
+        // And no value that looks like one either.
+        let text = serde_json::to_string(&obj).unwrap();
+        for p in crate::debrid::Provider::ALL {
+            assert!(
+                !text.contains(p.label()) || !text.to_lowercase().contains("token"),
+                "the settings file mentions a provider with a token"
+            );
+        }
+    }
+
+    /// The settings the panel needs survive a round trip: what is written
+    /// is what is read back.
+    #[test]
+    fn what_is_written_is_what_is_read_back() {
+        let mut s = Settings::default();
+        s.auto_extract = true;
+        s.extract_target = "custom".into();
+        let mut obj = serde_json::Map::new();
+        apply_settings(&mut obj, &s);
+        assert_eq!(obj.get("auto_extract").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            obj.get("extract_target").and_then(|v| v.as_str()),
+            Some("custom")
         );
+        // And the loader reads those keys back.
+        let back = load_from(&serde_json::Value::Object(obj));
+        assert!(back.auto_extract);
+        assert_eq!(back.extract_target, "custom");
+    }
+
+    /// An older install still carries the overlay style in its settings
+    /// file. Loading it must not fail, and the next save must leave the
+    /// obsolete keys out so that no later reader mistakes them for a live
+    /// setting.
+    #[test]
+    fn an_old_settings_file_loads_and_loses_the_overlay_keys() {
+        let old = serde_json::json!({
+            "theme": "dark",
+            "save_dir": "C:/downloads",
+            "auto_extract": true,
+            "extract_target": "custom",
+            "columns": ["Name", "Size"],
+            "overlay_style": "modern",
+            "overlay_style_source": "extension",
+        });
+        // Loading an old file must not fail.
+        let s = load_from(&old);
+        assert_eq!(s.theme, "dark");
+        assert_eq!(s.save_dir, "C:/downloads");
+        assert!(s.auto_extract);
+        assert_eq!(s.extract_target, "custom");
+
+        // The save merges onto the file that is already on disk.
+        let mut obj = old.as_object().unwrap().clone();
+        apply_settings(&mut obj, &s);
+        assert!(!obj.contains_key("overlay_style"));
+        assert!(!obj.contains_key("overlay_style_source"));
+        // Nothing else broke: the other settings and the keys the app does
+        // not own are still there.
+        assert_eq!(obj.get("theme").and_then(|v| v.as_str()), Some("dark"));
+        assert_eq!(obj.get("auto_extract").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            obj.get("extract_target").and_then(|v| v.as_str()),
+            Some("custom")
+        );
+        assert!(obj.contains_key("columns"));
     }
 }

@@ -1,0 +1,26 @@
+[
+  {
+    "format": "vtt",
+    "input": "expired caption URL with same selected video/language/type/variant",
+    "exitCode": 0,
+    "files": [
+      "Spanish [asr gemini].vtt"
+    ],
+    "bytes": 220928,
+    "cues": 1509,
+    "html": false,
+    "vtt": true
+  },
+  {
+    "format": "srt",
+    "input": "expired caption URL with same selected video/language/type/variant",
+    "exitCode": 0,
+    "files": [
+      "Spanish [asr gemini].srt"
+    ],
+    "bytes": 49134,
+    "cues": 755,
+    "html": false,
+    "vtt": false
+  }
+]

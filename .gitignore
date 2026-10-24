@@ -1,3 +1,9 @@
 /target
 *.zip
 *.xpi
+/target-*/
+/dist/
+__pycache__/
+*.pyc
+# The archive fixtures are test inputs, not build output.
+!tests/fixtures/*.zip

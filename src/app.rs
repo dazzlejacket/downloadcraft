@@ -7,10 +7,18 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(windows)]
+type PlatformTray = tray_icon::TrayIcon;
+#[cfg(not(windows))]
+type PlatformTray = ();
+
 // ---------- theme ----------
 /// Unified geometry: every card, modal, field, and button across ALL
 /// windows (main, Add-download dialog, progress) uses this radius.
 pub const RADIUS: f32 = 10.0;
+
+/// Unified title bar height (`main_window_titlebar.html` `.title-bar`).
+pub const TB_H: f32 = 46.0;
 
 /// Every hand-painted surface reads its colours from the ACTIVE palette
 /// (`pl()`) instead of a hard-coded constant, so a theme switch repaints the
@@ -395,7 +403,6 @@ pub fn apply_widget_theme(ctx: &egui::Context) {
 
 // ---------- Material Icons codepoints (font bundled under assets/fonts) ----------
 pub(crate) const MI_SEARCH: &str = "\u{e8b6}";
-pub(crate) const MI_ADD_LINK: &str = "\u{e178}";
 pub(crate) const MI_PLAY: &str = "\u{e037}";
 pub(crate) const MI_STOP: &str = "\u{e047}";
 pub(crate) const MI_IMAGE: &str = "\u{e3f4}";
@@ -455,7 +462,7 @@ pub fn setup_fonts(cc: &eframe::CreationContext<'_>) {
 fn file_icon(cat: &str) -> &'static str {
     match cat {
         "Image" => MI_IMAGE,
-        "Music" => MI_MUSIC,
+        "Audio" => MI_MUSIC,
         "Video" => MI_SLIDESHOW,
         "Apps" => MI_GRID,
         "Document" => MI_DOC,
@@ -466,25 +473,17 @@ fn file_icon(cat: &str) -> &'static str {
 
 /// Per-category tint for the list's name-cell marks, taken from the concept
 /// (`main_window.html`): blue video, amber archive, green picture, purple
-/// music, red document, cyan app. Light enough to read on both themes.
+/// audio, red document, cyan app. Light enough to read on both themes.
 fn cat_color(cat: &str) -> egui::Color32 {
     match cat {
         "Video" => egui::Color32::from_rgb(0x3b, 0x82, 0xf6),
         "Compressed" => egui::Color32::from_rgb(0xf5, 0x9e, 0x0b),
         "Image" => egui::Color32::from_rgb(0x22, 0xc5, 0x5e),
-        "Music" => egui::Color32::from_rgb(0xa8, 0x55, 0xf7),
+        "Audio" => egui::Color32::from_rgb(0xa8, 0x55, 0xf7),
         "Document" => egui::Color32::from_rgb(0xef, 0x44, 0x44),
         "Apps" => egui::Color32::from_rgb(0x06, 0xb6, 0xd4),
         _ => pl().dm_dim,
     }
-}
-
-fn mi(ui: &mut egui::Ui, glyph: &str, size: f32, color: egui::Color32) {
-    // Hover-only on purpose: icon glyphs must never steal row clicks.
-    ui.add(
-        egui::Label::new(egui::RichText::new(glyph).color(color).font(crate::fonts::icon(size)))
-            .sense(egui::Sense::hover()),
-    );
 }
 
 /// Standard modal dialog frame (dark card, 1px border, rounded).
@@ -520,6 +519,46 @@ fn dm_icon_btn(
     color: egui::Color32,
 ) {
     crate::dm::icon_btn(p, rect, man.hover(&rect), icon, size, w, color);
+}
+
+/// The concept's small upper-case field label, painted above a field.
+///
+/// The concept itself uses placeholders instead of labels, but a panel with
+/// several fields has to say what each one is.
+fn dm_field_label(ui: &mut egui::Ui, text: &str) {
+    let (r, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 13.0),
+        egui::Sense::hover(),
+    );
+    crate::dm::micro_label(ui.painter(), egui::pos2(r.min.x, r.center().y), text);
+}
+
+/// One line of small text in the concept's own muted grey.
+fn dm_note(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32) {
+    let (r, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), size + 4.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().text(
+        egui::pos2(r.min.x, r.center().y),
+        egui::Align2::LEFT_CENTER,
+        text.to_string(),
+        crate::fonts::reg(size),
+        color,
+    );
+}
+
+/// Icon button on the field surface (same fill/border as an input box).
+fn dm_icon_btn_box(
+    p: &egui::Painter,
+    man: &ManState,
+    rect: egui::Rect,
+    icon: DmIcon,
+    size: f32,
+    w: f32,
+    color: egui::Color32,
+) {
+    crate::dm::icon_btn_box(p, rect, man.hover(&rect), icon, size, w, color);
 }
 
 /// Outline button (concept "Add" / "Cancel").
@@ -786,15 +825,28 @@ enum ButtonId {
     DMove,
     DVerify,
     AbClose,
-    TAdd,
-    TDismiss,
     ThemeSystem,
     ThemeDark,
     ThemeLight,
-    GrabStart,
-    GrabQueue,
+    GrabStart,    GrabQueue,
     GrabClose,
     GrabPreset,
+    /// Archive extraction panel.
+    ExtractStart,
+    ExtractClose,
+    /// Debrid panel (cloud providers).
+    DebridProvider,
+    DebridValidate,
+    /// A magnet pasted into the Add dialog: hand it to the cloud panel.
+    AddToCloud,
+    DebridSubmit,
+    DebridTorrentFile,
+    DebridRefresh,
+    DebridSelectAll,
+    DebridSelectNone,
+    DebridQueue,
+    DebridCancel,
+    DebridClose,
     RuleAdd,
     RuleDel(usize),
     RuleUp(usize),
@@ -804,6 +856,60 @@ enum ButtonId {
     WinDel(usize),
     UpdCheck,
     UpdDownload,
+}
+
+/// A one-line, safe message for the cloud panel.
+///
+/// The provider errors never carry the request address (the token travels
+/// in the `Authorization` header, not in the URL), so the text can be
+/// shown to the user as it is.
+fn debrid_error_text(e: &anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
+/// What the provider's cache state means for the user.
+fn cache_hint(state: crate::debrid::CacheState) -> &'static str {
+    match state {
+        crate::debrid::CacheState::Cached => "the provider already has it, it will be ready at once",
+        crate::debrid::CacheState::Partial => "the provider holds only part of it",
+        crate::debrid::CacheState::Uncached => "the provider has to fetch it first",
+        crate::debrid::CacheState::Unknown => "the provider did not say",
+    }
+}
+
+/// The provider's link expiry as a local time, when it is known.
+///
+/// The provider's links are temporary: the user is told when the address
+/// they queued stops working.
+fn link_expiry_text(at: Option<u64>) -> String {
+    let Some(at) = at else {
+        return String::new();
+    };
+    match chrono::DateTime::from_timestamp(at as i64, 0) {
+        Some(t) => format!(
+            " The link expires at {}.",
+            t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+        ),
+        None => String::new(),
+    }
+}
+
+/// The queue row settings for one cloud file.
+///
+/// The provider's own connection limit wins over the app default, so a
+/// row never opens more sockets to the provider than the provider allows.
+/// A size the provider did not report stays unknown, exactly as it does
+/// for every other capture.
+fn cloud_row_settings(
+    target: &crate::debrid::QueueTarget,
+    default_conns: usize,
+) -> (usize, Option<u64>) {
+    let conns = match target.connections {
+        Some(n) => n.clamp(1, 16),
+        None => default_conns.clamp(1, 16),
+    };
+    let size = if target.size > 0 { Some(target.size) } else { None };
+    (conns, size)
 }
 
 /// Checkbox identity for manual routing.
@@ -817,6 +923,27 @@ enum CheckId {
     GrabDepth,
     WinOn,
     UpdOn,
+    /// One cloud file in the debrid panel.
+    DebridFile(u64),
+}
+
+/// What a finished cloud-provider task reports back to the UI.
+///
+/// The provider client owns the token, so it travels inside the session
+/// and never through a download row or a saved file.
+enum DebridOutcome {
+    /// The token was accepted; this is the account behind it.
+    Account(crate::debrid::Account),
+    /// The provider task and the files it reported.
+    Session(crate::debrid::CloudSession),
+    /// The direct links of the picked files, with the session they came
+    /// from, so the panel stays usable afterwards.
+    Targets(Vec<crate::debrid::QueueTarget>, crate::debrid::CloudSession),
+    /// The provider task was deleted.
+    Cancelled,
+    /// The task failed. The message is safe to show. A session that still
+    /// exists comes back with it, so the panel keeps its state.
+    Failed(String, Option<crate::debrid::CloudSession>),
 }
 
 /// Slider identity for manual routing (values live in self fields/items).
@@ -1043,11 +1170,20 @@ fn mtext(
 ///
 /// The manager's search sits in its own rounded pill, so the field must not
 /// draw a second inner box (that read as "a box inside the search box").
-fn mtext_bare(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, width: f32) -> egui::Rect {
+fn mtext_bare(
+    ui: &mut egui::Ui,
+    id: &str,
+    text: &mut String,
+    hint: &str,
+    width: f32,
+    font: egui::FontId,
+) -> egui::Rect {
     let te = egui::TextEdit::singleline(text)
         .id(egui::Id::new(id))
         .hint_text(hint)
         .desired_width(width)
+        .font(font)
+        .margin(egui::Margin::ZERO)
         .frame(false);
     ui.add(te).rect
 }
@@ -1061,51 +1197,24 @@ fn mtext_bare(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, width:
 
 /// Concept width (`file_properties.html` `.dialog { width: 480px }`).
 const DP_W: f32 = 480.0;
-const DP_LABEL_W: f32 = 70.0;
+/// Label column of the redesigned `.row`s (mock `grid-template-columns: 76px`).
+const DP_ROW_LABEL: f32 = 76.0;
 const DP_ROW_H: f32 = 16.0;
 
-/// Right-aligned 70 px field label: 10 px, muted (mock `.field-label`).
-fn dp_label(ui: &mut egui::Ui, text: &str) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(DP_LABEL_W, DP_ROW_H),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            ui.add(egui::Label::new(
-                egui::RichText::new(text)
-                    .font(crate::fonts::reg(10.0))
-                    .color(pl().dim),
-            ));
-        },
-    );
-}
-
-/// One clipped value cell (mock `.field-value`).
+/// One clipped value cell (mock `.field-value`). Always occupies exactly
+/// `width`, so every row can line up on one right edge.
 fn dp_value(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32, width: f32) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width.max(24.0), DP_ROW_H),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(text)
-                        .font(crate::fonts::reg(size))
-                        .color(color),
-                )
-                .truncate(),
-            );
-        },
-    );
-}
-
-/// 1 px divider (mock `.divider`).
-fn dp_rule(ui: &mut egui::Ui) {
-    let (r, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 1.0),
-        egui::Sense::hover(),
-    );
-    ui.painter().line_segment(
-        [r.left_center(), r.right_center()],
-        egui::Stroke::new(1.0, pl().modal_bd),
+    let w = width.max(24.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, DP_ROW_H), egui::Sense::hover());
+    let p = ui.painter();
+    let font = crate::fonts::reg(size);
+    let shown = truncate_to_width(p, text, font.clone(), color, w);
+    p.text(
+        egui::pos2(rect.min.x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        shown,
+        font,
+        color,
     );
 }
 
@@ -1186,6 +1295,9 @@ fn dp_input(
     password: bool,
     underline: bool,
 ) -> egui::Rect {
+    // `desired_width` is the inner text width; the frame margin sits outside
+    // it, so subtract it to make the *outer* rect exactly `width` wide.
+    let inset_x = if underline { 0.0 } else { 16.0 };
     let rect = ui
         .scope(|ui| {
             let v = ui.visuals_mut();
@@ -1218,7 +1330,7 @@ fn dp_input(
                     if underline { 0 } else { 8 },
                     if underline { 2 } else { 3 },
                 ))
-                .desired_width(width);
+                .desired_width((width - inset_x).max(24.0));
             if underline {
                 te = te.frame(false);
             }
@@ -1237,19 +1349,42 @@ fn dp_input(
     rect
 }
 
-/// Mock `.auth-label`: 46 px, right-aligned, 10 px muted.
-fn dp_auth_label(ui: &mut egui::Ui, text: &str) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(46.0, 18.0),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            ui.add(egui::Label::new(
-                egui::RichText::new(text)
-                    .font(crate::fonts::reg(10.0))
-                    .color(pl().dim),
-            ));
-        },
+/// 76 px left-aligned label column of the redesigned rows (mock `.row-label`).
+fn dp_lbl(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(DP_ROW_LABEL, DP_ROW_H), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.min.x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        crate::fonts::reg(10.5),
+        pl().dim,
     );
+}
+
+/// Hairline divider in an explicit tone (the redesigned card's `--border-soft`).
+fn dp_rule_soft(ui: &mut egui::Ui, color: egui::Color32) {
+    let (r, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 1.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().line_segment(
+        [r.left_center(), r.right_center()],
+        egui::Stroke::new(1.0, color),
+    );
+}
+
+/// A byte count with thousands separators, like the mock's "76,833,799".
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in b.iter().enumerate() {
+        if i > 0 && (b.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*ch as char);
+    }
+    out
 }
 
 /// "MP4 Video File", "ZIP Archive", ... for the mock's Type row.
@@ -1261,7 +1396,7 @@ fn dp_type_label(filename: &str) -> String {
         .to_ascii_uppercase();
     let kind = match crate::model::category_of(filename) {
         "Image" => "Image File",
-        "Music" => "Audio File",
+        "Audio" => "Audio File",
         "Video" => "Video File",
         "Document" => "Document",
         "Compressed" => "Archive",
@@ -1361,7 +1496,7 @@ fn cell_text(
 /// Widths come from `shaped` so the measurement matches what is drawn for the
 /// scripts egui cannot shape itself, and the cut lands on grapheme boundaries:
 /// slicing a Bengali consonant away from its matra leaves a dangling mark.
-fn truncate_to_width(
+pub(crate) fn truncate_to_width(
     p: &egui::Painter,
     text: &str,
     font: egui::FontId,
@@ -1448,10 +1583,65 @@ fn col_w_of(map: &std::collections::HashMap<SortCol, f32>, c: SortCol) -> f32 {
     map.get(&c).copied().unwrap_or(col_default(c))
 }
 
+/// The columns the table shows: the order, minus the hidden ones.
+///
+/// Name is the anchor of the table and is always there.
+fn visible_cols(order: &[SortCol], hidden: &[SortCol]) -> Vec<SortCol> {
+    order
+        .iter()
+        .copied()
+        .filter(|c| *c == SortCol::Name || !hidden.contains(c))
+        .collect()
+}
+
+/// Turn a column off, or back on.
+///
+/// The Name column is the anchor of the table and is never hidden.
+fn toggle_hidden_col(hidden: &mut Vec<SortCol>, col: SortCol) {
+    if col == SortCol::Name {
+        return;
+    }
+    match hidden.iter().position(|c| *c == col) {
+        Some(pos) => {
+            hidden.remove(pos);
+        }
+        None => hidden.push(col),
+    }
+}
+
+/// New widths while the divider between `left` and `right` is dragged by
+/// `dx`: the divider follows the pointer, so one side grows by what the other
+/// loses. Name takes whatever room the others leave, so its own width is
+/// never stored - only its neighbour changes.
+fn divider_widths(left: SortCol, right: SortCol, start_l: f32, start_r: f32, dx: f32) -> Vec<(SortCol, f32)> {
+    const MAX: f32 = 900.0;
+    if left == SortCol::Name {
+        return vec![(right, (start_r - dx).clamp(col_min(right), MAX))];
+    }
+    if right == SortCol::Name {
+        return vec![(left, (start_l + dx).clamp(col_min(left), MAX))];
+    }
+    // Both fixed: the move is limited by whichever side hits its minimum.
+    let dx = dx.clamp(col_min(left) - start_l, start_r - col_min(right));
+    vec![(left, start_l + dx), (right, start_r - dx)]
+}
+
 /// Uniform toolbar metrics: every action button shares one height.
 const TOOL_H: f32 = 46.0;
 /// Gap between toolbar buttons (`.toolbar { gap: 4px }`).
 const TOOL_GAP: f32 = 4.0;
+
+/// A thin rule between two groups of toolbar buttons.
+///
+/// IDM separates its toolbar into groups. Ten identical buttons in one row
+/// are hard to scan, and the destructive ones ended up next to Settings.
+fn tool_group_sep(ui: &mut egui::Ui) {
+    ui.add_space(10.0);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, TOOL_H), egui::Sense::hover());
+    let line = egui::Rect::from_center_size(r.center(), egui::vec2(1.0, 22.0));
+    ui.painter().rect_filled(line, 0.0, pl().card_bd);
+    ui.add_space(10.0);
+}
 
 /// Toolbar button: icon above label, content-sized width, uniform height.
 /// Manual-input version: reserves space, paints (hover from caller),
@@ -1463,6 +1653,10 @@ const TOOL_GAP: f32 = 4.0;
 ///
 /// The only fill a button ever carries is the hover wash — no action is
 /// pre-highlighted, so nothing reads as permanently selected.
+///
+/// `tips` says whether the hover text may be shown. It is off while a
+/// modal is open: egui paints tooltips above every window, so a leftover
+/// tooltip would land on top of the dialog.
 fn tool_button(
     ui: &mut egui::Ui,
     man: &ManState,
@@ -1470,6 +1664,7 @@ fn tool_button(
     label: &str,
     enabled: bool,
     tip: &str,
+    tips: bool,
 ) -> egui::Rect {
     let label_w = ui
         .painter()
@@ -1501,7 +1696,7 @@ fn tool_button(
         egui::FontId::proportional(11.0),
         c,
     );
-    if enabled && !tip.is_empty() && hov {
+    if enabled && !tip.is_empty() && hov && tips {
         egui::Tooltip::always_open(
             ui.ctx().clone(),
             ui.layer_id(),
@@ -1517,9 +1712,71 @@ fn tool_button(
 }
 
 /// Add-URL button: the same metrics and the same hover-only wash as the other
-/// toolbar buttons — nothing is pre-highlighted.
-fn add_url_button(ui: &mut egui::Ui, man: &ManState) -> egui::Rect {
-    tool_button(ui, man, MI_ADD, "Add URL", true, "Add a download by URL")
+/// toolbar buttons. When a download link is sitting on the clipboard it lights
+/// up in the accent colour (a soft breathing tint) so the user knows where to
+/// click, instead of a banner pushing the list down.
+fn add_url_button(ui: &mut egui::Ui, man: &ManState, hot: bool, tips: bool) -> egui::Rect {
+    if !hot {
+        return tool_button(ui, man, MI_ADD, "Add URL", true, "Add a download by URL", tips);
+    }
+    let label = "Add URL";
+    let label_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), egui::FontId::proportional(11.0), pl().txt)
+        .size()
+        .x;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2((label_w + 16.0).max(56.0), TOOL_H),
+        egui::Sense::hover(),
+    );
+    let hov = man.hover(&rect);
+    // Breathing accent: enough motion to catch the eye, no layout shift.
+    let t = ui.input(|i| i.time) as f32;
+    let pulse = 0.5 + 0.5 * (t * 2.6).sin();
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(70));
+    let p = ui.painter();
+    p.rect_filled(
+        rect,
+        6.0,
+        mix(pl().surface, pl().primary, if hov { 0.30 } else { 0.13 + 0.07 * pulse }),
+    );
+    p.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(
+            1.2_f32,
+            mix(pl().primary, pl().surface_lt, 0.15 + 0.25 * pulse),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    p.text(
+        egui::pos2(rect.center().x, rect.min.y + TOOL_H * 0.34),
+        egui::Align2::CENTER_CENTER,
+        MI_ADD.to_string(),
+        crate::fonts::icon(16.0),
+        pl().primary,
+    );
+    p.text(
+        egui::pos2(rect.center().x, rect.min.y + TOOL_H * 0.72),
+        egui::Align2::CENTER_CENTER,
+        label.to_string(),
+        egui::FontId::proportional(11.0),
+        pl().primary,
+    );
+    if hov && tips {
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            ui.id().with("toolbar_tip_add_url_hot"),
+            egui::PopupAnchor::Pointer,
+        )
+        .gap(12.0)
+        .show(|ui| {
+            ui.label("The clipboard has a download link — click to paste it");
+        });
+    }
+    rect
 }
 
 fn status_bar_w(ui: &mut egui::Ui, w: f32, frac: f32, c0: egui::Color32, c1: egui::Color32) {
@@ -1563,7 +1820,7 @@ struct ActiveTask {
     last_bytes: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SortCol {
     Name,
     Size,
@@ -1574,6 +1831,16 @@ enum SortCol {
 }
 
 impl SortCol {
+    /// Every column, in the order the Columns menu lists them.
+    const ALL: [SortCol; 6] = [
+        SortCol::Name,
+        SortCol::Size,
+        SortCol::Status,
+        SortCol::Speed,
+        SortCol::Eta,
+        SortCol::Date,
+    ];
+
     fn key(&self) -> &'static str {
         match self {
             SortCol::Name => "name",
@@ -1616,6 +1883,8 @@ enum ToolId {
     Queues,
     Settings,
     Grabber,
+    /// Toolbar "Debrid": cloud providers (Real-Debrid, TorBox).
+    Debrid,
     /// Toolbar "Resume": resume the checked rows (all paused when none).
     ResumeSel,
     /// Toolbar "Stop": pause the checked rows (all active when none).
@@ -1639,22 +1908,35 @@ enum HitKind {
     Row(u64),
     HdrCol(SortCol),
     HdrCheck,
-    ResizeCol(SortCol),
+    /// The divider between a column and its right neighbour.
+    ResizeCol(SortCol, SortCol),
     CtxItem(RowAct, u64),
     Btn(ButtonId),
     Check(CheckId),
     Slider(SliderId, f64, f64, bool), // id, min, max, log
     Field(&'static str),
     ComboAnchor,
+    /// A provider row in the cloud-provider dropdown: the index into
+    /// `Provider::ALL`.
+    DebridProviderRow(usize),
+    /// A row of the Columns menu: an index into `SortCol::ALL`, or one of
+    /// the two reset actions.
+    ColMenuItem(u8),
+    /// Queue v2 reorder: (item id, -1 up / +1 down).
+    QMove(u64, i32),
 }
 
 /// Active manual divider drag: table column resize (window edges are the
 /// OS's job now that the app uses native decorations).
+#[derive(Clone, Copy)]
 enum ResizeCap {
+    /// Dragging the divider between `col` and its right neighbour `right`.
     Col {
         col: SortCol,
+        right: SortCol,
         start_x: f32,
         start_w: f32,
+        start_right: f32,
     },
 }
 
@@ -1670,6 +1952,231 @@ enum RowAct {
     CopyUrl,
     Details,
     VerifyChecksum,
+    /// Unpack a finished ZIP / RAR / 7z archive.
+    ExtractArchive,
+}
+
+/// What an extraction reports back to the window.
+enum ExtractUpdate {
+    /// How far it got.
+    Progress { done: u64, total: u64 },
+    /// It is over; this is the message the user reads.
+    Done(String),
+}
+
+/// Where the files of an archive go, according to the settings.
+///
+/// "same" puts them next to the archive, "subfolder" into a folder named
+/// after it and "custom" into the folder the user picked.
+fn extract_destination(archive: &std::path::Path) -> Option<std::path::PathBuf> {
+    match crate::model::ui_pref_str("extract_target", "subfolder").as_str() {
+        "same" => archive.parent().map(|p| p.to_path_buf()),
+        "custom" => {
+            let dir = crate::model::ui_pref_str("extract_custom_dir", "");
+            if dir.trim().is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(dir))
+            }
+        }
+        _ => {
+            let stem = archive.file_stem()?;
+            let parent = archive.parent().unwrap_or_else(|| std::path::Path::new("."));
+            Some(parent.join(stem))
+        }
+    }
+}
+
+/// Unpack an archive on a worker thread and describe what happened.
+///
+/// The password is used here and dropped: it never reaches the queue, the
+/// settings or the log. The archive is only removed after everything landed.
+fn extract_worker(
+    archive: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    password: Option<String>,
+    keep_original: bool,
+    tx: std::sync::mpsc::Sender<ExtractUpdate>,
+) {
+    let opts = crate::archive::ExtractOptions {
+        dest,
+        password,
+        overwrite: false,
+        ..Default::default()
+    };
+    let mut progress = |p: crate::archive::ExtractProgress| {
+        let _ = tx.send(ExtractUpdate::Progress {
+            done: p.done,
+            total: p.total,
+        });
+        true
+    };
+    let message = match crate::archive::extract(&archive, &opts, &mut progress) {
+        Ok(out) => {
+            if out.cancelled {
+                format!("Extraction of {} was cancelled.", archive.display())
+            } else {
+                let name = archive
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mut msg = format!(
+                    "Extracted {} file(s) ({}) from {}.",
+                    out.files,
+                    crate::model::format_bytes(out.bytes),
+                    name
+                );
+                if out.skipped > 0 {
+                    msg.push_str(&format!(" {} file(s) were already there.", out.skipped));
+                }
+                if out.refused > 0 {
+                    msg.push_str(&format!(
+                        " {} entry(ies) were refused for safety.",
+                        out.refused
+                    ));
+                }
+                if !keep_original {
+                    // Only now that everything landed does the archive go.
+                    match std::fs::remove_file(&archive) {
+                        Ok(()) => msg.push_str(" The archive was removed."),
+                        Err(e) => {
+                            msg.push_str(&format!(" The archive could not be removed: {e}"))
+                        }
+                    }
+                }
+                msg
+            }
+        }
+        Err(crate::archive::ExtractError::NeedsPassword) => {
+            "This archive needs a password. Type it below and press Extract again.".into()
+        }
+        Err(e) => format!("Extraction failed: {e}"),
+    };
+    let _ = tx.send(ExtractUpdate::Done(message));
+}
+
+/// The provider control: a LIST of the five providers, not a cycle.
+///
+/// The button opens the list and the list does the choosing. Clicking the
+/// provider that is already chosen picks that same provider again - it
+/// never moves on to the next one.
+///
+/// The list is a popup, and the app closes every open popup when the user
+/// clicks anywhere else. The click that OPENS the list therefore has to be
+/// recognised as a popup click: treated as an ordinary click, the list is
+/// closed again in the very same frame, the user never sees it, and the
+/// provider can never be changed.
+///
+/// The whole interaction lives here, away from the painting, so a test can
+/// drive it exactly the way the mouse and the keyboard do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPicker {
+    /// Which provider is chosen, as an index into `Provider::ALL`.
+    index: usize,
+    /// Is the list open?
+    open: bool,
+    /// The row the keyboard is on.
+    highlight: usize,
+}
+
+impl Default for ProviderPicker {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            open: false,
+            highlight: 0,
+        }
+    }
+}
+
+impl ProviderPicker {
+    /// The provider that is chosen.
+    pub fn provider(&self) -> crate::debrid::Provider {
+        crate::debrid::Provider::from_index(self.index)
+    }
+
+    /// The chosen provider's index.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Is the list open?
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The row the keyboard is on.
+    pub fn highlight(&self) -> usize {
+        self.highlight
+    }
+
+    /// Point the picker at a provider, without opening the list.
+    ///
+    /// An index outside the list is wrapped, so a stale value can never
+    /// point the panel at nothing.
+    pub fn select(&mut self, index: usize) {
+        let n = crate::debrid::Provider::ALL.len();
+        if n == 0 {
+            return;
+        }
+        self.index = index % n;
+        self.highlight = self.index;
+    }
+
+    /// The anchor was clicked: open the list, or close it if it was open.
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+        self.highlight = self.index;
+    }
+
+    /// A row of the list was clicked: choose it and close the list.
+    ///
+    /// Choosing the provider that was already chosen keeps that provider:
+    /// a list never moves on to the next one by itself.
+    pub fn choose(&mut self, row: usize) {
+        self.select(row);
+        self.open = false;
+    }
+
+    /// The keyboard moved inside the open list.
+    pub fn move_highlight(&mut self, delta: isize) {
+        let n = crate::debrid::Provider::ALL.len() as isize;
+        if n <= 0 || !self.open {
+            return;
+        }
+        let cur = self.highlight as isize;
+        self.highlight = ((cur + delta).rem_euclid(n)) as usize;
+    }
+
+    /// Enter picks the highlighted row.
+    pub fn accept(&mut self) {
+        if self.open {
+            self.choose(self.highlight);
+        }
+    }
+
+    /// Escape closes the list without choosing anything.
+    pub fn dismiss(&mut self) {
+        self.open = false;
+    }
+}
+
+/// Does a click on this button open one of the app's popups?
+///
+/// The app closes every open popup when the user clicks anywhere else. A
+/// click that OPENS a popup is not "anywhere else": the provider list is
+/// opened by a button, and if that click counted as an ordinary click the
+/// list would be closed again in the very same frame - the user would
+/// never see it, and the provider could never be changed.
+fn button_opens_popup(b: ButtonId) -> bool {
+    matches!(b, ButtonId::DebridProvider)
+}
+
+/// The end-of-frame rule for the app's open popups.
+///
+/// A click closes them - unless the click belonged to a popup of its own.
+fn close_popups_after_click(clicked: bool, popup_click: bool) -> bool {
+    clicked && !popup_click
 }
 
 pub struct CraftApp {
@@ -1695,7 +2202,10 @@ pub struct CraftApp {
     scheduler_time: String,
     scheduler_started: bool,
     clipboard_rx: std::sync::mpsc::Receiver<String>,
-    clipboard_toast: Option<String>,
+    /// A download link found on the clipboard that is not in the list yet.
+    /// It is not shown as a banner (that pushed the list down); instead the
+    /// toolbar's Add URL button lights up and clicking it pastes this.
+    clipboard_url: Option<String>,
     browser_msg: String,
     pending_browser_install: Option<String>,
     /// mtime of ui.json at our last load/save — a newer stamp means the
@@ -1709,13 +2219,26 @@ pub struct CraftApp {
     known_ids: std::collections::HashSet<u64>,
     col_order: Vec<SortCol>,
     col_w: std::collections::HashMap<SortCol, f32>,
+    /// The columns the user has turned off.
+    ///
+    /// The Name column is the anchor of the table and is always there; the
+    /// rest can be hidden from the header's right-click menu.
+    col_hidden: Vec<SortCol>,
+    /// Where the Columns menu was opened, when it is open.
+    col_menu: Option<egui::Pos2>,
     // ---- power features ----
     max_concurrent: usize,
+    /// Cap on simultaneous connections per host across every download
+    /// (0 = no extra cap). Loaded from ui.json so Settings can change it.
+    per_host_conns: usize,
     /// Pop the standalone "Download complete" dialog when a download finishes.
     /// Its own "Don't show this dialog again" checkbox clears this.
     show_complete: bool,
     queue_running: bool,
     had_active: bool,
+    /// Bring the window to the front once (a dialog asked for a row to be
+    /// pointed at).
+    raise_once: bool,
     timeout_secs: u64,
     max_retries: u32,
     user_agent: String,
@@ -1729,7 +2252,10 @@ pub struct CraftApp {
     /// The main window is moved into the middle of the work area once, on the
     /// first frame where egui knows the screen geometry.
     placement_done: bool,
-    tray: Option<tray_icon::TrayIcon>,
+    /// Last press on the title bar (when, where): a second one inside 420 ms
+    /// and 24 px is the OS's missing "double-click the caption" gesture.
+    tb_press: Option<(std::time::Instant, egui::Pos2)>,
+    tray: Option<PlatformTray>,
     details_id: Option<u64>,
     probing: bool,
     probe_size: Option<u64>,
@@ -1740,6 +2266,21 @@ pub struct CraftApp {
     add_checksum: String,
     add_overwrite: bool,
     verify_jobs: Vec<(u64, std::sync::mpsc::Receiver<anyhow::Result<String>>)>,
+    // ---- Archive extraction ----
+    /// The extraction panel is open.
+    show_extract: bool,
+    /// The queue row being unpacked.
+    extract_id: u64,
+    /// The archive that is being unpacked.
+    extract_path: String,
+    /// The password the user typed. It lives in memory for this one
+    /// extraction and is never written anywhere.
+    extract_password: String,
+    /// What the last extraction said.
+    extract_notice: String,
+    /// An extraction is running.
+    extract_busy: bool,
+    extract_rx: Option<std::sync::mpsc::Receiver<ExtractUpdate>>,
     // ---- P3: site grabber ----
     show_grabber: bool,
     grab_url: String,
@@ -1750,6 +2291,29 @@ pub struct CraftApp {
     grab_results: Vec<crate::grabber::GrabLink>,
     grab_notice: String,
     grab_rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::grabber::GrabLink>, String>>>,
+    // ---- cloud providers (debrid) ----
+    show_debrid: bool,
+    /// The provider dropdown: which provider is chosen, whether the list is
+    /// open and which row the keyboard is on.
+    ///
+    /// The NAME is persisted in the settings file; a token never is.
+    debrid_picker: ProviderPicker,
+    /// The API token of every provider, kept apart.
+    ///
+    /// They live in memory only: the store has no serialized form, so a
+    /// token is never written to a settings file, a queue file or a
+    /// download row. One token per provider is what keeps one provider's
+    /// token from being shown - or sent - under another provider's name.
+    debrid_tokens: crate::debrid::TokenStore,
+    /// The magnet link or hosting URL to submit.
+    debrid_input: String,
+    /// The hosting password, when the host needs one.
+    debrid_password: String,
+    debrid_notice: String,
+    debrid_busy: bool,
+    debrid_account: Option<crate::debrid::Account>,
+    debrid_session: Option<crate::debrid::CloudSession>,
+    debrid_rx: Option<std::sync::mpsc::Receiver<DebridOutcome>>,
     // ---- P3: folder rules + rename templates ----
     folder_rules: Vec<crate::model::FolderRule>,
     rename_template: String,
@@ -1760,9 +2324,12 @@ pub struct CraftApp {
     update_check_on: bool,
     update_status: String,
     update_busy: bool,
-    update_rx: Option<std::sync::mpsc::Receiver<(String, Option<String>)>>,
+    update_rx: Option<std::sync::mpsc::Receiver<(String, Option<String>, bool)>>,
     /// Portable-update asset URL from the last check (P5), if any.
     update_asset: Option<String>,
+    /// A newer release exists: only then does the title bar show its update
+    /// chip. (An asset URL can be missing while an update still exists.)
+    update_found: bool,
     update_auto_done: bool,
     // ---- P5: per-download speed history (EWMA input + Details graph) ----
     // Last ≤60 half-second samples per download id, pruned with tasks.
@@ -1787,17 +2354,30 @@ pub struct CraftApp {
     drop_menu: Option<u8>,
     finish_open: bool,
     resize_cap: Option<ResizeCap>,
+    /// The press that is down (or just released) began on a column divider:
+    /// its release must not also count as a click that sorts the column.
+    col_drag_used: bool,
     slider_cap: Option<SliderCap>,
     // Add-dialog advanced fields (kept on self so manual buttons in
     // process_hits can commit without dialog locals).
     add_referer: String,
     add_cookie: String,
+    /// The browser's own User-Agent from the capture, if it sent one.
+    add_user_agent: String,
+    /// Captured request headers of the browser capture being added (not
+    /// editable; consumed by the next commit).
+    add_headers: std::collections::BTreeMap<String, String>,
+    /// Details dialog "Start at" text while it is being typed, per row id:
+    /// only a complete HH:MM is saved to the row, so reloading the field
+    /// from the row every frame threw away each keystroke of "02:30".
+    det_start_draft: (u64, String),
     add_user: String,
     add_pass: String,
     /// Preferred quality from the extension menu (used by the size probe so
     /// the Add dialog can show the chosen stream's size, and honored by the
     /// engine at download time).
     add_quality: String,
+    captured_media: HashMap<String, (u64, bool)>,
     // Details-dialog checksum staging (validated live; see Details tab).
     det_sum: String,
     det_for: Option<u64>,
@@ -1816,7 +2396,7 @@ impl CraftApp {
     pub fn new(rt: Arc<tokio::runtime::Runtime>) -> Self {
         let dl_dir = dirs::download_dir()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "C:\\Downloads".to_string());
+            .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || clipboard_watch(tx));
         let mut app = Self {
@@ -1836,13 +2416,16 @@ impl CraftApp {
             add_dir: dl_dir,
             add_file: String::new(),
             add_conns: 8,
-            connections_default: 8,
+            // 12 parallel ranges per file out of the box: the modern
+            // equivalent of IDM's 8 against today's fatter pipes, while the
+            // fragile-CDN detector still collapses those hosts to one stream.
+            connections_default: 12,
             speed_limit_kbps: 0,
             scheduler_enabled: false,
             scheduler_time: "02:00".to_string(),
             scheduler_started: false,
             clipboard_rx: rx,
-            clipboard_toast: None,
+            clipboard_url: None,
             browser_msg: String::new(),
             pending_browser_install: None,
             last_ui_mtime: std::cell::Cell::new(None),
@@ -1858,23 +2441,28 @@ impl CraftApp {
                 SortCol::Date,
             ],
             col_w: Default::default(),
+            col_hidden: Vec::new(),
+            col_menu: None,
             max_concurrent: 3,
+        per_host_conns: 0,
             show_complete: true,
             queue_running: false,
             had_active: false,
+            raise_once: false,
             timeout_secs: 60,
             max_retries: 5,
-            user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36".to_string(),
+            user_agent: crate::platform::default_user_agent().to_string(),
             proxy_url: String::new(),
             antivirus_cmd: String::new(),
             finish_action: "nothing".to_string(),
             category_folders: true,
             // Closing the window tucks the app into the tray (IDM-style); the
             // tray's Exit is how you quit. The Tasks menu switches it off.
-            close_to_tray: true,
+            close_to_tray: cfg!(windows),
             theme: "dark".to_string(),
             theme_applied: String::new(),
             placement_done: false,
+            tb_press: None,
             tray: None,
             details_id: None,
             probing: false,
@@ -1886,7 +2474,13 @@ impl CraftApp {
             add_checksum: String::new(),
             add_overwrite: false,
             verify_jobs: Vec::new(),
-            show_grabber: false,
+            show_extract: false,
+            extract_id: 0,
+            extract_path: String::new(),
+            extract_password: String::new(),
+            extract_notice: String::new(),
+            extract_busy: false,
+            extract_rx: None,            show_grabber: false,
             grab_url: String::new(),
             grab_preset: 0,
             grab_exts: crate::grabber::preset_exts("Mixed"),
@@ -1895,6 +2489,16 @@ impl CraftApp {
             grab_results: Vec::new(),
             grab_notice: String::new(),
             grab_rx: None,
+            show_debrid: false,
+            debrid_picker: ProviderPicker::default(),
+            debrid_tokens: crate::debrid::TokenStore::default(),
+            debrid_input: String::new(),
+            debrid_password: String::new(),
+            debrid_notice: String::new(),
+            debrid_busy: false,
+            debrid_account: None,
+            debrid_session: None,
+            debrid_rx: None,
             folder_rules: crate::model::default_folder_rules(),
             rename_template: "{name}".to_string(),
             speed_windows: vec![crate::model::SpeedWindow {
@@ -1904,11 +2508,12 @@ impl CraftApp {
             }],
             speed_windows_on: false,
             speed_limit_live: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-            update_check_on: false,
+            update_check_on: true,
             update_status: String::new(),
             update_busy: false,
             update_rx: None,
             update_asset: None,
+            update_found: false,
             update_auto_done: false,
             speed_hist: std::collections::HashMap::new(),
             phases: std::collections::HashMap::new(),
@@ -1925,12 +2530,17 @@ impl CraftApp {
             drop_menu: None,
             finish_open: false,
             resize_cap: None,
+            col_drag_used: false,
             slider_cap: None,
             add_referer: String::new(),
             add_cookie: String::new(),
+            add_user_agent: String::new(),
+            add_headers: std::collections::BTreeMap::new(),
+            det_start_draft: (u64::MAX, String::new()),
             add_user: String::new(),
             add_pass: String::new(),
             add_quality: String::new(),
+            captured_media: HashMap::new(),
             det_sum: String::new(),
             det_for: None,
             add_focus_req: false,
@@ -2014,7 +2624,10 @@ impl CraftApp {
             } else {
                 None
             };
-            if total.unwrap_or(0) == 0 {
+            // A fragmented stream has no size until it is done; the row may
+            // still hold an estimate from before, which must not come back.
+            let fragmented = task.shared.frag_count.load(Ordering::SeqCst) > 0;
+            if total.unwrap_or(0) == 0 && !fragmented {
                 total = row.and_then(|d| d.total_bytes);
             }
             let mut downloaded = task.shared.downloaded.load(Ordering::SeqCst);
@@ -2039,6 +2652,10 @@ impl CraftApp {
                     "phase": self.phases.get(id).cloned().unwrap_or_default(),
                     "resolution": resolution,
                     "parts": parts,
+                    "fragments": [
+                        task.shared.frag_index.load(Ordering::SeqCst),
+                        task.shared.frag_count.load(Ordering::SeqCst),
+                    ],
                 }),
             );
         }
@@ -2056,6 +2673,7 @@ impl CraftApp {
             None => return,
         };
         let _guard = crate::model::fs_lock("cmd");
+        if !_guard.owned() { return; }
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return,
@@ -2095,7 +2713,7 @@ impl CraftApp {
 
     /// Pop a standalone IDM-style progress window for one download.
     fn spawn_progress(id: u64) {
-        let Ok(exe) = std::env::current_exe() else {
+        let Ok(exe) = crate::platform::launch_path() else {
             return;
         };
         let mut cmd = std::process::Command::new(exe);
@@ -2110,7 +2728,7 @@ impl CraftApp {
 
     /// Pop the standalone "Download complete" dialog for one finished download.
     fn spawn_complete(id: u64) {
-        let Ok(exe) = std::env::current_exe() else {
+        let Ok(exe) = crate::platform::launch_path() else {
             return;
         };
         let mut cmd = std::process::Command::new(exe);
@@ -2128,7 +2746,7 @@ impl CraftApp {
 
     /// Launch the standalone Settings window (separate OS process).
     fn open_settings_window() {
-        let Ok(exe) = std::env::current_exe() else {
+        let Ok(exe) = crate::platform::launch_path() else {
             return;
         };
         let mut cmd = std::process::Command::new(exe);
@@ -2150,9 +2768,9 @@ impl CraftApp {
         let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
             return;
         };
-        let changed = self.last_ui_mtime.get().map(|t| mtime > t).unwrap_or(false);
-        self.last_ui_mtime.set(Some(mtime));
+        let changed = self.last_ui_mtime.get().map(|t| mtime > t).unwrap_or(true);
         if changed && !self.show_add {
+            self.last_ui_mtime.set(Some(mtime));
             self.load_ui_state();
             self.refresh_speed_limit();
             self.push_log("Settings reloaded from disk.");
@@ -2161,19 +2779,24 @@ impl CraftApp {
 
     fn save_ui_state(&self) {
         if let Some(path) = Self::ui_state_path() {
+            let _guard=crate::model::fs_lock("ui-settings");
+            if !_guard.owned() { return; }
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let order: Vec<&str> = self.col_order.iter().map(|c| c.key()).collect();
+            let hidden: Vec<&str> = self.col_hidden.iter().map(|c| c.key()).collect();
             let widths: std::collections::HashMap<&str, f32> = self
                 .col_w
                 .iter()
                 .map(|(c, w)| (c.key(), *w))
                 .collect();
-            let v = serde_json::json!({
+            let mine = serde_json::json!({
                 "columns": order,
+                "columns_hidden": hidden,
                 "widths": widths,
                 "max_concurrent": self.max_concurrent,
+                "per_host_conns": self.per_host_conns,
                 "show_complete": self.show_complete,
                 "timeout_secs": self.timeout_secs,
                 "max_retries": self.max_retries,
@@ -2192,7 +2815,24 @@ impl CraftApp {
                 "speed_windows": self.speed_windows,
                 "speed_windows_on": self.speed_windows_on,
                 "update_check_on": self.update_check_on,
+                // The provider NAME only. A token lives in memory and is
+                // never written down.
+                "debrid_provider": self.debrid_provider().key(),
             });
+            // Overlay our keys, never replace the whole file: the Settings
+            // window keeps its own keys here too (helper paths and their
+            // "app's own copy / PATH / custom" source choices) and a full
+            // rewrite would silently drop them.
+            let mut v: serde_json::Value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|d| serde_json::from_str(&d).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let (Some(dst), Some(src)) = (v.as_object_mut(), mine.as_object()) {
+                for (k, val) in src {
+                    dst.insert(k.clone(), val.clone());
+                }
+            }
             if let Ok(json) = serde_json::to_string_pretty(&v) {
                 Self::atomic_write(&path, json.as_bytes());
                 if let Ok(mtime) =
@@ -2233,6 +2873,22 @@ impl CraftApp {
                         }
                         self.col_order = order;
                     }
+                    // The hidden columns are a closed set: an unknown key is
+                    // ignored, and the Name column can never be hidden
+                    // because the table hangs off it.
+                    if let Some(arr) = v.get("columns_hidden").and_then(|c| c.as_array()) {
+                        let mut hidden = Vec::new();
+                        for item in arr {
+                            if let Some(s) = item.as_str() {
+                                if let Some(c) = SortCol::from_key(s) {
+                                    if c != SortCol::Name && !hidden.contains(&c) {
+                                        hidden.push(c);
+                                    }
+                                }
+                            }
+                        }
+                        self.col_hidden = hidden;
+                    }
                     if let Some(w) = v.get("widths").and_then(|x| x.as_object()) {
                         for (k, val) in w {
                             if let (Some(c), Some(f)) =
@@ -2245,6 +2901,9 @@ impl CraftApp {
                     let g = |k: &str| v.get(k);
                     if let Some(n) = g("max_concurrent").and_then(|x| x.as_u64()) {
                         self.max_concurrent = (n as usize).clamp(1, 16);
+                    }
+                    if let Some(n) = g("per_host_conns").and_then(|x| x.as_u64()) {
+                        self.per_host_conns = (n as usize).clamp(0, 64);
                     }
                     if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
                         self.show_complete = b;
@@ -2273,10 +2932,18 @@ impl CraftApp {
                         self.category_folders = b;
                     }
                     if let Some(b) = g("close_to_tray").and_then(|x| x.as_bool()) {
-                        self.close_to_tray = b;
+                        self.close_to_tray = cfg!(windows) && b;
                     }
                     if let Some(s) = g("theme").and_then(|x| x.as_str()) {
                         self.theme = s.to_string();
+                    }
+                    // The provider is a closed set: an unknown key keeps
+                    // the default rather than pointing the panel at
+                    // nothing.
+                    if let Some(s) = g("debrid_provider").and_then(|x| x.as_str()) {
+                        if let Some(p) = crate::debrid::Provider::from_key(s) {
+                            self.debrid_picker.select(p.index());
+                        }
                     }
                     if let Some(n) = g("connections_default").and_then(|x| x.as_u64()) {
                         self.connections_default = (n as usize).clamp(1, 16);
@@ -2399,12 +3066,11 @@ impl CraftApp {
                 self.add_file.clear();
                 self.add_checksum.clear();
                 self.add_quality.clear();
+                self.clear_add_credentials();
                 self.show_add = true;
             }
             2 => {
-                let _ = std::process::Command::new("explorer")
-                    .arg(&self.add_dir)
-                    .spawn();
+                open_path(std::path::Path::new(&self.add_dir), false);
             }
             4 => {
                 for id in self.selected_ids() {
@@ -2551,12 +3217,115 @@ impl CraftApp {
                 }
             }
             RowAct::VerifyChecksum => self.verify_checksum(id),
+            RowAct::ExtractArchive => self.open_extract(id),
+        }
+    }
+
+    /// Open the extraction panel for a finished archive.
+    ///
+    /// The panel is also how the user is asked before an automatic
+    /// extraction, and where a password for an encrypted archive is typed.
+    fn open_extract(&mut self, id: u64) {
+        let Some(d) = self.downloads.iter().find(|d| d.id == id) else {
+            return;
+        };
+        let path = d.dest_path();
+        if !path.is_file() {
+            self.push_log(format!(
+                "Extract #{id}: the file is not on disk ({}).",
+                path.display()
+            ));
+            return;
+        }
+        if crate::archive::detect_kind(&path).is_none() {
+            self.push_log(format!(
+                "Extract #{id}: {} is not a ZIP, RAR or 7z archive.",
+                path.display()
+            ));
+            self.show_extract = true;
+            self.extract_id = id;
+            self.extract_path = path.to_string_lossy().into_owned();
+            self.extract_notice = "This file is not an archive.".into();
+            return;
+        }        self.show_extract = true;
+        self.extract_id = id;
+        self.extract_path = path.to_string_lossy().into_owned();
+        self.extract_notice.clear();
+        self.extract_password.clear();
+    }
+
+    /// Start the extraction on a worker thread. The GUI never blocks.
+    fn start_extract(&mut self, id: u64) {
+        let Some(d) = self.downloads.iter().find(|d| d.id == id) else {
+            return;
+        };
+        let archive = d.dest_path();
+        if !archive.is_file() {
+            self.extract_notice = "The archive is not on disk.".into();
+            return;
+        }
+        let Some(kind) = crate::archive::detect_kind(&archive) else {
+            self.extract_notice = "This file is not a ZIP, RAR or 7z archive.".into();
+            return;
+        };
+        let Some(dest) = extract_destination(&archive) else {
+            self.extract_notice =
+                "No destination folder is set. Pick one in Settings → Download Engine → Archives."
+                    .into();
+            return;
+        };
+        let keep = crate::model::ui_pref_bool("extract_keep_original", true);
+        let password = if self.extract_password.trim().is_empty() {
+            None
+        } else {
+            Some(self.extract_password.clone())
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let archive_for_worker = archive.clone();
+        std::thread::spawn(move || {
+            extract_worker(archive_for_worker, dest, password, keep, tx);
+        });
+        self.extract_busy = true;
+        self.extract_rx = Some(rx);
+        self.extract_notice = format!("Extracting the {} archive…", kind.label());
+        self.push_log(format!("Extract #{id}: working…"));
+    }
+
+    /// Collect the result of a running extraction.
+    fn poll_extract(&mut self) {
+        let mut progress: Option<(u64, u64)> = None;
+        let mut done = None;
+        if let Some(rx) = self.extract_rx.as_ref() {
+            while let Ok(update) = rx.try_recv() {
+                match update {
+                    ExtractUpdate::Progress { done: d, total } => progress = Some((d, total)),
+                    ExtractUpdate::Done(msg) => done = Some(msg),
+                }
+            }
+        }
+        if let Some((d, total)) = progress {
+            self.extract_notice = if total > 0 {
+                format!(
+                    "Extracting… {} of {}",
+                    crate::model::format_bytes(d),
+                    crate::model::format_bytes(total)
+                )
+            } else {
+                format!("Extracting… {}", crate::model::format_bytes(d))
+            };
+        }
+        if let Some(msg) = done {
+            self.extract_busy = false;
+            self.extract_rx = None;
+            self.extract_notice = msg.clone();
+            // The password is dropped as soon as the extraction is over.
+            self.extract_password.clear();
+            self.push_log(msg);
         }
     }
 
     /// Row context-menu item definitions: (label, action).
-    fn ctx_items() -> Vec<(String, Option<RowAct>)> {
-        use RowAct::*;
+    fn ctx_items() -> Vec<(String, Option<RowAct>)> {        use RowAct::*;
         vec![
             ("Details".into(), Some(Details)),
             ("".into(), None),
@@ -2564,6 +3333,7 @@ impl CraftApp {
             ("Pause".into(), Some(Pause)),
             ("Redownload".into(), Some(Redownload)),
             ("Verify checksum".into(), Some(VerifyChecksum)),
+            ("Extract archive…".into(), Some(ExtractArchive)),
             ("".into(), None),
             ("Copy URL".into(), Some(CopyUrl)),
             ("Open file location".into(), Some(OpenFolder)),
@@ -2688,7 +3458,7 @@ impl CraftApp {
         self.probe_size = None;
         self.probe_name = None;
         let ua = if self.user_agent.trim().is_empty() {
-            format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
+            format!("download_craft/{}", crate::model::APP_VERSION)
         } else {
             self.user_agent.clone()
         };
@@ -2704,15 +3474,14 @@ impl CraftApp {
                 Ok(client) => {
                     let (mut total, _, ctype, mut disp) =
                         crate::engine::probe(&client, &opts, &url).await;
+                    // A playlist's length is its text, never the video size.
+                    if crate::engine::is_stream_manifest(&url, ctype.as_deref(), "") {
+                        total = None;
+                    }
                     // Page URLs (YouTube watch / generic video pages) answer
                     // HEAD with HTML and no length → resolve the media stream
                     // first so the dialog shows the real size + title (IDM-style).
-                    let is_page = ctype
-                        .as_deref()
-                        .map(|c| c.contains("text/html"))
-                        .unwrap_or(false)
-                        || url.contains("youtube.com")
-                        || url.contains("youtu.be");
+                    let is_page = crate::engine::needs_resolve(&url, ctype.as_deref());
                     if total.is_none() && is_page {
                         let shared =
                             std::sync::Arc::new(crate::engine::SharedState::new());
@@ -2761,7 +3530,7 @@ impl CraftApp {
         let exts = crate::grabber::parse_ext_list(&self.grab_exts);
         let depth_1 = self.grab_depth;
         let ua = if self.user_agent.trim().is_empty() {
-            format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
+            format!("download_craft/{}", crate::model::APP_VERSION)
         } else {
             self.user_agent.clone()
         };
@@ -2805,9 +3574,707 @@ impl CraftApp {
         self.grab_notice.clear();
     }
 
+    // ---- cloud providers (debrid) ----
+
+    /// True while a modal dialog owns the screen.
+    ///
+    /// egui draws tooltips in its topmost layer, above every window, so a
+    /// tooltip left over from the window behind would paint over an open
+    /// dialog. While a modal is up the window behind is dimmed and its
+    /// tooltips stay silent.
+    fn modal_open(&self) -> bool {
+        self.show_add
+            || self.show_queues
+            || self.show_grabber
+            || self.show_about
+            || self.show_debrid
+            || self.show_extract
+            || self.details_id.is_some()
+    }
+
+    /// The provider the panel is pointed at.
+    fn debrid_provider(&self) -> crate::debrid::Provider {
+        self.debrid_picker.provider()
+    }
+
+    /// The token of the provider the panel is pointed at.
+    ///
+    /// Each provider keeps its own token, so a token can never be read
+    /// under another provider's name.
+    fn debrid_token(&self) -> &str {
+        self.debrid_tokens.get(self.debrid_provider())
+    }
+
+    /// The token field of the provider the panel is pointed at.
+    fn debrid_token_mut(&mut self) -> &mut String {
+        let provider = self.debrid_provider();
+        self.debrid_tokens.field(provider)
+    }
+
+    /// The chosen provider changed.
+    ///
+    /// The account, the session and the notice belong to the old provider
+    /// and are dropped. The TOKEN is not: it stays in its own provider's
+    /// slot, so it can never be shown - or sent - under the new provider's
+    /// name, and switching back finds it where it was left.
+    fn debrid_provider_changed(&mut self) {
+        self.debrid_account = None;
+        self.debrid_session = None;
+        self.debrid_notice.clear();
+        // The NAME is a preference and is remembered. A token never is.
+        self.save_ui_state();
+    }
+
+    /// The cloud-provider panel.
+    ///
+    /// The same design language as the Add-download dialog: the concept's
+    /// field boxes, the accent gradient on the primary action, small
+    /// upper-case field labels, and no stock egui chrome.
+    ///
+    /// The provider is a real dropdown - a list of every provider the app
+    /// can talk to, each with what its own API cannot do - rather than a
+    /// button that moves on to the next one.
+    fn debrid_panel_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        rows: &[(u64, String, u64)],
+        selected: &[u64],
+        status: &str,
+        state: &str,
+        cache: crate::debrid::CacheState,
+    ) {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        let p = ui.painter().clone();
+        let provider = self.debrid_provider();
+        let n_providers = crate::debrid::Provider::ALL.len();
+
+        // ---- keyboard ----
+        // While the list is open the arrows move, Enter picks and Escape
+        // closes it. Otherwise Escape closes the panel. The app never asks
+        // for the keyboard, so it does not take it away either.
+        let ctx = ui.ctx().clone();
+        if self.debrid_picker.is_open() {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                self.debrid_picker.move_highlight(1);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                self.debrid_picker.move_highlight(-1);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.debrid_picker.accept();
+                self.debrid_provider_changed();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                || ctx.input(|i| i.key_pressed(egui::Key::Tab))
+            {
+                self.debrid_picker.dismiss();
+            }
+        } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_debrid = false;
+        }
+
+        // ---- header: mark, title, close ----
+        let (hdr, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 26.0),
+            egui::Sense::hover(),
+        );
+        dm_mark(
+            &p,
+            egui::Rect::from_min_size(
+                egui::pos2(hdr.min.x, hdr.min.y + 4.0),
+                egui::vec2(18.0, 18.0),
+            ),
+        );
+        p.text(
+            egui::pos2(hdr.min.x + 26.0, hdr.center().y),
+            egui::Align2::LEFT_CENTER,
+            "Cloud providers",
+            crate::fonts::semi(13.0),
+            pl().dm_txt,
+        );
+        let close = egui::Rect::from_center_size(
+            egui::pos2(hdr.max.x - 10.0, hdr.center().y),
+            egui::vec2(16.0, 16.0),
+        );
+        dm_icon_btn(&p, &self.man, close, DmIcon::Close, 12.0, 2.0, pl().dm_dim);
+        if self.man.clicked(&close) {
+            self.show_debrid = false;
+            self.debrid_picker.dismiss();
+        }
+        // The header rule.
+        let (rule, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 1.0),
+            egui::Sense::hover(),
+        );
+        p.rect_filled(rule, 0.0, pl().dm_line);
+        ui.add_space(3.0);
+
+        // ---- provider ----
+        dm_field_label(ui, "Provider");
+        let mut combo = egui::Rect::NOTHING;
+        ui.horizontal(|ui| {
+            let (c, _) = ui.allocate_exact_size(egui::vec2(300.0, DM_BOX_H), egui::Sense::hover());
+            combo = c;
+            let hov = self.man.hover(&c);
+            crate::dm::select_field(
+                &p,
+                c,
+                hov,
+                provider.label(),
+                self.debrid_picker.is_open(),
+            );
+            self.hits.push((HitKind::Btn(ButtonId::DebridProvider), c));
+            let (v, _) = ui.allocate_exact_size(egui::vec2(110.0, DM_BOX_H), egui::Sense::hover());
+            crate::dm::btn_flat(&p, v, self.man.hover(&v), "Validate");
+            self.hits.push((HitKind::Btn(ButtonId::DebridValidate), v));
+        });
+        // What this provider cannot do, in one line. Every word comes from
+        // the provider's own capability flags.
+        dm_note(
+            ui,
+            &format!("{} — {}", provider.label(), provider.limits_summary()),
+            pl().dm_lbl,
+            10.5,
+        );
+
+        // ---- token ----
+        dm_field_label(ui, "API token");
+        {
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), DM_BOX_H),
+                egui::Sense::hover(),
+            );
+            crate::dm::dm_field(
+                ui,
+                "debrid_token",
+                r,
+                r.max.x - 8.0,
+                self.debrid_token_mut(),
+                "paste the provider's API token",
+                true,
+            );
+            self.hits.push((HitKind::Field("debrid_token"), r));
+        }
+        dm_note(
+            ui,
+            "The token stays in memory only. It is never written to a settings file, a queue file or a download row.",
+            pl().dm_lbl,
+            10.5,
+        );
+
+        // ---- what to hand to the provider ----
+        dm_field_label(ui, "Magnet or hosting link");
+        {
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), DM_BOX_H),
+                egui::Sense::hover(),
+            );
+            crate::dm::dm_field(
+                ui,
+                "debrid_input",
+                r,
+                r.max.x - 8.0,
+                &mut self.debrid_input,
+                "magnet:… or https://host/…",
+                false,
+            );
+            self.hits.push((HitKind::Field("debrid_input"), r));
+        }
+        dm_field_label(ui, "Host password (optional)");
+        {
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), DM_BOX_H),
+                egui::Sense::hover(),
+            );
+            crate::dm::dm_field(
+                ui,
+                "debrid_password",
+                r,
+                r.max.x - 8.0,
+                &mut self.debrid_password,
+                "only when the host asks for one",
+                true,
+            );
+            self.hits.push((HitKind::Field("debrid_password"), r));
+        }
+
+        // A .torrent file is only offered when the provider's own API
+        // takes one. A provider that does not gets a disabled button and
+        // the reason.
+        let torrent_reason = provider.unsupported_reason(crate::debrid::Workflow::TorrentMetadata);
+        {
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(150.0, DM_BOX_H),
+                egui::Sense::hover(),
+            );
+            if torrent_reason.is_some() {
+                p.rect(
+                    r,
+                    DM_RAD,
+                    pl().dm_trough,
+                    egui::Stroke::new(1.0_f32, pl().dm_box_bd),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Torrent file…",
+                    crate::fonts::reg(12.0),
+                    pl().dm_lbl,
+                );
+            } else {
+                crate::dm::btn_flat(&p, r, self.man.hover(&r), "Torrent file…");
+                self.hits.push((HitKind::Btn(ButtonId::DebridTorrentFile), r));
+            }
+        }
+        if let Some(reason) = torrent_reason {
+            dm_note(ui, reason, pl().dm_lbl, 10.5);
+        }
+
+        // ---- what the provider said ----
+        if let Some(a) = &self.debrid_account {
+            let text = format!("Signed in as {}", a.summary());
+            dm_note(ui, &text, pl().dm_txt, 11.5);
+        }
+        if !self.debrid_notice.is_empty() {
+            let text = self.debrid_notice.clone();
+            dm_note(ui, &text, pl().notice, 11.5);
+        }
+        if self.debrid_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Talking to the provider…");
+            });
+        }
+
+        // ---- the provider's files ----
+        if !rows.is_empty() {
+            ui.add_space(3.0);
+            let text = format!("{} file(s) — provider says {status} ({state})", rows.len());
+            dm_note(ui, &text, pl().dm_txt, 11.5);
+            match provider.unsupported_reason(crate::debrid::Workflow::CacheQuery) {
+                Some(reason) => {
+                    let text = format!("Provider cache: {reason}");
+                    dm_note(ui, &text, pl().dm_lbl, 10.5);
+                }
+                None => {
+                    let text = format!(
+                        "Provider cache: {} — {}",
+                        cache.label(),
+                        cache_hint(cache)
+                    );
+                    dm_note(ui, &text, pl().dm_lbl, 10.5);
+                }
+            }
+            // Some providers fetch every file of a torrent and leave the
+            // choice to this app; the panel says so instead of implying
+            // the provider narrowed it.
+            if let Some(reason) =
+                provider.unsupported_reason(crate::debrid::Workflow::ProviderFileSelection)
+            {
+                let text = format!(
+                    "{reason} The checkboxes still pick which of those files DownloadCraft downloads."
+                );
+                dm_note(ui, &text, pl().dm_lbl, 10.5);
+            }
+            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                for (id, name, bytes) in rows {
+                    let checked = selected.contains(id);
+                    let label = if *bytes > 0 {
+                        format!("{}  ({})", elide_left(name, 44), format_bytes(*bytes))
+                    } else {
+                        elide_left(name, 52)
+                    };
+                    let (r, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 22.0),
+                        egui::Sense::hover(),
+                    );
+                    if self.man.hover(&r) {
+                        ui.painter().rect_filled(r, 4.0, pl().dm_hover);
+                    }
+                    let box_r = egui::Rect::from_center_size(
+                        egui::pos2(r.min.x + 9.0, r.center().y),
+                        egui::Vec2::splat(14.0),
+                    );
+                    crate::dm::dm_check(ui.painter(), box_r, checked);
+                    ui.painter().text(
+                        egui::pos2(r.min.x + 22.0, r.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        crate::fonts::reg(11.5),
+                        pl().dm_txt,
+                    );
+                    self.hits.push((HitKind::Check(CheckId::DebridFile(*id)), r));
+                }
+            });
+            ui.horizontal(|ui| {
+                for (label, w, id) in [
+                    ("Select all", 110.0f32, ButtonId::DebridSelectAll),
+                    ("Select none", 110.0, ButtonId::DebridSelectNone),
+                    ("Refresh", 100.0, ButtonId::DebridRefresh),
+                ] {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
+                    crate::dm::btn_flat(&p, r, self.man.hover(&r), label);
+                    self.hits.push((HitKind::Btn(id), r));
+                }
+            });
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(160.0, 36.0), egui::Sense::hover());
+                crate::dm::dm_gradient(&p, r, DM_RAD, DM_ACC, DM_ACC2);
+                if self.man.hover(&r) {
+                    p.rect_filled(r, DM_RAD, egui::Color32::from_white_alpha(22));
+                }
+                p.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Queue selected",
+                    crate::fonts::semi(13.0),
+                    egui::Color32::WHITE,
+                );
+                self.hits.push((HitKind::Btn(ButtonId::DebridQueue), r));
+                let (r, _) = ui.allocate_exact_size(egui::vec2(170.0, 36.0), egui::Sense::hover());
+                crate::dm::btn_flat(&p, r, self.man.hover(&r), "Cancel at provider");
+                self.hits.push((HitKind::Btn(ButtonId::DebridCancel), r));
+            });
+        }
+
+        // ---- actions ----
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(120.0, 36.0), egui::Sense::hover());
+            crate::dm::dm_gradient(&p, r, DM_RAD, DM_ACC, DM_ACC2);
+            if self.man.hover(&r) {
+                p.rect_filled(r, DM_RAD, egui::Color32::from_white_alpha(22));
+            }
+            p.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                "Submit",
+                crate::fonts::semi(13.0),
+                egui::Color32::WHITE,
+            );
+            self.hits.push((HitKind::Btn(ButtonId::DebridSubmit), r));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(100.0, 36.0), egui::Sense::hover());
+            crate::dm::btn_flat(&p, r, self.man.hover(&r), "Close");
+            self.hits.push((HitKind::Btn(ButtonId::DebridClose), r));
+        });
+
+        // ---- the provider dropdown ----
+        // Painted last, so it sits over the card. The rows are real hits:
+        // the list is drawn where the pointer can reach it.
+        if self.debrid_picker.is_open() && !combo.is_negative() {
+            let row_h = 42.0;
+            let list_w = 320.0;
+            let list_h = n_providers as f32 * row_h + 10.0;
+            let mut list = egui::Rect::from_min_size(
+                egui::pos2(combo.min.x, combo.max.y + 6.0),
+                egui::vec2(list_w, list_h),
+            );
+            // Keep the list on the screen.
+            let scr = ctx.screen_rect();
+            if list.max.y > scr.max.y - 8.0 {
+                list = list.translate(egui::vec2(0.0, scr.max.y - 8.0 - list.max.y));
+            }
+            p.rect(
+                list,
+                8.0,
+                pl().dm_card,
+                egui::Stroke::new(1.0_f32, pl().dm_line),
+                egui::StrokeKind::Inside,
+            );
+            for (i, prov) in crate::debrid::Provider::ALL.into_iter().enumerate() {
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(list.min.x + 6.0, list.min.y + 5.0 + i as f32 * row_h),
+                    egui::vec2(list_w - 12.0, row_h),
+                );
+                let hot = self.man.hover(&r) || self.debrid_picker.highlight() == i;
+                if hot {
+                    p.rect_filled(r, 4.0, pl().dm_hover);
+                }
+                if i == self.debrid_picker.index() {
+                    let cr = egui::Rect::from_center_size(
+                        egui::pos2(r.min.x + 12.0, r.center().y),
+                        egui::Vec2::splat(14.0),
+                    );
+                    crate::dm::dm_icon(&p, cr, DmIcon::Check, DM_ACC, 2.0);
+                }
+                p.text(
+                    egui::pos2(r.min.x + 24.0, r.min.y + 13.0),
+                    egui::Align2::LEFT_CENTER,
+                    prov.label().to_string(),
+                    crate::fonts::semi(11.5),
+                    pl().dm_txt,
+                );
+                p.text(
+                    egui::pos2(r.min.x + 24.0, r.min.y + 28.0),
+                    egui::Align2::LEFT_CENTER,
+                    prov.limits_summary(),
+                    crate::fonts::reg(10.0),
+                    pl().dm_lbl,
+                );
+                // The validation state, for the provider the panel is on.
+                // The others are not known, and are not guessed.
+                if i == self.debrid_picker.index() {
+                    let text = if self.debrid_account.is_some() {
+                        "signed in"
+                    } else {
+                        "not connected"
+                    };
+                    p.text(
+                        egui::pos2(r.max.x - 10.0, r.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        text.to_string(),
+                        crate::fonts::reg(10.0),
+                        pl().dm_dim,
+                    );
+                }
+                self.hits.push((HitKind::DebridProviderRow(i), r));
+            }
+        }
+    }
+
+    /// Build a provider client, or explain why the token cannot be used.
+    ///
+    /// The token is copied into the client and stays in memory: it is
+    /// never written to a settings file, a queue file or a download row.
+    fn debrid_client(&self) -> Result<crate::debrid::Api, String> {
+        crate::debrid::Api::new(self.debrid_provider(), self.debrid_token().trim().to_string())
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    /// Ask the provider who the token belongs to.
+    ///
+    /// A wrong token is refused here, before any torrent is submitted.
+    fn start_debrid_validate(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let api = match self.debrid_client() {
+            Ok(api) => api,
+            Err(e) => {
+                self.debrid_notice = e;
+                return;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let out = match api.account().await {
+                Ok(a) => DebridOutcome::Account(a),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), None),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Hand the entered magnet link or hosting URL to the provider.
+    ///
+    /// The provider runs the swarm; this app has no local torrent engine.
+    fn start_debrid_submit(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let input = self.debrid_input.trim().to_string();
+        if input.is_empty() {
+            self.debrid_notice = "Enter a magnet link or a hosting URL.".to_string();
+            return;
+        }
+        let api = match self.debrid_client() {
+            Ok(api) => api,
+            Err(e) => {
+                self.debrid_notice = e;
+                return;
+            }
+        };
+        let password = self.debrid_password.clone();
+        let magnet = input.starts_with("magnet:");
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let session = if magnet {
+                crate::debrid::CloudSession::submit_torrent(api, &input).await
+            } else {
+                crate::debrid::CloudSession::submit_hosting(api, &input, &password).await
+            };
+            let out = match session {
+                Ok(s) => DebridOutcome::Session(s),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), None),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Hand a `.torrent` file to the provider.
+    ///
+    /// The provider fetches the torrent on our behalf; this app has no
+    /// local torrent engine and never opens a peer connection.
+    fn start_debrid_torrent_file(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        if let Some(reason) = self
+            .debrid_provider()
+            .unsupported_reason(crate::debrid::Workflow::TorrentMetadata)
+        {
+            self.debrid_notice = reason.to_string();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Torrent", &["torrent"])
+            .set_title("Choose a .torrent file")
+            .pick_file()
+        else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "torrent".to_string());
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.debrid_notice = format!("Could not read that file: {e}");
+                return;
+            }
+        };
+        let api = match self.debrid_client() {
+            Ok(api) => api,
+            Err(e) => {
+                self.debrid_notice = e;
+                return;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let out = match crate::debrid::CloudSession::submit_torrent_file(api, name, bytes).await
+            {
+                Ok(s) => DebridOutcome::Session(s),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), None),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Read the provider task again: its status and its file list.
+    fn start_debrid_refresh(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let Some(mut session) = self.debrid_session.take() else {
+            self.debrid_notice = "Nothing to refresh yet.".to_string();
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            // The session comes back even when the provider refused, so the
+            // panel keeps what it already knows.
+            let out = match session.refresh().await {
+                Ok(()) => DebridOutcome::Session(session),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), Some(session)),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Ask the provider for the direct links of the picked files.
+    ///
+    /// The links are ordinary HTTPS addresses that carry no provider
+    /// credential, so they go into the normal queue.
+    fn start_debrid_queue(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let Some(session) = self.debrid_session.take() else {
+            self.debrid_notice = "Nothing to queue yet.".to_string();
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let out = match session.resolve().await {
+                Ok(targets) => DebridOutcome::Targets(targets, session),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), Some(session)),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Delete the provider task.
+    fn start_debrid_cancel(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let Some(session) = self.debrid_session.take() else {
+            self.debrid_notice = "Nothing to cancel.".to_string();
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let out = match session.cancel().await {
+                Ok(()) => DebridOutcome::Cancelled,
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), Some(session)),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Queue the direct links of the picked cloud files.
+    ///
+    /// They go through the same dedupe + destination-clash path as every
+    /// other capture, so a cloud file never bypasses the queue rules.
+    /// The provider's own connection limit is kept for the row.
+    ///
+    /// Returns how many files were queued and when the earliest provider
+    /// link stops working.
+    fn queue_cloud_targets(
+        &mut self,
+        targets: Vec<crate::debrid::QueueTarget>,
+    ) -> (usize, Option<u64>) {
+        let mut n = 0;
+        let mut expires: Option<u64> = None;
+        for t in targets {
+            let url = t.url.clone();
+            let (conns, size) = cloud_row_settings(&t, self.connections_default);
+            if !self.queue_url(url.clone(), Some(t.filename.clone()), false, size) {
+                continue;
+            }
+            if let Some(row) = self.downloads.iter_mut().find(|d| d.url == url) {
+                row.connections = conns;
+            }
+            if let Some(at) = t.expires_at {
+                expires = Some(match expires {
+                    Some(seen) => seen.min(at),
+                    None => at,
+                });
+            }
+            n += 1;
+        }
+        if self.queue_running {
+            self.fill_next();
+        }
+        (n, expires)
+    }
+
     /// Recompute the live scheduler cap from speed windows (P3.4).
     /// u64::MAX = no window active (per-download caps apply as usual).
-    fn refresh_speed_limit(&self) {        let v = if self.speed_windows_on {
+    fn refresh_speed_limit(&self) {
+        let window = if self.speed_windows_on {
             let now = chrono::Local::now();
             let now_min = (now.format("%H").to_string().parse::<u16>().unwrap_or(0)) * 60
                 + now.format("%M").to_string().parse::<u16>().unwrap_or(0);
@@ -2815,9 +4282,19 @@ impl CraftApp {
                 .iter()
                 .find(|w| w.active_at(now_min))
                 .map(|w| w.limit_kbps * 1024)
-                .unwrap_or(u64::MAX)
+                .filter(|v| *v > 0)
         } else {
-            u64::MAX
+            None
+        };
+        // The global limit travels live too: tasks start without a frozen
+        // copy of it, so changing it (progress window, slider, Unlimited)
+        // reaches downloads already running instead of only the next ones.
+        let global = Some(self.speed_limit_kbps * 1024).filter(|v| *v > 0);
+        let v = match (global, window) {
+            (Some(g), Some(w)) => g.min(w),
+            (Some(g), None) => g,
+            (None, Some(w)) => w,
+            (None, None) => u64::MAX, // no cap at all
         };
         self.speed_limit_live.store(v, Ordering::SeqCst);
     }
@@ -2839,6 +4316,62 @@ impl CraftApp {
         }
     }
 
+    /// The OS caption is off (`main.rs`), so these edge strips do what the
+    /// native frame used to: a resize cursor on hover and a resize drag on
+    /// press. A maximized window has no edges to grab.
+    ///
+    /// Corners come first, so a press in a corner is never taken by one of
+    /// the straight edges, and only the first matching zone is acted on.
+    fn handle_window_edges(&mut self, ctx: &egui::Context) {
+        use egui::viewport::ResizeDirection as Dir;
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let Some(q) = self.man.pos() else {
+            return;
+        };
+        let r = ctx.screen_rect();
+        let z = 5.0;
+        let c = 12.0;
+        let over = |a: egui::Pos2, b: egui::Pos2| egui::Rect::from_min_max(a, b);
+        let zones: [(egui::Rect, Dir, egui::CursorIcon); 8] = [
+            (over(r.min, egui::pos2(r.min.x + c, r.min.y + c)), Dir::NorthWest, egui::CursorIcon::ResizeNorthWest),
+            (over(egui::pos2(r.max.x - c, r.min.y), egui::pos2(r.max.x, r.min.y + c)), Dir::NorthEast, egui::CursorIcon::ResizeNorthEast),
+            (over(egui::pos2(r.min.x, r.max.y - c), egui::pos2(r.min.x + c, r.max.y)), Dir::SouthWest, egui::CursorIcon::ResizeSouthWest),
+            (over(egui::pos2(r.max.x - c, r.max.y - c), r.max), Dir::SouthEast, egui::CursorIcon::ResizeSouthEast),
+            (over(egui::pos2(r.min.x + c, r.min.y), egui::pos2(r.max.x - c, r.min.y + z)), Dir::North, egui::CursorIcon::ResizeNorth),
+            (over(egui::pos2(r.min.x + c, r.max.y - z), egui::pos2(r.max.x - c, r.max.y)), Dir::South, egui::CursorIcon::ResizeSouth),
+            (over(egui::pos2(r.min.x, r.min.y + c), egui::pos2(r.min.x + z, r.max.y - c)), Dir::West, egui::CursorIcon::ResizeWest),
+            (over(egui::pos2(r.max.x - z, r.min.y + c), egui::pos2(r.max.x, r.max.y - c)), Dir::East, egui::CursorIcon::ResizeEast),
+        ];
+        for (rect, dir, icon) in zones {
+            if rect.contains(q) {
+                ctx.set_cursor_icon(icon);
+                if self.man.press_started_in(&rect) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                }
+                return;
+            }
+        }
+    }
+
+    /// Send the window to the tray (the title bar's close button, or the OS
+    /// close while the tray is on). Parking, not hiding: a hidden window
+    /// stops painting, which freezes transfers and the browser inbox.
+    fn park_to_tray(&mut self) {
+        crate::tray::park();
+        // Say where the window went the first time, or a vanish reads as a
+        // crash (the tray icon is easy to miss). Once per run.
+        static HID_HINT: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !HID_HINT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            notify(
+                "Download Craft is still running",
+                "In the tray — left-click its icon to reopen, right-click for Exit.",
+            );
+        }
+    }
+
     /// One-shot opt-in update check against GitHub releases (P3.4, P5 asset).
     fn start_update_check(&mut self) {
         if self.update_busy {
@@ -2849,6 +4382,7 @@ impl CraftApp {
         self.update_busy = true;
         self.update_status.clear();
         self.update_asset = None;
+        self.update_found = false;
         self.rt.spawn(async move {
             let _ = tx.send(update_check_async().await);
         });
@@ -2886,6 +4420,7 @@ impl CraftApp {
         if !is_download_url(&url) {
             return false;
         }
+        let media = self.captured_media.get(&url).copied().unwrap_or_default();
         // Same URL already tracked. A live row is left alone; a dead row
         // (failed, or finished with its file gone) is refreshed so a
         // re-capture is never silently dropped.
@@ -2903,6 +4438,8 @@ impl CraftApp {
             if let Some(s) = size.filter(|s| *s > 0) {
                 self.downloads[pos].total_bytes = Some(s);
             }
+            self.downloads[pos].duration_secs = media.0;
+            self.downloads[pos].expects_audio = media.1;
             self.downloads[pos].downloaded_bytes = 0;
             self.downloads[pos].speed_bps = 0.0;
             self.downloads[pos].status = Status::Queued;
@@ -2918,9 +4455,32 @@ impl CraftApp {
         let fname = filename
             .filter(|f| !f.trim().is_empty())
             .unwrap_or_else(|| filename_from_url(&url));
-        let fname = crate::model::apply_rename_template(&self.rename_template, &fname, &url);
+        let mut fname = crate::model::apply_rename_template(&self.rename_template, &fname, &url);
         let dir = self.save_dir_for(&fname);
-        let dest = std::path::Path::new(&dir).join(&fname);
+        let mut dest = std::path::Path::new(&dir).join(&fname);
+        // A row that is running or paused keeps its download: a different
+        // link that wants the same file name gets a numbered name instead.
+        // Taking it over swapped the URL and deleted partial files mid-transfer.
+        if let Some(pos) = crate::model::find_dest_clash(&self.downloads, &dest) {
+            let busy = self.tasks.contains_key(&self.downloads[pos].id)
+                || matches!(self.downloads[pos].status, Status::Downloading | Status::Paused);
+            if busy && self.downloads[pos].url != url {
+                let free = crate::model::conflict_free_dest(&dest);
+                let taken = |p: &std::path::Path| self.downloads.iter().any(|d| d.dest_path() == p);
+                let mut n = 1;
+                let mut cand = free;
+                while taken(&cand) && n < 1000 {
+                    let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    let ext = dest.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+                    cand = std::path::Path::new(&dir).join(format!("{stem} ({n}){ext}"));
+                    n += 1;
+                }
+                if let Some(name) = cand.file_name() {
+                    fname = name.to_string_lossy().to_string();
+                }
+                dest = cand;
+            }
+        }
         // Same file, fresh URL (re-capture): refresh in place instead of a
         // colliding duplicate (two tasks on one dest fail loudly and can
         // corrupt resume state across different URLs).
@@ -2931,6 +4491,8 @@ impl CraftApp {
                 self.downloads[pos].downloaded_bytes = 0;
                 crate::model::drop_resume_state(&dest);
             }
+            self.downloads[pos].duration_secs = media.0;
+            self.downloads[pos].expects_audio = media.1;
             self.downloads[pos].total_bytes = size.filter(|s| *s > 0);
             self.downloads[pos].speed_bps = 0.0;
             self.downloads[pos].status = Status::Queued;
@@ -2941,9 +4503,8 @@ impl CraftApp {
             self.save_queue();
             return true;
         }
-        let id = self.alloc_id();
         let mut item = DownloadItem::new(
-            id,
+            0,
             url,
             fname,
             dir,
@@ -2951,6 +4512,11 @@ impl CraftApp {
         );
         // Browser-measured size survives queueing (see confirm::commit).
         item.total_bytes = size.filter(|s| *s > 0);
+        item.duration_secs = media.0;
+        item.expects_audio = media.1;
+        if !self.persist_new_item(&mut item) { return false; }
+        let id=item.id;
+        self.downloads.retain(|d|d.id!=id);
         self.downloads.push(item);
         if autostart {
             self.start(id);
@@ -3009,20 +4575,31 @@ impl CraftApp {
 
     fn save_queue(&mut self) {
         let _guard = crate::model::fs_lock("queue");
+        if !_guard.owned() { return; }
         let Some(path) = Self::queue_path() else {
             return;
         };
         let mut items = self.downloads.clone();
         for it in &mut items {
             it.speed_bps = 0.0;
+            if matches!(it.status, Status::Completed) {
+                it.cookie.clear();
+                it.extra_headers.clear();
+            }
         }
         // Union with foreign additions made since our last sync (confirm /
         // basket / CLI). Our own deletions stay deleted: ids we have ever
         // seen but no longer hold are dropped, unknown ids are merged in.
         if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(&data) {
+            if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(data.trim_start_matches('\u{feff}')) {
                 for it in disk {
-                    if items.iter().any(|d| d.id == it.id || d.url == it.url) {
+                    // Same row = same id, or same URL at the same quality: one
+                    // page queued at 1080p and 720p is two downloads.
+                    if items.iter().any(|d| {
+                        d.id == it.id
+                            || (d.url == it.url
+                                && crate::model::same_quality(&d.quality_pref, &it.quality_pref))
+                    }) {
                         continue;
                     }
                     if self.known_ids.contains(&it.id) {
@@ -3046,29 +4623,33 @@ impl CraftApp {
         }
     }
 
-    /// Fresh id that cannot collide with other processes' additions: refresh
-    /// from disk under the queue lock, then take max+1.
-    fn alloc_id(&mut self) -> u64 {
-        let _guard = crate::model::fs_lock("queue");
-        if let Some(path) = Self::queue_path() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(&data) {
-                    for it in &disk {
-                        self.known_ids.insert(it.id);
-                        self.next_id = self.next_id.max(it.id + 1);
-                    }
-                }
+    /// Assign an id AND persist the row under one lock. Reserving only the id
+    /// allowed a dialog to allocate the same id before our next queue save.
+    fn persist_new_item(&mut self, item: &mut DownloadItem) -> bool {
+        let mut queued=item.clone();
+        match crate::model::append_to_queue(&mut queued) {
+            crate::model::AppendResult::Added(id) => {
+                item.id=id;
+                self.next_id=self.next_id.max(id+1);
+                self.known_ids.insert(id);
+                true
             }
+            crate::model::AppendResult::AlreadyQueued(id) => {
+                self.push_log(format!("Already queued as #{id}."));false
+            }
+            crate::model::AppendResult::Error(e) => { self.push_log(format!("Could not queue download: {e}"));false }
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.known_ids.insert(id);
-        id
     }
 
     /// Parse queue items tolerantly: one bad entry (schema drift, partial
     /// write) must not nuke the whole queue. Returns (good, had_bad).
     fn parse_queue_items(data: &str) -> (Vec<DownloadItem>, bool) {
+        // A BOM (Notepad/PowerShell saves) made the whole queue unreadable:
+        // it loaded empty and the next save wrote "[]" over it.
+        let data = data.trim_start_matches('\u{feff}');
+        if data.trim().is_empty() {
+            return (Vec::new(), false);
+        }
         if let Ok(items) = serde_json::from_str::<Vec<DownloadItem>>(data) {
             return (items, false);
         }
@@ -3143,6 +4724,8 @@ impl CraftApp {
         // slot, so a start while one is already open never stacks duplicates,
         // while a window the user closed comes straight back on Retry.
         Self::spawn_progress(id);
+        // The live limit is the task's only cap: make it current first.
+        self.refresh_speed_limit();
         let item = self.downloads[idx].clone();
         let shared = Arc::new(SharedState::new());
         if let Some(t) = item.total_bytes {
@@ -3156,24 +4739,34 @@ impl CraftApp {
         let dest = item.dest_path();
         let conns = item.connections;
         let opts = EngineOpts {
-            speed_limit_bps: self.speed_limit_kbps * 1024,
+            // The global limit is applied live through `global_limit` (see
+            // refresh_speed_limit), not frozen into the task at start.
+            speed_limit_bps: 0,
             timeout_secs: item.eff_timeout(self.timeout_secs),
             max_retries: item.eff_retries(self.max_retries),
-            user_agent: if self.user_agent.trim().is_empty() {
-                format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
+            user_agent: if !item.user_agent.trim().is_empty() {
+                // The browser that captured the link answers it; the
+                // app's own setting is only the fallback.
+                item.user_agent.clone()
+            } else if self.user_agent.trim().is_empty() {
+                format!("download_craft/{}", crate::model::APP_VERSION)
             } else {
                 self.user_agent.clone()
             },
             referer: item.referer.clone(),
             cookie: item.cookie.clone(),
+            captured_headers: crate::engine::CapturedHeaders::for_url(&item.url, &item.extra_headers),
             username: item.username.clone(),
             password: item.password.clone(),
             proxy_url: self.proxy_url.clone(),
             allow_rename: true,
             expected_sha256: item.checksum_sha256.clone(),
+            expected_duration_secs: item.duration_secs,
+            require_audio: item.expects_audio || !item.pair_url.is_empty(),
             overwrite_existing: item.overwrite_existing,
             quality_pref: item.quality_pref.clone(),
             global_limit: Some(self.speed_limit_live.clone()),
+            per_host_conns: self.per_host_conns,
         };
         let shared2 = shared.clone();
         // Adaptive pairs (video-only + audio) merge via ffmpeg on completion.
@@ -3192,6 +4785,8 @@ impl CraftApp {
             if let Err(e) = r {
                 shared2.set_error(format!("{e:#}"));
                 eprintln!("download failed: {e:#}");
+            } else {
+                shared2.succeeded.store(true, Ordering::SeqCst);
             }
         });
         self.tasks.insert(
@@ -3227,7 +4822,20 @@ impl CraftApp {
             let next = self
                 .downloads
                 .iter()
-                .find(|d| matches!(d.status, Status::Queued))
+                .filter(|d| matches!(d.status, Status::Queued))
+                // A Queued row whose task still runs (a refresh re-queued it)
+                // is not startable: `start` returns without changing it, and
+                // picking it again looped forever and froze the window.
+                .filter(|d| !self.tasks.contains_key(&d.id))
+                // Queue v2: a row scheduled for later waits even when a slot
+                // is free, and priority decides who goes first.
+                .filter(|d| crate::model::start_at_due(&d.start_at, chrono::Local::now()))
+                .max_by(|a, b| {
+                    a.priority
+                        .cmp(&b.priority)
+                        // Same priority: oldest first (stable, predictable).
+                        .then_with(|| b.created_at.cmp(&a.created_at))
+                })
                 .map(|d| d.id);
             match next {
                 Some(id) => self.start(id),
@@ -3236,7 +4844,60 @@ impl CraftApp {
         }
     }
 
+    /// Queued rows in the order the pump will start them.
+    fn queued_order(&self) -> Vec<u64> {
+        let mut rows: Vec<&DownloadItem> = self
+            .downloads
+            .iter()
+            .filter(|d| matches!(d.status, Status::Queued))
+            .collect();
+        rows.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        rows.into_iter().map(|d| d.id).collect()
+    }
+
+    /// Move one queued row up (-1) or down (+1) in the pump's order by nudging
+    /// its priority past the neighbour's. Ties keep creation order, so an
+    /// untouched queue still runs oldest-first.
+    fn move_in_queue(&mut self, id: u64, dir: i32) {
+        let order = self.queued_order();
+        let Some(pos) = order.iter().position(|x| *x == id) else {
+            return;
+        };
+        let target = pos as i32 + dir;
+        if target < 0 || target as usize >= order.len() {
+            return;
+        }
+        let other = order[target as usize];
+        let other_prio = self
+            .downloads
+            .iter()
+            .find(|d| d.id == other)
+            .map(|d| d.priority)
+            .unwrap_or(0);
+        let new_prio = if dir < 0 { other_prio + 1 } else { other_prio - 1 };
+        if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+            d.priority = new_prio;
+        }
+        self.save_queue();
+        self.push_log(format!(
+            "Moved #{} {} the queue.",
+            id,
+            if dir < 0 { "up in" } else { "down in" }
+        ));
+    }
+
     fn pause(&mut self, id: u64) {
+        if self.tasks.get(&id).map(|t|t.shared.external_helper.load(Ordering::SeqCst)).unwrap_or(false) {
+            // yt-dlp has no portable suspend command. Stop its process now;
+            // Resume starts a fresh helper, retaining its .part/.ytdl files.
+            self.cancel_task(id);
+            self.push_log(format!("Paused #{id}; Resume continues the media download from available partial files."));
+            return;
+        }
         if let Some(t) = self.tasks.get(&id) {
             t.shared.paused.store(true, Ordering::SeqCst);
             if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
@@ -3279,6 +4940,15 @@ impl CraftApp {
     }
 
     fn cancel_task(&mut self, id: u64) {
+        // A live recording has no "later": Stop means finish. Whatever was
+        // written is already a playable file, so the row becomes Completed
+        // instead of Paused (which would imply a resumable partial).
+        let live = self
+            .tasks
+            .get(&id)
+            .map(|t| t.shared.live.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        let mut stopped: Option<(String, String)> = None;
         if let Some(t) = self.tasks.remove(&id) {
             t.shared.cancelled.store(true, Ordering::SeqCst);
             t.handle.abort();
@@ -3290,8 +4960,21 @@ impl CraftApp {
         // its partial state kept for resume.
         if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
             if !matches!(d.status, Status::Completed) {
-                d.status = Status::Paused;
+                d.status = if live && d.downloaded_bytes > 0 {
+                    Status::Completed
+                } else {
+                    Status::Paused
+                };
             }
+            if live {
+                stopped = Some((
+                    d.filename.clone(),
+                    crate::model::format_bytes(d.downloaded_bytes),
+                ));
+            }
+        }
+        if let Some((name, size)) = stopped {
+            self.push_log(format!("Live capture stopped: {name} — {size} saved"));
         }
         self.save_queue();
     }
@@ -3303,8 +4986,16 @@ impl CraftApp {
         self.save_queue();
     }
 
+    /// Checked rows the user can see. A row checked under another filter or
+    /// search stays checked but is not acted on: toolbar Delete removed rows
+    /// the current view was hiding.
     fn selected_ids(&self) -> Vec<u64> {
-        self.downloads.iter().filter(|d| d.selected).map(|d| d.id).collect()
+        let visible: std::collections::HashSet<u64> = self.visible_ids().into_iter().collect();
+        self.downloads
+            .iter()
+            .filter(|d| d.selected && visible.contains(&d.id))
+            .map(|d| d.id)
+            .collect()
     }
 
     fn start_queue(&mut self) {
@@ -3319,7 +5010,14 @@ impl CraftApp {
             .filter(|d| matches!(d.status, Status::Paused))
             .map(|d| d.id)
             .collect();
-        for id in ids {
+        // A paused row whose task is alive already holds its slot: resuming
+        // it costs nothing. Checking the cap first left every download that
+        // Stop All paused stuck (their tasks fill the slots).
+        let (live, idle): (Vec<u64>, Vec<u64>) = ids.into_iter().partition(|id| self.tasks.contains_key(id));
+        for id in live {
+            self.resume(id);
+        }
+        for id in idle {
             if self.tasks.len() >= cap {
                 break;
             }
@@ -3360,8 +5058,8 @@ impl CraftApp {
             } else {
                 self.phases.insert(*id, phase);
             }
-            if let Ok(mut g) = task.shared.resolved_name.lock() {
-                if let Some(name) = g.take() {
+            if let Ok(g) = task.shared.resolved_name.lock() {
+                if let Some(name) = g.clone() {
                     if let Some(d) = self.downloads.iter_mut().find(|d| d.id == *id) {
                         if d.status != Status::Completed {
                             d.filename = name;
@@ -3426,7 +5124,11 @@ impl CraftApp {
                     // still arriving, so a stalled transfer cannot show a rate
                     // frozen at its last value.
                     let reported = task.shared.speed_bps.load(Ordering::SeqCst) as f64;
-                    d.speed_bps = if delta > 0.0 && reported > 0.0 {
+                    // A paused transfer has no speed, whatever its last
+                    // in-flight bytes did.
+                    d.speed_bps = if task.shared.paused.load(Ordering::SeqCst) {
+                        0.0
+                    } else if delta > 0.0 && reported > 0.0 {
                         reported
                     } else if d.speed_bps <= 0.0 {
                         raw
@@ -3496,8 +5198,15 @@ impl CraftApp {
                         .map(|m| m.len())
                         .unwrap_or(0);
                     let adaptive = d.pair_url.starts_with("http");
+                    // A merge the engine finished (both legs at their servers'
+                    // own lengths, file muxed) is done even when the expected
+                    // total was a little off: a Facebook reel failed with
+                    // "got 3.22 MB of 3.23 MB" while every byte had arrived.
+                    let merged_ok = adaptive
+                        && landed > 0
+                        && task.shared.succeeded.load(Ordering::SeqCst);
                     let complete = match d.total_bytes {
-                        Some(t) if adaptive => t > 0 && dl >= t,
+                        Some(t) if adaptive => (t > 0 && dl >= t) || merged_ok,
                         Some(t) => t > 0 && dl >= t && landed >= t,
                         // unknown size: only a clean end WITH bytes counts
                         None => !cancelled && dl > 0,
@@ -3515,8 +5224,10 @@ impl CraftApp {
                         && d.dest_path().exists();
                     if cancelled {
                         d.status = Status::Paused;
-                    } else if complete || file_done {
+                    } else if task_can_complete(&task.shared, complete || file_done) {
                         d.status = Status::Completed;
+                        d.cookie.clear();
+                        d.extra_headers.clear();
                         // The file on disk is the truth. A retried or merged
                         // transfer can end with a byte counter that claims more
                         // than the file holds, and a probe's size can be an
@@ -3613,6 +5324,18 @@ impl CraftApp {
                     if self.show_complete {
                         Self::spawn_complete(id);
                     }
+                    // Unpack it when the user asked for that. With "ask
+                    // before extracting" on, the panel is opened instead and
+                    // the user decides.
+                    if crate::model::ui_pref_bool("auto_extract", false)
+                        && crate::archive::detect_kind(&path).is_some()
+                    {
+                        if crate::model::ui_pref_bool("extract_ask", false) {
+                            self.open_extract(id);
+                        } else {
+                            self.start_extract(id);
+                        }
+                    }
                 }
                 if let Some(m) = msg {
                     self.push_log(m);
@@ -3642,20 +5365,12 @@ impl CraftApp {
     fn on_download_finished(&mut self, name: &str, path: &std::path::Path) {
         notify("Download Craft — download finished", name);
         if !self.antivirus_cmd.trim().is_empty() {
-            let cmd = self.antivirus_cmd.replace("{file}", &path.to_string_lossy());
-            self.push_log(format!("Antivirus scan: {cmd}"));
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                let _ = std::process::Command::new("cmd")
-                    .arg("/C")
-                    .arg(format!("start /min \"\" {cmd}"))
-                    .creation_flags(0x08000000)
-                    .spawn();
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = std::process::Command::new("sh").arg("-c").arg(&cmd).spawn();
+            match crate::platform::antivirus_command(&self.antivirus_cmd,path) {
+                Ok(mut cmd) => {
+                    self.push_log(format!("Antivirus scan: {}",path.display()));
+                    if let Err(e)=cmd.spawn() {self.push_log(format!("Antivirus launch failed: {e}"));}
+                }
+                Err(e) => self.push_log(e),
             }
         }
     }
@@ -3689,6 +5404,7 @@ impl CraftApp {
                 "Queue drained with {leftovers} paused/failed item(s) left — finish action still runs."
             ));
         }
+        #[cfg(windows)]
         match self.finish_action.as_str() {
             "shutdown" => {
                 self.push_log("Queue done — shutting down.");
@@ -3712,6 +5428,13 @@ impl CraftApp {
             }
             _ => {
                 self.push_log("Queue finished.");
+            }
+        }
+        #[cfg(not(windows))]
+        if self.finish_action != "nothing" && !self.finish_action.is_empty() {
+            match crate::platform::power(&self.finish_action) {
+                Ok(())=>self.push_log(format!("Queue done — {} requested.",self.finish_action)),
+                Err(e)=>self.push_log(format!("Queue finished; power action was not completed: {e}")),
             }
         }
         notify("Download Craft — queue finished", "All downloads completed.");
@@ -3743,6 +5466,7 @@ impl CraftApp {
             None => return false,
         };
         let _guard = crate::model::fs_lock("inbox");
+        if !_guard.owned() { return false; }
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return false,
@@ -3770,20 +5494,29 @@ impl CraftApp {
         };
         let mut keep: Vec<crate::native_host::InboxItem> = Vec::new();
         let mut next: Option<crate::native_host::InboxItem> = None;
+        // Already queued = same URL at the same quality (another quality of
+        // one page is a new download).
+        let queued = |i: &crate::native_host::InboxItem, downloads: &[DownloadItem]| {
+            let q = i.quality.as_deref().unwrap_or("");
+            downloads.iter().any(|d| d.url == i.url && crate::model::same_quality(&d.quality_pref, q))
+        };
         for i in items.into_iter() {
             if next.is_none()
                 && is_download_url(&i.url)
-                && !self.downloads.iter().any(|d| d.url == i.url)
+                && !queued(&i, &self.downloads)
                 && age_secs(&i.received_at) >= CONFIRM_GRACE_SECS
             {
                 next = Some(i);
             } else if is_download_url(&i.url)
-                && !self.downloads.iter().any(|d| d.url == i.url)
+                && (!queued(&i, &self.downloads) || age_secs(&i.received_at) < CONFIRM_GRACE_SECS)
             {
                 // Young (dialog likely opening) or a later old entry: keep.
+                // A young entry for an already-queued row is kept too: it
+                // carries the re-capture's fresh cookie/headers, which its
+                // dialog claims to refresh a failed row.
                 keep.push(i);
             }
-            // Invalid URLs and already-queued duplicates are dropped.
+            // Invalid URLs and old already-queued duplicates are dropped.
         }
         // Cap the inbox (newest first by received_at) so a stuck producer
         // can't grow it without bound.
@@ -3818,6 +5551,12 @@ impl CraftApp {
             .or_else(|| item.page_url)
             .unwrap_or_default();
         let cookie = item.cookie.unwrap_or_default();
+        // The browser's own agent travels with the capture: a site that
+        // checks the browser only answers that browser.
+        let user_agent = item.user_agent.unwrap_or_default();
+        self.add_headers = item.headers.unwrap_or_default();
+        if self.captured_media.len() >= 200 { self.captured_media.clear(); }
+        self.captured_media.insert(url.clone(), (item.dur.unwrap_or(0), item.audio_expected));
         let size = item.size;
         let quality = item.quality;
         self.add_url = url.clone();
@@ -3828,6 +5567,7 @@ impl CraftApp {
             .unwrap_or_else(|| filename_from_url(&url));
         self.add_referer = referer;
         self.add_cookie = cookie;
+        self.add_user_agent = user_agent;
         self.add_checksum.clear();
         self.add_quality = quality.filter(|s| !s.trim().is_empty()).unwrap_or_default();
         // Browser-measured size rides along: show it without a server-side
@@ -3857,17 +5597,44 @@ impl CraftApp {
         };
         let (items, _) = Self::parse_queue_items(&data);
         for mut it in items {
-            if self
-                .downloads
-                .iter()
-                .any(|d| d.id == it.id || d.url == it.url)
-            {
+            // A row we hold that another process re-queued (a dialog refreshed
+            // a failed/finished row with a fresh capture, the CLI re-queued
+            // it): take the disk version. Skipping it kept the stale status,
+            // so its start order did nothing and our next save undid it.
+            if let Some(pos) = self.downloads.iter().position(|d| d.id == it.id) {
+                let local = &self.downloads[pos];
+                // Only rows another process may refresh: failed, finished with
+                // the file gone, or paused without a task. A row this window
+                // just completed (file present) is never reverted by a disk
+                // copy its own save has not overwritten yet.
+                let refreshable = match &local.status {
+                    Status::Failed(_) => true,
+                    Status::Completed => !local.dest_path().exists(),
+                    Status::Paused => true,
+                    _ => false,
+                };
+                let refreshed_elsewhere = matches!(it.status, Status::Queued)
+                    && refreshable
+                    && !self.tasks.contains_key(&it.id);
+                if refreshed_elsewhere {
+                    let selected = local.selected;
+                    it.speed_bps = 0.0;
+                    it.selected = selected;
+                    self.downloads[pos] = it;
+                }
+                continue;
+            }
+            if self.downloads.iter().any(|d| {
+                d.url == it.url && crate::model::same_quality(&d.quality_pref, &it.quality_pref)
+            }) {
                 continue;
             }
             // Foreign entry for a file we already track (fresh capture):
-            // refresh the local entry instead of a colliding duplicate.
+            // refresh the local entry instead of a colliding duplicate — but
+            // never a row with a live task (its download would be hijacked).
             if let Some(pos) =
                 crate::model::find_dest_clash(&self.downloads, &it.dest_path())
+                    .filter(|p| !self.tasks.contains_key(&self.downloads[*p].id))
             {
                 let local = &mut self.downloads[pos];
                 if local.url != it.url {
@@ -3892,36 +5659,62 @@ impl CraftApp {
         }
     }
 
-    /// Consume `%APPDATA%/download_craft/wake.json` (`{"start":[ids]}`):
-    /// start IDs queued by a standalone dialog's "Start Download".
+    /// Consume `%APPDATA%/download_craft/wake.json`:
+    /// `{"start":[ids]}` starts IDs queued by a standalone dialog's "Start
+    /// Download"; `{"focus":[ids]}` points the window at rows that are
+    /// already running (the dialog's "Focus existing").
     fn check_wake(&mut self) {
         let path = match crate::model::config_dir() {
             Some(p) => p.join("wake.json"),
             None => return,
         };
         let _guard = crate::model::fs_lock("wake");
+        if !_guard.owned() { return; }
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return,
         };
         let _ = std::fs::remove_file(&path); // claim first: at-most-once
-        let ids: Vec<u64> = serde_json::from_str::<serde_json::Value>(&data)
-            .ok()
+        let value = serde_json::from_str::<serde_json::Value>(&data).ok();
+        let ids: Vec<u64> = value
+            .as_ref()
             .and_then(|v| v.get("start").cloned())
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
-        if ids.is_empty() {
+        let focus: Vec<u64> = value
+            .as_ref()
+            .and_then(|v| v.get("focus").cloned())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        if ids.is_empty() && focus.is_empty() {
             return;
         }
         self.merge_queue_from_disk();
         for id in ids {
-            let ready = self.downloads.iter().any(|d| {
-                d.id == id && matches!(d.status, Status::Queued) && !self.tasks.contains_key(&id)
-            });
-            if ready {
-                self.queue_running = true;
-                self.start(id);
+            let status = self.downloads.iter().find(|d| d.id == id).map(|d| d.status.clone());
+            match status {
+                Some(Status::Queued) if !self.tasks.contains_key(&id) => {
+                    self.queue_running = true;
+                    self.start(id);
+                }
+                // A dialog that found the row Paused asks to start it: resume,
+                // or its "starting it" notice promised something that never
+                // happened.
+                Some(Status::Paused) => {
+                    self.queue_running = true;
+                    self.resume(id);
+                }
+                _ => {}
             }
+        }
+        if !focus.is_empty() {
+            // Point the window at the rows the dialog pointed at.
+            for d in self.downloads.iter_mut() {
+                if focus.contains(&d.id) {
+                    d.selected = true;
+                }
+            }
+            self.raise_once = true;
         }
     }
 
@@ -3981,6 +5774,7 @@ fn quiet(cmd: &mut std::process::Command) {
 fn quiet(_cmd: &mut std::process::Command) {}
 
 /// Open a file (or reveal it in Explorer when `reveal`).
+#[cfg(windows)]
 pub(crate) fn open_path(path: &std::path::Path, reveal: bool) {
     if reveal {
         if path.exists() {
@@ -3997,6 +5791,9 @@ pub(crate) fn open_path(path: &std::path::Path, reveal: bool) {
         let _ = c.spawn();
     }
 }
+
+#[cfg(not(windows))]
+pub(crate) fn open_path(path: &std::path::Path, reveal: bool) { crate::platform::open(path,reveal); }
 
 /// Show `path` selected in the file manager.
 #[cfg(windows)]
@@ -4025,13 +5822,14 @@ fn select_in_file_manager(path: &std::path::Path) {
 /// always this value — nothing to paste.
 pub(crate) const EXTENSION_ID: &str = "pgdhmfgefjnfijmlheboncdmfhcnoikk";
 
+#[cfg(windows)]
 pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
     let base = crate::model::config_dir()
         .map(|p| p.join("native-host"))
         .ok_or_else(|| "no config dir".to_string())?;
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::platform::launch_path().map_err(|e| e.to_string())?;
     let bat = base.join("download_craft_host.bat");
     // NOTE: `@echo off` is mandatory — cmd echoes every command to stdout
     // by default, which corrupts the length-prefixed native-messaging
@@ -4084,6 +5882,34 @@ pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
     Ok(manifest_path.to_string_lossy().to_string())
 }
 
+#[cfg(not(windows))]
+pub(crate) fn install_native_host(browser: &str) -> Result<String,String> { crate::platform::install_native_host(browser) }
+
+/// Whether `browser` has this app registered as its native host: the
+/// registration exists and its manifest file is still on disk.
+#[cfg(windows)]
+pub(crate) fn native_host_status(browser: &str) -> bool {
+    let mut rc = std::process::Command::new("reg");
+    rc.args(["query", native_host_key(browser), "/ve"]);
+    quiet(&mut rc);
+    let Ok(out) = rc.output() else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    // "(Default)    REG_SZ    C:\…\chrome.json"
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.split("REG_SZ").nth(1).map(|p| p.trim().to_string()))
+        .is_some_and(|p| std::path::Path::new(&p).is_file())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn native_host_status(browser: &str) -> bool {
+    crate::platform::native_host_directory(browser)
+        .map(|d| d.join("com.download_craft.json").is_file())
+        .unwrap_or(false)
+}
+
 /// Registry key for a Chromium-family / Firefox native host (HKCU, no admin).
 /// Opera / Brave / Vivaldi share the Chromium layout with vendor keys.
 fn native_host_key(browser: &str) -> &'static str {
@@ -4112,11 +5938,12 @@ fn legacy_host_key(browser: &str) -> &'static str {
 /// (first run, portable exe moved or renamed, etc.).
 /// Returns Ok(true) when something was (re)installed.
 /// Best-effort: failures are reported to the caller, never fatal.
+#[cfg(windows)]
 fn ensure_native_host(browser: &str) -> Result<bool, String> {
     let base = crate::model::config_dir()
         .map(|p| p.join("native-host"))
         .ok_or_else(|| "no config dir".to_string())?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::platform::launch_path().map_err(|e| e.to_string())?;
     let exe_s = exe.to_string_lossy().into_owned();
     let manifest_path = base.join(format!("{browser}.json"));
     let manifest_s = manifest_path.to_string_lossy().into_owned();
@@ -4153,11 +5980,17 @@ fn ensure_native_host(browser: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(not(windows))]
+fn ensure_native_host(browser:&str)->Result<bool,String>{
+    crate::platform::install_native_host(browser).map(|_|true)
+}
+
 /// Opt-in update check (P3.4, extended P5): compare the running version
 /// against the latest GitHub release tag, and locate the portable Windows
 /// asset when one is newer. Network failures become a status string —
-/// never a popup, never an auto-download.
-async fn update_check_async() -> (String, Option<String>) {
+/// never a popup, never an auto-download. The third field says "a newer
+/// release exists", which is what puts the chip in the title bar.
+async fn update_check_async() -> (String, Option<String>, bool) {
     let current = env!("CARGO_PKG_VERSION");
     let client = match reqwest::Client::builder()
         .user_agent(format!("download_craft/{current}"))
@@ -4165,7 +5998,7 @@ async fn update_check_async() -> (String, Option<String>) {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return (format!("Update check failed: {e:#}"), None),
+        Err(e) => return (format!("Update check failed: {e:#}"), None, false),
     };
     let resp = client
         .get("https://api.github.com/repos/hungry-detective/downloadcraft/releases/latest")
@@ -4174,18 +6007,18 @@ async fn update_check_async() -> (String, Option<String>) {
         .await;
     let resp = match resp {
         Ok(r) => r,
-        Err(e) => return (format!("Update check failed (network): {e:#}"), None),
+        Err(e) => return (format!("Update check failed (network): {e:#}"), None, false),
     };
     if !resp.status().is_success() {
-        return (format!("Update check failed: HTTP {}", resp.status()), None);
+        return (format!("Update check failed: HTTP {}", resp.status()), None, false);
     }
     let v: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return (format!("Update check failed (parse): {e:#}"), None),
+        Err(e) => return (format!("Update check failed (parse): {e:#}"), None, false),
     };
     let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
     if tag.is_empty() {
-        return ("Update check failed: no releases found.".to_string(), None);
+        return ("Update check failed: no releases found.".to_string(), None, false);
     }
     if crate::model::is_newer_version(current, tag) {
         let url = v
@@ -4195,9 +6028,10 @@ async fn update_check_async() -> (String, Option<String>) {
         (
             format!("Update available: {tag} (you have v{current}) — {url}"),
             crate::model::pick_windows_asset(&v),
+            true,
         )
     } else {
-        (format!("Up to date (v{current})."), None)
+        (format!("Up to date (v{current})."), None, false)
     }
 }
 
@@ -4210,6 +6044,7 @@ fn notify(title: &str, body: &str) {
 }
 
 /// Build the system tray icon (uses the bundled app icon).
+#[cfg(windows)]
 fn build_tray() -> Option<tray_icon::TrayIcon> {
     let img = image::load_from_memory(include_bytes!("../assets/icon.png"))
         .ok()?
@@ -4233,6 +6068,11 @@ fn build_tray() -> Option<tray_icon::TrayIcon> {
         .build()
         .ok()
 }
+
+// Portable first version uses the regular taskbar/Dock window. This avoids
+// depending on an AppIndicator service or a second GTK event loop.
+#[cfg(not(windows))]
+fn build_tray()->Option<PlatformTray>{None}
 
 fn clipboard_watch(tx: std::sync::mpsc::Sender<String>) {
     let mut last = String::new();
@@ -4261,6 +6101,8 @@ const DATE_W: f32 = 104.0;
 
 impl eframe::App for CraftApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        crate::tray::set_context(ctx);
+        self.watch_ui_state();
         // The tray helpers work on the native window (parking = visible but
         // far off-screen, because a hidden window stops painting and eframe
         // then stops running frames altogether).
@@ -4311,12 +6153,14 @@ impl eframe::App for CraftApp {
         // Manual pointer routing: snapshot input, then match layout rects
         // recorded below (process_hits runs after all layout, topmost first).
         self.man.begin(ctx);
+        // Borderless window: the edges resize it (see `handle_window_edges`).
+        self.handle_window_edges(ctx);
         self.hits.clear();
         while let Ok(url) = self.clipboard_rx.try_recv() {
             if !self.downloads.iter().any(|d| d.url == url)
-                && self.clipboard_toast.as_deref() != Some(url.as_str())
+                && self.clipboard_url.as_deref() != Some(url.as_str())
             {
-                self.clipboard_toast = Some(url);
+                self.clipboard_url = Some(url);
             }
         }
 
@@ -4324,6 +6168,12 @@ impl eframe::App for CraftApp {
         self.poll_verify_jobs();
         self.write_progress_snapshot();
         self.check_scheduler();
+        // A dialog asked for a running row to be pointed at: bring the window
+        // forward once, then leave the user alone.
+        if self.raise_once {
+            self.raise_once = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         if self.last_inbox_check.elapsed().as_secs() >= 2 {
             self.last_inbox_check = Instant::now();
             crate::model::touch_heartbeat();
@@ -4342,10 +6192,11 @@ impl eframe::App for CraftApp {
                 while let Ok(m) = rx.try_recv() {
                     got = Some(m);
                 }
-                if let Some((m, asset)) = got {
+                if let Some((m, asset, found)) = got {
                     self.update_busy = false;
                     self.update_status = m.clone();
                     self.update_asset = asset;
+                    self.update_found = found;
                     if m.starts_with("Update available") {
                         self.push_log(m);
                     }
@@ -4404,6 +6255,7 @@ impl eframe::App for CraftApp {
         // The menu itself is handled in `tray::install_menu_handler`, which acts
         // on the click without waiting for a frame; this loop is the fallback
         // for the case where that handler could not be installed.
+        #[cfg(windows)]
         while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if ev.id() == "tray-show" {
                 crate::tray::show();
@@ -4413,6 +6265,7 @@ impl eframe::App for CraftApp {
                 crate::tray::request_quit();
             }
         }
+        #[cfg(windows)]
         while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
             if matches!(
                 ev,
@@ -4457,17 +6310,7 @@ impl eframe::App for CraftApp {
             // Parking (not hiding) keeps the app running: hiding the window
             // stops WM_PAINT, which stops eframe frames, which froze transfers
             // and the browser inbox while "in the tray".
-            crate::tray::park();
-            // Say where the window went the first time, or a vanish reads as a
-            // crash (the tray icon is easy to miss). Once per run.
-            static HID_HINT: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !HID_HINT.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                notify(
-                    "Download Craft is still running",
-                    "In the tray — left-click its icon to reopen, right-click for Exit.",
-                );
-            }
+            self.park_to_tray();
         } else if self.close_to_tray
             && self.tray.is_some()
             && ctx.input(|i| i.viewport().minimized) == Some(true)
@@ -4478,9 +6321,10 @@ impl eframe::App for CraftApp {
             crate::tray::park();
         }
 
-        // Native OS window chrome (title bar, min/max/close, drag, resize,
-        // snap, taskbar) — a custom-painted titlebar can never match it and
-        // is the fastest way to look unprofessional.
+        // The window is borderless: the title bar below is the app's own
+        // (`main.rs` turns the OS caption off). Dragging and Aero snap go
+        // through the OS move loop, the resize strips through
+        // `handle_window_edges`.
 
         // ---- per-frame counts, shared by the sidebar and the status bar ----
         let n_all = self.downloads.len();
@@ -4503,90 +6347,268 @@ impl eframe::App for CraftApp {
         }
         let n_incomplete = n_all - n_done;
 
-        // ================= menu bar + search =================
-        // Flat desktop menu bar in the concept's metrics
-        // (`main_window.html` .menu-bar / .search-box): text items on the left,
-        // a bordered search field with a trailing magnifier on the right, and
-        // one hairline closing the strip. Dropdowns render at the end of update
+        // ================= title bar =================
+        // `main_window_titlebar.html`: one 46 px row carrying the brand, the
+        // File/Tasks/Tools/Theme/Help menus, the list search, the update chip
+        // and the window buttons. The taskbar (Add URL, Resume, Stop …) stays
+        // in the workspace card below — only the menu row and the search moved
+        // up here. The OS caption is off (`main.rs` drops the decorations), so
+        // this row is also what drags the window; `handle_window_edges` owns
+        // the resize strips. Dropdowns still render at the end of update
         // (topmost).
-        egui::TopBottomPanel::top("menubar")
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        egui::TopBottomPanel::top("titlebar")
+            .exact_height(TB_H)
             .frame(egui::Frame::new().fill(pl().bg).inner_margin(egui::Margin {
-                left: 14,
-                right: 14,
-                top: 4,
-                bottom: 4,
+                left: 12,
+                right: 8,
+                top: 0,
+                bottom: 0,
             }))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for (m, label) in
-                        ["File", "Tasks", "Tools", "Theme", "Help"].iter().enumerate()
-                    {
-                        let g = ui.painter().layout_no_wrap(
-                            label.to_string(),
-                            egui::FontId::proportional(11.5),
-                            pl().txt,
-                        );
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(g.size().x + 20.0, 24.0),
-                            egui::Sense::hover(),
-                        );
-                        let hov = self.man.hover(&rect);
-                        let open = self.drop_menu == Some(m as u8);
-                        if hov || open {
-                            ui.painter().rect_filled(rect, 4.0, pl().surface_lt);
-                        }
-                        ui.painter().galley(
-                            egui::pos2(
-                                rect.center().x - g.size().x / 2.0,
-                                rect.center().y - g.size().y / 2.0,
-                            ),
-                            g,
-                            if hov || open { pl().txt } else { pl().dim },
-                        );
-                        self.hits.push((HitKind::MenuBtn(m as u8), rect));
+                let (bar, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), TB_H),
+                    egui::Sense::hover(),
+                );
+                let p = ui.painter().clone();
+                let cy = bar.center().y;
+                // Interactive children: a press on one of these must never
+                // turn into a window drag.
+                let mut live: Vec<egui::Rect> = Vec::new();
+
+                // ---- brand: the dialog mark + the product name ----
+                let mark = egui::Rect::from_center_size(
+                    egui::pos2(bar.left() + 9.0, cy),
+                    egui::Vec2::splat(18.0),
+                );
+                crate::dm::dm_mark(&p, mark);
+                let name = p.layout_no_wrap(
+                    crate::model::APP_NAME.to_owned(),
+                    crate::fonts::semi(13.0),
+                    pl().txt,
+                );
+                p.galley(
+                    egui::pos2(mark.right() + 6.0, cy - name.size().y / 2.0),
+                    name.clone(),
+                    pl().txt,
+                );
+                let mut x = mark.right() + 6.0 + name.size().x + 11.0;
+                p.vline(x, (cy - 9.0)..=(cy + 9.0), egui::Stroke::new(1.0, pl().card_bd));
+                x += 9.0;
+
+                // ---- menus (`.menu-item`): the same dropdowns, now up here ----
+                for (m, label) in ["File", "Tasks", "Tools", "Theme", "Help"].iter().enumerate() {
+                    let g = p.layout_no_wrap(label.to_string(), crate::fonts::reg(11.0), pl().dim);
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(x, cy - 12.0),
+                        egui::vec2(g.size().x + 12.0, 24.0),
+                    );
+                    let hov = self.man.hover(&r);
+                    let open = self.drop_menu == Some(m as u8);
+                    if hov || open {
+                        p.rect_filled(r, 5.0, pl().surface_lt);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Search box: filled, 1px border, 6px radius, a single
-                        // box (no inner frame) with the magnifier on the
-                        // trailing edge — the concept's `.search-box`.
-                        egui::Frame::new()
-                            .fill(pl().surface)
-                            .stroke(egui::Stroke::new(1.0_f32, pl().card_bd))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin {
-                                left: 10,
-                                right: 10,
-                                top: 4,
-                                bottom: 4,
-                            })
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    // The menu bar lays its children out right
-                                    // to left, so the magnifier is added first
-                                    // to land on the pill's trailing edge —
-                                    // the concept's `.search-box` order
-                                    // (input, then `.search-icon`).
-                                    mi(ui, MI_SEARCH, 13.0, pl().dim);
-                                    let r = mtext_bare(
-                                        ui,
-                                        "search",
-                                        &mut self.search,
-                                        "Search in the List",
-                                        176.0,
-                                    );
-                                    self.hits.push((HitKind::Field("search"), r));
-                                });
-                            });
-                    });
-                });
-                // menu-bar bottom hairline (`.menu-bar { border-bottom }`)
-                let r = ui.max_rect();
-                ui.painter()
-                    .hline(r.x_range(), r.bottom() + 3.5, egui::Stroke::new(1.0_f32, pl().card_bd));
+                    p.galley(
+                        egui::pos2(r.center().x - g.size().x / 2.0, cy - g.size().y / 2.0),
+                        g,
+                        if hov || open { pl().txt } else { pl().dim },
+                    );
+                    self.hits.push((HitKind::MenuBtn(m as u8), r));
+                    live.push(r);
+                    x = r.right() + 1.0;
+                }
+
+                // ---- right edge, built inwards from the window buttons:
+                // controls · update chip · search (`.win-controls` order) ----
+                let ctrl_l = bar.right() - (28.0 * 3.0 + 2.0);
+                for (i, (icon, kind)) in [
+                    (DmIcon::Minimize, 0u8),
+                    (
+                        if maximized { DmIcon::Restore } else { DmIcon::Maximize },
+                        1,
+                    ),
+                    (DmIcon::Close, 2),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(ctrl_l + i as f32 * 29.0, cy - 13.0),
+                        egui::vec2(28.0, 26.0),
+                    );
+                    let hov = self.man.hover(&r);
+                    let close = *kind == 2;
+                    if hov {
+                        p.rect_filled(r, 4.0, if close { pl().error } else { pl().surface_lt });
+                    }
+                    dm_icon(
+                        &p,
+                        egui::Rect::from_center_size(r.center(), egui::Vec2::splat(12.0)),
+                        *icon,
+                        if hov {
+                            if close { egui::Color32::WHITE } else { pl().txt }
+                        } else {
+                            pl().dim
+                        },
+                        2.0,
+                    );
+                    if self.man.clicked(&r) {
+                        match kind {
+                            0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                            1 => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized))
+                            }
+                            _ => {
+                                if self.close_to_tray && self.tray.is_some() {
+                                    self.park_to_tray();
+                                } else {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            }
+                        }
+                    }
+                    live.push(r);
+                }
+                let mut right = ctrl_l - 8.0;
+
+                // ---- update chip: only when a newer release was found on
+                // launch (`.update-btn`). A circle at rest; the word "Update"
+                // grows out of it on hover. The glyph is the concept's arrow
+                // *without* its baseline (the line under it read as a second,
+                // unrelated icon).
+                if self.update_found && !self.update_busy {
+                    let rest = egui::Rect::from_min_size(
+                        egui::pos2(right - 28.0, cy - 14.0),
+                        egui::vec2(28.0, 28.0),
+                    );
+                    let hov = self.man.hover(&rest);
+                    let t = ctx.animate_bool_with_time(egui::Id::new("update_chip"), hov, 0.22);
+                    let label = p.layout_no_wrap(
+                        "Update".to_owned(),
+                        crate::fonts::semi(10.5),
+                        pl().primary,
+                    );
+                    let w = 28.0 + t * (label.size().x + 5.0);
+                    let chip = egui::Rect::from_min_size(
+                        egui::pos2(right - w, cy - 14.0),
+                        egui::vec2(w, 28.0),
+                    );
+                    p.rect_filled(chip, 14.0, wash(pl().txt, if hov { 20 } else { 12 }));
+                    let ib = egui::Rect::from_min_size(
+                        egui::pos2(chip.left() + 7.0, cy - 7.0),
+                        egui::Vec2::splat(14.0),
+                    );
+                    let s = ib.width() / 24.0;
+                    let m = |x: f32, y: f32| egui::pos2(ib.min.x + x * s, ib.min.y + y * s);
+                    let st = egui::Stroke::new((2.0 * s).max(1.0), pl().primary);
+                    p.line_segment([m(12.0, 3.5), m(12.0, 13.5)], st);
+                    p.line_segment([m(7.5, 9.0), m(12.0, 13.5)], st);
+                    p.line_segment([m(12.0, 13.5), m(16.5, 9.0)], st);
+                    if t > 0.01 {
+                        p.galley(
+                            egui::pos2(ib.right() + 5.0, cy - label.size().y / 2.0),
+                            p.layout_no_wrap(
+                                "Update".to_owned(),
+                                crate::fonts::semi(10.5),
+                                pl().primary.gamma_multiply(t),
+                            ),
+                            pl().primary,
+                        );
+                    }
+                    if self.man.clicked(&chip) {
+                        // The About card carries the details and the
+                        // "Download update" button (never a silent replace).
+                        self.show_about = true;
+                    }
+                    live.push(chip);
+                    right = chip.left() - 8.0;
+                }
+
+                // ---- search: rounded pill with the magnifier inside, no
+                // second inner box (`.search-box`) ----
+                let pill = egui::Rect::from_min_size(
+                    egui::pos2(right - 176.0, cy - 14.0),
+                    egui::vec2(176.0, 28.0),
+                );
+                let focused = ui.memory(|m| m.has_focus(egui::Id::new("search")));
+                let hov = self.man.hover(&pill);
+                if focused {
+                    // 3 px accent glow, where the concept uses box-shadow.
+                    p.rect_stroke(
+                        pill.expand(1.5),
+                        16.0,
+                        egui::Stroke::new(3.0, wash(pl().primary, 34)),
+                        egui::StrokeKind::Middle,
+                    );
+                }
+                p.rect(
+                    pill,
+                    14.0,
+                    wash(pl().txt, if focused { 13 } else if hov { 16 } else { 10 }),
+                    egui::Stroke::new(
+                        1.0,
+                        if focused { pl().primary } else { egui::Color32::TRANSPARENT },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    egui::pos2(pill.left() + 17.5, cy),
+                    egui::Align2::CENTER_CENTER,
+                    MI_SEARCH.to_string(),
+                    crate::fonts::icon(11.0),
+                    pl().dim,
+                );
+                let inner = egui::Rect::from_min_max(
+                    egui::pos2(pill.left() + 30.0, pill.top() + 4.0),
+                    egui::pos2(pill.right() - 10.0, pill.bottom() - 4.0),
+                );
+                let mut fui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                mtext_bare(
+                    &mut fui,
+                    "search",
+                    &mut self.search,
+                    "Search in the List",
+                    inner.width(),
+                    crate::fonts::reg(10.5),
+                );
+                self.hits.push((HitKind::Field("search"), pill));
+                live.push(pill);
+
+                // ---- the strip itself moves the window, through the OS: a
+                // custom drag hook would lose Aero snap. A second press
+                // inside the double-click window toggles maximize instead
+                // (there is no OS caption left to do that for us). ----
+                let over_live = self
+                    .man
+                    .pos()
+                    .map_or(false, |q| live.iter().any(|r| r.contains(q)));
+                if !over_live {
+                    if let Some(q) = self.man.pos() {
+                        if self.man.press_started_in(&bar) {
+                            let now = std::time::Instant::now();
+                            let again = matches!(
+                                self.tb_press,
+                                Some((t, p))
+                                    if now.duration_since(t).as_millis() <= 420
+                                        && p.distance(q) <= 24.0
+                            );
+                            if again {
+                                self.tb_press = None;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                            } else {
+                                self.tb_press = Some((now, q));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                        }
+                    }
+                }
             });
         // Menu/dropdown actions run from process_hits (see do_menu_act).
+
 
         // ================= bottom status bar =================
         // The concept's `.status-bar`: session totals on the left, state on the
@@ -4602,6 +6624,18 @@ impl eframe::App for CraftApp {
             }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Left: what is running right now. The strip answers
+                    // "is anything happening?" without reading the list.
+                    let active = self
+                        .downloads
+                        .iter()
+                        .filter(|d| d.status == Status::Downloading)
+                        .count();
+                    let total = self.downloads.len();
+                    if active > 0 {
+                        let text = format!("{active} of {total} active");
+                        ui.label(egui::RichText::new(text).size(10.5).color(pl().dim));
+                    }
                     // Session totals live in the sidebar's footer, inside its
                     // card — the strip only carries live state ("Ready" / speed).
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4656,7 +6690,7 @@ impl eframe::App for CraftApp {
                         let cats: [(&str, &str, &str); 6] = [
                             ("Image", MI_IMAGE, "Pictures"),
                             ("Video", MI_SLIDESHOW, "Videos"),
-                            ("Music", MI_MUSIC, "Music"),
+                            ("Audio", MI_MUSIC, "Audio"),
                             ("Document", MI_DOC, "Documents"),
                             ("Compressed", MI_ARCHIVE, "Compressed"),
                             ("Apps", MI_GRID, "Apps"),
@@ -4813,24 +6847,104 @@ impl eframe::App for CraftApp {
                 // Manual routing: paint (+record hit); process_hits acts.
                 ui.add_space(6.0);
                 let n_checked = self.selected_ids().len();
-                let mut tools: Vec<(ToolId, &str, &str, bool, &str)> = Vec::new();
-                tools.push((ToolId::ResumeSel, MI_PLAY_CIRCLE, "Resume", true, "Resume the selected downloads (all paused when none is checked)"));
-                tools.push((ToolId::StopSel, MI_STOP_CIRCLE, "Stop", true, "Pause the selected downloads (all active when none is checked)"));
-                tools.push((ToolId::StopAll, MI_PAUSE_CIRCLE, "Stop All", true, "Pause every active download now"));
-                tools.push((ToolId::Delete, MI_DELETE, "Delete", n_checked > 0, "Remove the checked rows from the list"));
-                tools.push((ToolId::StartQueue, MI_PLAY, "Start Queue", true, "Start queued downloads"));
-                tools.push((ToolId::StopQueue, MI_STOP, "Stop Queue", true, "Stop starting new downloads (active ones finish)"));
-                tools.push((ToolId::Queues, MI_REORDER, "Open Queue", true, "Queue status, scheduler and log"));
-                tools.push((ToolId::Grabber, MI_PUBLIC, "Site Grabber", true, "Collect file links from a web page"));
-                tools.push((ToolId::Settings, MI_TUNE, "Settings", true, "Open Settings in its own window"));
+                // The toolbar is grouped the way IDM groups its own: what
+                // starts something, what controls what is running, and what
+                // manages the queues. Ten identical buttons in one row are
+                // hard to scan, and the destructive ones sat next to
+                // Settings.
+                let groups: Vec<Vec<(ToolId, &str, &str, bool, &str)>> = vec![
+                    vec![
+                        (
+                            ToolId::Grabber,
+                            MI_PUBLIC,
+                            "Site Grabber",
+                            true,
+                            "Collect file links from a web page",
+                        ),
+                        (
+                            ToolId::Debrid,
+                            MI_CLOUD_DL,
+                            "Debrid",
+                            true,
+                            "Resolve magnet and hosting links with a cloud provider",
+                        ),
+                    ],
+                    vec![
+                        (
+                            ToolId::ResumeSel,
+                            MI_PLAY_CIRCLE,
+                            "Resume",
+                            true,
+                            "Resume the selected downloads (all paused when none is checked)",
+                        ),
+                        (
+                            ToolId::StopSel,
+                            MI_STOP_CIRCLE,
+                            "Stop",
+                            true,
+                            "Pause the selected downloads (all active when none is checked)",
+                        ),
+                        (
+                            ToolId::StopAll,
+                            MI_PAUSE_CIRCLE,
+                            "Stop All",
+                            true,
+                            "Pause every active download now",
+                        ),
+                        (
+                            ToolId::Delete,
+                            MI_DELETE,
+                            "Delete",
+                            n_checked > 0,
+                            "Remove the checked rows from the list",
+                        ),
+                    ],
+                    vec![
+                        (
+                            ToolId::StartQueue,
+                            MI_PLAY,
+                            "Start Queue",
+                            true,
+                            "Start queued downloads",
+                        ),
+                        (
+                            ToolId::StopQueue,
+                            MI_STOP,
+                            "Stop Queue",
+                            true,
+                            "Stop starting new downloads (active ones finish)",
+                        ),
+                        (
+                            ToolId::Queues,
+                            MI_REORDER,
+                            "Open Queue",
+                            true,
+                            "Queue status, scheduler and log",
+                        ),
+                    ],
+                    vec![(
+                        ToolId::Settings,
+                        MI_TUNE,
+                        "Settings",
+                        true,
+                        "Open Settings in its own window",
+                    )],
+                ];
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing = egui::vec2(TOOL_GAP, 2.0);
-                    let r = add_url_button(ui, &self.man);
+                    // A tooltip belongs to the window it came from. While a
+                    // modal is up, the window behind must stay silent.
+                    let tips = !self.modal_open();
+                    let r = add_url_button(ui, &self.man, self.clipboard_url.is_some(), tips);
                     self.hits.push((HitKind::Tool(ToolId::AddUrl), r));
-                    for (id, icon, label, enabled, tip) in tools {
-                        let r = tool_button(ui, &self.man, icon, label, enabled, tip);
-                        self.hits.push((HitKind::Tool(id), r));
+                    for group in groups.iter() {
+                        tool_group_sep(ui);
+                        for (id, icon, label, enabled, tip) in group {
+                            let r =
+                                tool_button(ui, &self.man, icon, label, *enabled, tip, tips);
+                            self.hits.push((HitKind::Tool(*id), r));
+                        }
                     }
                 });
                 ui.add_space(6.0);
@@ -4841,47 +6955,9 @@ impl eframe::App for CraftApp {
                 );
                 ui.painter().rect_filled(tr, 0.0, pl().card_bd);
                 ui.add_space(5.0);
-                // clipboard toast: dismissible banner card, never loose text
-                if let Some(url) = self.clipboard_toast.clone() {
-                    egui::Frame::new()
-                        .fill(pl().surface)
-                        .stroke(egui::Stroke::new(1.0_f32, pl().primary))
-                        .corner_radius(RADIUS)
-                        .inner_margin(egui::Margin {
-                            left: 12,
-                            right: 8,
-                            top: 8,
-                            bottom: 8,
-                        })
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                mi(ui, MI_ADD_LINK, 16.0, pl().primary);
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                    ui.label(
-                                        egui::RichText::new("Link copied from clipboard").strong(),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(
-                                            url.chars().take(90).collect::<String>(),
-                                        )
-                                        .small()
-                                        .color(pl().dim),
-                                    );
-                                });
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let r = mbutton(ui, &self.man, "×", 34.0, 30.0, false);
-                                        self.hits.push((HitKind::Btn(ButtonId::TDismiss), r));
-                                        let r = mbutton(ui, &self.man, "Add URL", 90.0, 30.0, false);
-                                        self.hits.push((HitKind::Btn(ButtonId::TAdd), r));
-                                    },
-                                );
-                            });
-                        });
-                    ui.add_space(6.0);
-                }
+                // A link found on the clipboard is surfaced on the toolbar's
+                // Add URL button (see `add_url_button`), not as a banner here:
+                // the banner pushed the whole list down by a row.
                 // Bulk actions for the checked rows live in the toolbar itself
                 // (Delete sits next to Stop All): a bar that appeared only while
                 // something was checked pushed the whole list down by a row's
@@ -4916,7 +6992,9 @@ impl eframe::App for CraftApp {
                     // column right-aligned, and one rule under the header.
                     const ROW_H: f32 = 34.0;
                     const HDR_H: f32 = 22.0;
-                    let cols = self.col_order.clone();
+                    // The columns the user has turned off are not drawn.
+                    // Name is the anchor of the table and is always there.
+                    let cols = visible_cols(&self.col_order, &self.col_hidden);
                     let avail_w = ui.available_width();
                     // The numeric columns keep their stored widths, but when the
                     // window is too narrow for them plus a readable Name column
@@ -5003,22 +7081,35 @@ impl eframe::App for CraftApp {
                             self.hits.push((HitKind::HdrCol(*col), r));
                             if ci + 1 < cols.len() {
                                 // Divider grab strip on the column's right edge
-                                // (`.resizer`), a hairline until hovered.
+                                // (`.resizer`): a faint line always, so it can
+                                // be found, and an accent bar while hovered or
+                                // dragged.
                                 let zr = egui::Rect::from_min_size(
-                                    egui::pos2(r.max.x - 3.5, r.min.y),
-                                    egui::vec2(7.0, HDR_H),
+                                    egui::pos2(r.max.x - 4.0, r.min.y),
+                                    egui::vec2(8.0, HDR_H),
                                 );
-                                if self.man.hover(&zr) {
+                                let dragging = matches!(self.resize_cap,
+                                    Some(ResizeCap::Col { col: c, .. }) if c == *col);
+                                if self.man.hover(&zr) || dragging {
                                     ui.painter().rect_filled(
                                         egui::Rect::from_min_size(
-                                            egui::pos2(r.max.x - 1.5, r.min.y + 6.0),
-                                            egui::vec2(3.0, HDR_H - 12.0),
+                                            egui::pos2(r.max.x - 1.5, r.min.y + 5.0),
+                                            egui::vec2(3.0, HDR_H - 10.0),
                                         ),
                                         1.5,
                                         pl().primary,
                                     );
+                                } else {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(r.max.x - 0.5, r.min.y + 8.0),
+                                            egui::vec2(1.0, HDR_H - 16.0),
+                                        ),
+                                        0.0,
+                                        pl().card_bd,
+                                    );
                                 }
-                                self.hits.push((HitKind::ResizeCol(*col), zr));
+                                self.hits.push((HitKind::ResizeCol(*col, cols[ci + 1]), zr));
                             }
                         }
                     });
@@ -5044,6 +7135,12 @@ impl eframe::App for CraftApp {
                                     // from ROW_H plus the faint row rule, not
                                     // from the style's 10px item spacing.
                                     ui.spacing_mut().item_spacing.y = 0.0;
+                                    // A row that is scrolled out of sight still
+                                    // has a rect (egui only clips the paint),
+                                    // so its hit would reach over the toolbar
+                                    // and swallow the buttons there. Every hit
+                                    // is therefore clipped to the viewport.
+                                    let view = ui.clip_rect();
                                     for id in &ids {
                                         let id = *id;
                                         let (sel, fname, cat, size_s, prog, spd, eta, date, st, preparing) = {
@@ -5060,6 +7157,11 @@ impl eframe::App for CraftApp {
                                             // out — the browser probe often measured it
                                             // before the transfer even started.
                                             let preparing = match self.phases.get(&id) {
+                                                // A live capture has no percentage to
+                                                // show, so the pill names the state.
+                                                Some(p) if p == "Recording live" => {
+                                                    "LIVE".to_string()
+                                                }
                                                 Some(p)
                                                     if d.downloaded_bytes == 0
                                                         && p != "Downloading" =>
@@ -5112,7 +7214,7 @@ impl eframe::App for CraftApp {
                                                 pl().card_bd.gamma_multiply(0.55),
                                             ),
                                         );
-                                        self.hits.push((HitKind::Row(id), rrect));
+                                        self.hits.push((HitKind::Row(id), rrect.intersect(view)));
                                         // Manual select checkbox.
                                         let cb = egui::Rect::from_center_size(
                                             egui::pos2(
@@ -5129,7 +7231,7 @@ impl eframe::App for CraftApp {
                                         );
                                         self.hits.push((
                                             HitKind::RowCheck(id),
-                                            cb.expand(6.0),
+                                            cb.expand(6.0).intersect(view),
                                         ));
                                 // Cells painted at explicit sub-rects: pure
                                 // paint, no widgets, no cursor use — the row
@@ -5246,12 +7348,10 @@ impl eframe::App for CraftApp {
         }
 
         // ================= modal backdrop (dim only — never intercepts clicks) =================
-        if self.show_add
-            || self.show_queues
-            || self.show_grabber
-            || self.show_about
-            || self.details_id.is_some()
-        {
+        // Every dialog is dimmed behind, including the cloud-provider panel:
+        // a window that is not dimmed reads as a separate app, and the
+        // toolbar behind it stays clickable in the user's mind.
+        if self.modal_open() {
             ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Middle,
                 egui::Id::new("modal_dim"),
@@ -5498,9 +7598,9 @@ impl eframe::App for CraftApp {
                         false,
                     );
                     self.hits.push((HitKind::Field("add_file"), file_box));
-                    dm_icon_btn(&p, &self.man, refr_btn, DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
+                    dm_icon_btn_box(&p, &self.man, refr_btn, DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
                     self.hits.push((HitKind::Btn(ButtonId::AddRefresh), refr_btn));
-                    dm_icon_btn(&p, &self.man, gear_btn, DmIcon::Settings, 14.0, 1.5, pl().dm_dim);
+                    dm_icon_btn_box(&p, &self.man, gear_btn, DmIcon::Settings, 15.0, 1.5, pl().dm_dim);
                     self.hits.push((HitKind::Btn(ButtonId::AddAdv), gear_btn));
                     // ---- advanced panel (gear): same tokens, placeholders
                     // instead of labels, per the concept's field style ----
@@ -5597,6 +7697,35 @@ impl eframe::App for CraftApp {
                     // ---- actions (manual hit table, as before) ----
                     let act_y = DM_ACT + adv_h;
                     let add_btn = at(DM_X, act_y, 100.0, 36.0);
+                    // A magnet names a torrent, not a file. The app has no
+                    // torrent client of its own, so it goes to the cloud
+                    // provider instead of the download queue.
+                    let magnet = crate::model::is_magnet(&self.add_url);
+                    if magnet {
+                        let cloud_btn = egui::Rect::from_min_size(
+                            egui::pos2(add_btn.min.x, add_btn.min.y),
+                            egui::vec2(248.0, 36.0),
+                        );
+                        dm_gradient(&p, cloud_btn, DM_RAD, DM_ACC, DM_ACC2);
+                        if self.man.hover(&cloud_btn) {
+                            p.rect_filled(cloud_btn, DM_RAD, egui::Color32::from_white_alpha(22));
+                        }
+                        p.text(
+                            cloud_btn.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Resolve with cloud provider",
+                            crate::fonts::semi(13.0),
+                            egui::Color32::WHITE,
+                        );
+                        self.hits.push((HitKind::Btn(ButtonId::AddToCloud), cloud_btn));
+                        p.text(
+                            egui::pos2(cloud_btn.max.x + 10.0, cloud_btn.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "Your provider fetches it — this app opens no peer connections.",
+                            crate::fonts::reg(10.0),
+                            pl().dm_lbl,
+                        );
+                    } else {
                     dm_btn_flat(&p, &self.man, add_btn, "Add");
                     self.hits.push((HitKind::Btn(ButtonId::AddAdd), add_btn));
                     let dl_btn = egui::Rect::from_min_size(
@@ -5615,6 +7744,7 @@ impl eframe::App for CraftApp {
                         egui::Color32::WHITE,
                     );
                     self.hits.push((HitKind::Btn(ButtonId::AddDownload), dl_btn));
+                    }
                     let cancel_btn = egui::Rect::from_min_size(
                         egui::pos2(o.x + DM_W - 17.0 - 100.0, add_btn.min.y),
                         egui::vec2(100.0, 36.0),
@@ -5628,7 +7758,7 @@ impl eframe::App for CraftApp {
             if self.add_dir.trim().is_empty() {
                 self.add_dir = dirs::download_dir()
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "C:\\Downloads".to_string());
+                    .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
             }
             // ---- recent-folders menu (the path field's caret) ----
             // A click outside the caret and outside the menu closes it. The
@@ -5788,6 +7918,175 @@ impl eframe::App for CraftApp {
             self.show_grabber = open && self.show_grabber;
         }
 
+        // ================= archive extraction =================
+        if self.show_extract {
+            self.poll_extract();
+            let mut open = self.show_extract;
+            let w = modal_width(ctx, 520.0);
+            egui::Window::new("Extract archive")
+                .id(egui::Id::new("extract_modal"))
+                .order(egui::Order::Foreground)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(w)
+                .min_width(w.min(320.0))
+                .max_width(w)
+                .frame(modal_frame())
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    ui.monospace(&self.extract_path);
+                    ui.weak(
+                        "Files are only written, never started. Nothing is allowed to leave the \
+                         destination folder, and an archive that expands wildly is refused.",
+                    );
+                    ui.horizontal(|ui| {
+                        let r = mtext(
+                            ui,
+                            "extract_password",
+                            &mut self.extract_password,
+                            "Password (only if the archive asks for one)",
+                            f32::INFINITY,
+                            true,
+                        );
+                        self.hits.push((HitKind::Field("extract_password"), r));
+                    });
+                    if !self.extract_notice.is_empty() {
+                        ui.colored_label(pl().notice, &self.extract_notice);
+                    }
+                    if self.extract_busy {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Extracting…");
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        let r = mbutton(ui, &self.man, "Extract", 120.0, 36.0, true);
+                        self.hits.push((HitKind::Btn(ButtonId::ExtractStart), r));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let r = mbutton(ui, &self.man, "Close", 110.0, 36.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::ExtractClose), r));
+                        });
+                    });
+                });
+            self.show_extract = open && self.show_extract;
+            if !self.show_extract {
+                // The password does not outlive the panel.
+                self.extract_password.clear();
+            }
+        }
+
+        // ================= cloud providers (debrid) =================
+        if self.show_debrid {
+            // Collect the finished provider call without holding borrows
+            // across UI code.
+            let mut got: Option<DebridOutcome> = None;
+            if let Some(rx) = self.debrid_rx.as_ref() {
+                while let Ok(r) = rx.try_recv() {
+                    got = Some(r);
+                }
+            }
+            if let Some(outcome) = got {
+                self.debrid_busy = false;
+                match outcome {
+                    DebridOutcome::Account(a) => {
+                        self.debrid_notice = format!("Signed in as {}", a.summary());
+                        self.debrid_account = Some(a);
+                    }
+                    DebridOutcome::Session(s) => {
+                        self.debrid_notice = format!("Provider status: {}", s.status());
+                        self.debrid_session = Some(s);
+                    }
+                    DebridOutcome::Targets(targets, session) => {
+                        let (n, expires) = self.queue_cloud_targets(targets);
+                        self.debrid_session = Some(session);
+                        self.debrid_notice =
+                            format!("Queued {n} cloud file(s).{}", link_expiry_text(expires));
+                        self.push_log(format!(
+                            "Debrid queued {n} cloud file(s).{}",
+                            link_expiry_text(expires)
+                        ));
+                    }
+                    DebridOutcome::Cancelled => {
+                        self.debrid_session = None;
+                        self.debrid_notice = "Task removed at the provider.".to_string();
+                        self.push_log("Debrid task removed at the provider.");
+                    }
+                    DebridOutcome::Failed(msg, session) => {
+                        self.debrid_notice = msg;
+                        if let Some(s) = session {
+                            self.debrid_session = Some(s);
+                        }
+                    }
+                }
+            }
+            if self.debrid_busy {
+                ctx.request_repaint();
+            }
+            // The file list is copied out, so the UI code never borrows the
+            // session while it records its own hits.
+            let (rows, selected, status, state, cache) = match self.debrid_session.as_ref() {
+                Some(s) => {
+                    let mut rows: Vec<(u64, String, u64)> = s
+                        .files()
+                        .iter()
+                        .map(|f| (f.id, f.name.clone(), f.bytes))
+                        .collect();
+                    // A hosting link that the provider resolved right away
+                    // has no task: its files are numbered from one.
+                    for (n, h) in s.hosted_files().iter().enumerate() {
+                        rows.push((n as u64 + 1, h.name.clone(), 0));
+                    }
+                    (
+                        rows,
+                        s.selected().to_vec(),
+                        s.status().to_string(),
+                        s.state().label().to_string(),
+                        s.cache_state(),
+                    )
+                }
+                None => (
+                    Vec::new(),
+                    Vec::new(),
+                    String::new(),
+                    String::new(),
+                    crate::debrid::CacheState::Unknown,
+                ),
+            };
+            let mut open = self.show_debrid;
+            // The panel is a Compact Blue card, the same design language as
+            // the Add-download dialog: the concept field boxes, the accent
+            // gradient on the primary action, small upper-case field labels,
+            // and no stock egui chrome.
+            let debrid_w = modal_width(ctx, 620.0);
+            egui::Window::new("Cloud providers")
+                .id(egui::Id::new("debrid_modal"))
+                .order(egui::Order::Foreground)
+                .open(&mut open)
+                .title_bar(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(debrid_w)
+                .min_width(debrid_w.min(320.0))
+                .max_width(debrid_w)
+                .max_height((ctx.screen_rect().height() * 0.9).clamp(300.0, 900.0))
+                .frame(
+                    egui::Frame::new()
+                        .fill(pl().dm_card)
+                        .stroke(egui::Stroke::new(1.0_f32, pl().dm_line))
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::same(16)),
+                )
+                .show(ctx, |ui| {
+                    self.debrid_panel_ui(ui, &rows, &selected, &status, &state, cache);
+                });
+            self.show_debrid = open && self.show_debrid;
+        }
+
         if self.show_queues {
             let mut open = true;
             let n_items = self.downloads.len();
@@ -5809,98 +8108,154 @@ impl eframe::App for CraftApp {
                 .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
                 .frame(modal_frame())
                 .show(ctx, |ui| {
-                ui.label(format!("{n_items} item(s) in queue, {n_active} active."));
-                ui.horizontal(|ui| {
-                    let r = mbutton(ui, &self.man, "Start Queue", 130.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::QStart), r));
-                    let r = mbutton(ui, &self.man, "Stop Queue", 130.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::QStop), r));
-                });
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Max simultaneous downloads: {}",
-                        self.max_concurrent
-                    ))
-                    .color(pl().dim),
-                );
-                let r = mslider(
-                    ui,
-                    &self.man,
-                    "",
-                    1.0,
-                    16.0,
-                    self.slider_get(SliderId::QMax),
-                    false,
-                );
-                self.hits.push((
-                    HitKind::Slider(SliderId::QMax, 1.0, 16.0, false),
-                    r,
-                ));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("When queue finishes:");
-                    let cur = match self.finish_action.as_str() {
-                        "shutdown" => "Shut down",
-                        "sleep" => "Sleep",
-                        "hibernate" => "Hibernate",
-                        _ => "Do nothing",
-                    };
-                    let g = ui.painter().layout_no_wrap(
-                        cur.to_string(),
-                        egui::FontId::proportional(12.5),
-                        pl().txt,
+                // The Next-up list grows the body past a short window;
+                // scroll the body and keep the Close button on screen.
+                let body_max =
+                    (ctx.screen_rect().height() * 0.86 - 120.0).clamp(180.0, 760.0);
+                egui::ScrollArea::vertical()
+                    .max_height(body_max)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                    ui.label(format!("{n_items} item(s) in queue, {n_active} active."));
+                    ui.horizontal(|ui| {
+                        let r = mbutton(ui, &self.man, "Start Queue", 130.0, 32.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::QStart), r));
+                        let r = mbutton(ui, &self.man, "Stop Queue", 130.0, 32.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::QStop), r));
+                    });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Max simultaneous downloads: {}",
+                            self.max_concurrent
+                        ))
+                        .color(pl().dim),
                     );
-                    let (r, _) = ui.allocate_exact_size(
-                        egui::vec2((g.size().x + 40.0).max(140.0), 28.0),
-                        egui::Sense::hover(),
+                    let r = mslider(
+                        ui,
+                        &self.man,
+                        "",
+                        1.0,
+                        16.0,
+                        self.slider_get(SliderId::QMax),
+                        false,
                     );
-                    if self.man.hover(&r) {
-                        ui.painter().rect_filled(r, 6.0, pl().surface_lt);
-                    }
-                    ui.painter().rect_stroke(
+                    self.hits.push((
+                        HitKind::Slider(SliderId::QMax, 1.0, 16.0, false),
                         r,
-                        6.0,
-                        egui::Stroke::new(1.0, pl().modal_bd),
-                        egui::StrokeKind::Inside,
+                    ));
+                    // Queue v2: live ordering. The list is exactly the pump's
+                    // start order (priority, then oldest first).
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Next up — the first row starts first")
+                            .color(pl().dim),
                     );
-                    ui.painter().galley(
-                        egui::pos2(r.min.x + 10.0, r.center().y - g.size().y / 2.0),
-                        g,
-                        pl().txt,
-                    );
-                    // dropdown arrow
-                    ui.painter().text(
-                        egui::pos2(r.max.x - 14.0, r.center().y),
-                        egui::Align2::CENTER_CENTER,
-                        "▾".to_string(),
-                        egui::FontId::proportional(12.0),
-                        pl().dim,
-                    );
-                    self.hits.push((HitKind::ComboAnchor, r));
-                });
-                ui.separator();
-                let r = mcheck(
-                    ui,
-                    &self.man,
-                    "Start queue automatically at (HH:MM):",
-                    self.scheduler_enabled,
-                );
-                self.hits.push((HitKind::Check(CheckId::SchedOn), r));
-                let r = mtext(ui, "sched_time", &mut self.scheduler_time, "HH:MM", 90.0, false);
-                self.hits.push((HitKind::Field("sched_time"), r));
-                if !sched_fired {
-                    ui.small("Waiting for scheduled time…");
-                } else {
-                    ui.small("Scheduler already fired this session.");
-                    let r = mbutton(ui, &self.man, "Reset Scheduler", 140.0, 30.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::QSchedReset), r));
-                }
-                ui.separator();
-                ui.collapsing("Log", |ui| {
-                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                        for line in &log {
-                            ui.monospace(line);
+                    let order = self.queued_order();
+                    if order.is_empty() {
+                        ui.small("Nothing waiting — every row is running or finished.");
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .max_height(132.0)
+                            .show(ui, |ui| {
+                                for (i, id) in order.iter().take(24).enumerate() {
+                                    let row = self.downloads.iter().find(|d| d.id == *id);
+                                    let mut name = row
+                                        .map(|d| d.filename.clone())
+                                        .unwrap_or_else(|| format!("#{id}"));
+                                    if name.chars().count() > 42 {
+                                        name = name.chars().take(41).collect::<String>() + "…";
+                                    }
+                                    let at = row.map(|d| d.start_at.clone()).unwrap_or_default();
+                                    ui.horizontal(|ui| {
+                                        let when = if at.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!("  (at {at})")
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(format!("{}. {name}{when}", i + 1))
+                                                .size(11.0),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                let r = mbutton(ui, &self.man, "Down", 40.0, 22.0, false);
+                                                self.hits.push((HitKind::QMove(*id, 1), r));
+                                                let r = mbutton(ui, &self.man, "Up", 32.0, 22.0, false);
+                                                self.hits.push((HitKind::QMove(*id, -1), r));
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("When queue finishes:");
+                        let cur = match self.finish_action.as_str() {
+                            "shutdown" => "Shut down",
+                            "sleep" => "Sleep",
+                            "hibernate" => "Hibernate",
+                            _ => "Do nothing",
+                        };
+                        let g = ui.painter().layout_no_wrap(
+                            cur.to_string(),
+                            egui::FontId::proportional(12.5),
+                            pl().txt,
+                        );
+                        let (r, _) = ui.allocate_exact_size(
+                            egui::vec2((g.size().x + 40.0).max(140.0), 28.0),
+                            egui::Sense::hover(),
+                        );
+                        if self.man.hover(&r) {
+                            ui.painter().rect_filled(r, 6.0, pl().surface_lt);
                         }
+                        ui.painter().rect_stroke(
+                            r,
+                            6.0,
+                            egui::Stroke::new(1.0, pl().modal_bd),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().galley(
+                            egui::pos2(r.min.x + 10.0, r.center().y - g.size().y / 2.0),
+                            g,
+                            pl().txt,
+                        );
+                        // dropdown arrow
+                        ui.painter().text(
+                            egui::pos2(r.max.x - 14.0, r.center().y),
+                            egui::Align2::CENTER_CENTER,
+                            "▾".to_string(),
+                            egui::FontId::proportional(12.0),
+                            pl().dim,
+                        );
+                        self.hits.push((HitKind::ComboAnchor, r));
+                    });
+                    ui.separator();
+                    let r = mcheck(
+                        ui,
+                        &self.man,
+                        "Start queue automatically at (HH:MM):",
+                        self.scheduler_enabled,
+                    );
+                    self.hits.push((HitKind::Check(CheckId::SchedOn), r));
+                    let r = mtext(ui, "sched_time", &mut self.scheduler_time, "HH:MM", 90.0, false);
+                    self.hits.push((HitKind::Field("sched_time"), r));
+                    if !sched_fired {
+                        ui.small("Waiting for scheduled time…");
+                    } else {
+                        ui.small("Scheduler already fired this session.");
+                        let r = mbutton(ui, &self.man, "Reset Scheduler", 140.0, 30.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::QSchedReset), r));
+                    }
+                    ui.separator();
+                    ui.collapsing("Log", |ui| {
+                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            for line in &log {
+                                ui.monospace(line);
+                            }
+                        });
                     });
                 });
                 ui.add_space(4.0);
@@ -5939,7 +8294,12 @@ impl eframe::App for CraftApp {
                     let mut desc = item.description.clone();
                     let mut user = item.username.clone();
                     let mut pass = item.password.clone();
+                    if self.det_start_draft.0 != item.id {
+                        self.det_start_draft = (item.id, item.start_at.clone());
+                    }
+                    let mut start_at = self.det_start_draft.1.clone();
                     let mut sum = self.det_sum.clone();
+                    let mut referer = item.referer.clone();
 
                     let det_w = modal_width(ctx, DP_W);
                     let mut open = true;
@@ -5969,22 +8329,29 @@ impl eframe::App for CraftApp {
                             // The dialog is a card: no window item spacing
                             // between the header, the content and the bar.
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            // ---- title bar: file icon · name · close ----
+                            // ---- title bar: file badge · name · close ----
                             let (bar, _) = ui.allocate_exact_size(
-                                egui::vec2(det_w, 38.0),
+                                egui::vec2(det_w, 40.0),
                                 egui::Sense::hover(),
                             );
                             let p = ui.painter().clone();
+                            p.line_segment(
+                                [
+                                    egui::pos2(bar.min.x, bar.max.y - 0.5),
+                                    egui::pos2(bar.max.x, bar.max.y - 0.5),
+                                ],
+                                egui::Stroke::new(1.0, pl().modal_bd),
+                            );
                             p.text(
                                 egui::pos2(bar.min.x + 22.0, bar.center().y),
                                 egui::Align2::CENTER_CENTER,
                                 file_icon(crate::model::category_of(&item.filename)).to_string(),
                                 crate::fonts::icon(16.0),
-                                pl().primary,
+                                pl().warning,
                             );
                             let close_r = egui::Rect::from_center_size(
-                                egui::pos2(bar.max.x - 25.0, bar.center().y),
-                                egui::vec2(22.0, 22.0),
+                                egui::pos2(bar.max.x - 21.5, bar.center().y),
+                                egui::vec2(25.0, 25.0),
                             );
                             let close_hover = self.man.hover(&close_r);
                             if close_hover {
@@ -6001,7 +8368,7 @@ impl eframe::App for CraftApp {
                             // Filename between icon and X, elided on overflow.
                             // Drawn through the shaper so a Bangla caption name
                             // keeps its conjuncts and matra order.
-                            let title_l = bar.min.x + 36.0;
+                            let title_l = bar.min.x + 40.0;
                             let title_w = (close_r.min.x - 8.0 - title_l).max(40.0);
                             let shown = truncate_to_width(
                                 &p,
@@ -6019,37 +8386,25 @@ impl eframe::App for CraftApp {
                                 pl().txt,
                             );
 
-                            // ---- content (mock `.content`) ----
+                            // ---- content (mock `.dlg-body`) ----
                             egui::Frame::new()
                                 .inner_margin(egui::Margin {
-                                    left: 16,
-                                    right: 16,
-                                    top: 4,
-                                    bottom: 12,
+                                    left: 13,
+                                    right: 13,
+                                    top: 9,
+                                    bottom: 10,
                                 })
                                 .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.y = 3.0;
-                                    let row_w = det_w - 32.0;
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let row_w = det_w - 26.0;
                                     ui.set_width(row_w);
+                                    let soft = mix(pl().modal_bg, pl().modal_bd, 0.45);
 
-                                    // Type
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
-                                        dp_label(ui, "Type:");
-                                        dp_value(
-                                            ui,
-                                            &dp_type_label(&item.filename),
-                                            pl().txt,
-                                            11.0,
-                                            row_w - DP_LABEL_W - 10.0,
-                                        );
-                                    });
-                                    // Status
                                     let (status_txt, status_col) = match &item.status {
                                         Status::Queued => ("Queued".to_string(), pl().dim),
                                         Status::Downloading => (
                                             if item.downloaded_bytes == 0 {
-                                                "Downloading — connecting…".to_string()
+                                                "Connecting…".to_string()
                                             } else {
                                                 "Downloading".to_string()
                                             },
@@ -6059,29 +8414,114 @@ impl eframe::App for CraftApp {
                                         Status::Completed => ("Complete".to_string(), pl().success),
                                         Status::Failed(_) => ("Failed".to_string(), pl().error),
                                     };
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
-                                        dp_label(ui, "Status:");
-                                        dp_value(ui, &status_txt, status_col, 11.0, row_w - DP_LABEL_W - 10.0);
-                                    });
-                                    // Size
-                                    let size_txt = match item.total_bytes {
-                                        Some(t) if t > 0 => {
-                                            format!("{} ({} Bytes)", format_bytes(t), t)
+
+                                    // ---- meta strip: Type | Status | Size ----
+                                    let (strip, _) = ui.allocate_exact_size(
+                                        egui::vec2(row_w, 48.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    {
+                                        let p = ui.painter();
+                                        p.rect(
+                                            strip,
+                                            8.0,
+                                            pl().surface,
+                                            egui::Stroke::new(1.0, soft),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        let fr = [1.5_f32, 0.95, 1.0];
+                                        let sum_fr: f32 = fr.iter().sum();
+                                        let mut cx = strip.min.x;
+                                        for i in 0..3 {
+                                            let cw = row_w * fr[i] / sum_fr;
+                                            if i > 0 {
+                                                p.line_segment(
+                                                    [
+                                                        egui::pos2(cx, strip.min.y + 6.0),
+                                                        egui::pos2(cx, strip.max.y - 6.0),
+                                                    ],
+                                                    egui::Stroke::new(1.0, soft),
+                                                );
+                                            }
+                                            let tx = cx + 11.0;
+                                            let tw = (cw - 22.0).max(10.0);
+                                            p.text(
+                                                egui::pos2(tx, strip.min.y + 5.0),
+                                                egui::Align2::LEFT_TOP,
+                                                ["TYPE", "STATUS", "SIZE"][i],
+                                                crate::fonts::reg(8.0),
+                                                pl().dim,
+                                            );
+                                            let vy = strip.min.y + 17.0;
+                                            match i {
+                                                0 => {
+                                                    let tv = truncate_to_width(
+                                                        p,
+                                                        &dp_type_label(&item.filename),
+                                                        crate::fonts::reg(11.0),
+                                                        pl().txt,
+                                                        tw,
+                                                    );
+                                                    p.text(
+                                                        egui::pos2(tx, vy),
+                                                        egui::Align2::LEFT_TOP,
+                                                        tv,
+                                                        crate::fonts::reg(11.0),
+                                                        pl().txt,
+                                                    );
+                                                }
+                                                1 => {
+                                                    p.circle_filled(
+                                                        egui::pos2(tx + 2.5, vy + 5.5),
+                                                        2.5,
+                                                        status_col,
+                                                    );
+                                                    let sv = truncate_to_width(
+                                                        p,
+                                                        &status_txt,
+                                                        crate::fonts::reg(11.0),
+                                                        status_col,
+                                                        (tw - 10.0).max(10.0),
+                                                    );
+                                                    p.text(
+                                                        egui::pos2(tx + 10.0, vy),
+                                                        egui::Align2::LEFT_TOP,
+                                                        sv,
+                                                        crate::fonts::reg(11.0),
+                                                        status_col,
+                                                    );
+                                                }
+                                                _ => {
+                                                    let raw = match item.total_bytes {
+                                                        Some(t) if t > 0 => t,
+                                                        _ => item.downloaded_bytes,
+                                                    };
+                                                    p.text(
+                                                        egui::pos2(tx, vy),
+                                                        egui::Align2::LEFT_TOP,
+                                                        format_bytes(raw),
+                                                        crate::fonts::reg(11.0),
+                                                        pl().txt,
+                                                    );
+                                                    p.text(
+                                                        egui::pos2(tx, vy + 14.0),
+                                                        egui::Align2::LEFT_TOP,
+                                                        format!("{} bytes", thousands(raw)),
+                                                        crate::fonts::reg(8.5),
+                                                        pl().dim,
+                                                    );
+                                                }
+                                            }
+                                            cx += cw;
                                         }
-                                        _ => format!("{} downloaded", format_bytes(item.downloaded_bytes)),
-                                    };
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
-                                        dp_label(ui, "Size:");
-                                        dp_value(ui, &size_txt, pl().txt, 11.0, row_w - DP_LABEL_W - 10.0);
-                                    });
+                                    }
 
                                     // Live progress for anything not finished:
-                                    // one slim bar (the concept has no room
-                                    // for a second dialog).
+                                    // one slim bar plus a summary line under the
+                                    // meta strip (the concept has no room for a
+                                    // second dialog).
                                     if !finished {
-                                        ui.add_space(2.0);
+                                        ui.add_space(8.0);
                                         let (br, _) = ui.allocate_exact_size(
                                             egui::vec2(row_w, 4.0),
                                             egui::Sense::hover(),
@@ -6107,117 +8547,182 @@ impl eframe::App for CraftApp {
                                         if eta != "-" {
                                             bits.push(format!("{eta} left"));
                                         }
+                                        ui.add_space(3.0);
                                         dp_value(ui, &bits.join("  ·  "), pl().dim, 10.0, row_w);
-                                        ui.add_space(2.0);
+                                        ui.add_space(3.0);
+                                    } else {
+                                        ui.add_space(8.0);
                                     }
 
-                                    // Save To + Move (finished files only: a
-                                    // partial file must stay where it resumes).
+                                    // ---- Save to + Move ----
                                     let dest = item.dest_path();
                                     let exists = dest.exists();
+                                    let shown = if exists {
+                                        dest.to_string_lossy().to_string()
+                                    } else if finished {
+                                        "The file has been moved.".to_string()
+                                    } else {
+                                        item.save_dir.clone()
+                                    };
                                     ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        dp_label(ui, "Save To:");
-                                        let text_w =
-                                            (ui.available_width() - if finished { 62.0 } else { 0.0 })
-                                                .max(60.0);
-                                        let shown = if exists {
-                                            dest.to_string_lossy().to_string()
-                                        } else if finished {
-                                            "The file has been moved.".to_string()
-                                        } else {
-                                            item.save_dir.clone()
-                                        };
-                                        dp_value(ui, &shown, pl().dim, 10.0, text_w);
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Save to");
                                         if finished {
-                                            let r = dp_small(ui, &self.man, "Move", 56.0);
-                                            self.hits.push((HitKind::Btn(ButtonId::DMove), r));
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let r = dp_small(ui, &self.man, "Move", 56.0);
+                                                    self.hits.push((HitKind::Btn(ButtonId::DMove), r));
+                                                    let w = ui.available_width();
+                                                    dp_value(ui, &shown, pl().dim, 9.5, w);
+                                                },
+                                            );
+                                        } else {
+                                            let w = ui.available_width();
+                                            dp_value(ui, &shown, pl().dim, 9.5, w);
                                         }
                                     });
+                                    ui.add_space(4.0);
 
-                                    // Address (media URL) + copy
+                                    // ---- Address (media URL) + copy ----
                                     ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        dp_label(ui, "Address:");
-                                        let text_w = (ui.available_width() - 26.0).max(60.0);
-                                        dp_value(ui, &item.url, pl().primary, 10.0, text_w);
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Address");
+                                        let text_w = (ui.available_width() - 30.0).max(40.0);
+                                        dp_value(ui, &item.url, pl().primary, 9.5, text_w);
                                         let r = dp_icon(ui, &self.man, MI_COPY);
                                         self.hits.push((HitKind::Btn(ButtonId::DCopyAddr), r));
                                     });
+                                    ui.add_space(5.0);
+                                    dp_rule_soft(ui, soft);
+                                    ui.add_space(5.0);
 
-                                    // Description (live note)
+                                    // ---- Description (live note) ----
                                     ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        dp_label(ui, "Description:");
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Description");
                                         let w = ui.available_width();
                                         let r = dp_input(ui, "det_desc", &mut desc, "Add a note", w, false, false);
                                         self.hits.push((HitKind::Field("det_desc"), r));
                                     });
+                                    ui.add_space(4.0);
 
-                                    // Web page (the captured page, when the
-                                    // referer is an HTML page) + copy
-                                    let web = page_url_of(&item.referer);
-                                    let refr = if item.referer.trim().is_empty()
-                                        || item.referer.trim() == web
+                                    // ---- Start at + clock (Queue v2: start
+                                    // this row no earlier than HH:MM; blank =
+                                    // as soon as a slot is free) ----
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Start at");
+                                        let w = (ui.available_width() - 30.0).max(40.0);
+                                        let r = dp_input(
+                                            ui,
+                                            "det_start",
+                                            &mut start_at,
+                                            "HH:MM (blank = now)",
+                                            w,
+                                            false,
+                                            false,
+                                        );
+                                        self.hits.push((HitKind::Field("det_start"), r));
+                                        dp_icon(ui, &self.man, MI_SCHEDULE);
+                                    });
+                                    if !start_at.trim().is_empty()
+                                        && crate::model::parse_hhmm(&start_at).is_none()
                                     {
-                                        String::new()
-                                    } else {
-                                        item.referer.trim().to_string()
-                                    };
+                                        ui.add_space(2.0);
+                                        dp_value(
+                                            ui,
+                                            "Use HH:MM (24-hour), e.g. 23:30.",
+                                            pl().error,
+                                            10.0,
+                                            row_w,
+                                        );
+                                    }
+                                    ui.add_space(4.0);
+
+                                    // ---- Web page + Referer ----
+                                    let web = page_url_of(&item.referer);
                                     if !web.is_empty() {
+                                        dp_value(
+                                            ui,
+                                            "The web page from which this file was obtained:",
+                                            pl().dim,
+                                            9.5,
+                                            row_w,
+                                        );
+                                        ui.add_space(2.0);
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 6.0;
-                                            dp_label(ui, "Web page:");
-                                            let text_w = (ui.available_width() - 26.0).max(60.0);
-                                            dp_value(ui, &web, pl().primary, 10.0, text_w);
+                                            let text_w = (ui.available_width() - 26.0).max(40.0);
+                                            dp_value(ui, &web, pl().primary, 10.5, text_w);
                                             let r = dp_icon(ui, &self.man, MI_COPY);
                                             self.hits.push((HitKind::Btn(ButtonId::DCopyPage), r));
                                         });
+                                        ui.add_space(7.0);
                                     }
-                                    if !refr.is_empty() {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 10.0;
-                                            dp_label(ui, "Referer:");
-                                            dp_value(
-                                                ui,
-                                                &refr,
-                                                pl().dim,
-                                                10.0,
-                                                row_w - DP_LABEL_W - 10.0,
-                                            );
-                                        });
-                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Referer");
+                                        let w = ui.available_width();
+                                        let r = dp_input(
+                                            ui,
+                                            "det_ref",
+                                            &mut referer,
+                                            "https://… (empty = none)",
+                                            w,
+                                            false,
+                                            false,
+                                        );
+                                        self.hits.push((HitKind::Field("det_ref"), r));
+                                    });
+                                    ui.add_space(4.0);
 
-                                    // Integrity: the README-documented SHA-256
-                                    // check keeps its home here (finished or
-                                    // already-set items only).
+                                    // ---- Integrity + Verify ----
                                     if finished || !item.checksum_sha256.trim().is_empty() {
                                         ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 6.0;
-                                            dp_label(ui, "Integrity:");
-                                            let w = (ui.available_width()
-                                                - if finished { 66.0 } else { 0.0 })
-                                                .max(60.0);
-                                            let r = dp_input(
-                                                ui,
-                                                "det_sum",
-                                                &mut sum,
-                                                "SHA-256 (optional)",
-                                                w,
-                                                false,
-                                                false,
-                                            );
-                                            self.hits.push((HitKind::Field("det_sum"), r));
+                                            ui.spacing_mut().item_spacing.x = 10.0;
+                                            dp_lbl(ui, "Integrity");
                                             if finished {
-                                                let vr = dp_small(ui, &self.man, "Verify", 60.0);
-                                                self.hits
-                                                    .push((HitKind::Btn(ButtonId::DVerify), vr));
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        let vr = dp_small(ui, &self.man, "Verify", 62.0);
+                                                        self.hits.push((
+                                                            HitKind::Btn(ButtonId::DVerify),
+                                                            vr,
+                                                        ));
+                                                        let w = ui.available_width();
+                                                        let r = dp_input(
+                                                            ui,
+                                                            "det_sum",
+                                                            &mut sum,
+                                                            "SHA-256 (optional)",
+                                                            w,
+                                                            false,
+                                                            false,
+                                                        );
+                                                        self.hits.push((HitKind::Field("det_sum"), r));
+                                                    },
+                                                );
+                                            } else {
+                                                let w = ui.available_width();
+                                                let r = dp_input(
+                                                    ui,
+                                                    "det_sum",
+                                                    &mut sum,
+                                                    "SHA-256 (optional)",
+                                                    w,
+                                                    false,
+                                                    false,
+                                                );
+                                                self.hits.push((HitKind::Field("det_sum"), r));
                                             }
                                         });
                                         let norm = crate::model::normalize_sha256(&sum);
                                         if !sum.trim().is_empty()
                                             && !crate::model::is_valid_sha256(&norm)
                                         {
+                                            ui.add_space(2.0);
                                             dp_value(
                                                 ui,
                                                 "Invalid SHA-256 — 64 hex characters expected.",
@@ -6226,26 +8731,50 @@ impl eframe::App for CraftApp {
                                                 row_w,
                                             );
                                         }
+                                        ui.add_space(4.0);
                                     }
 
-                                    ui.add_space(4.0);
-                                    dp_rule(ui);
-                                    ui.add_space(4.0);
+                                    dp_rule_soft(ui, soft);
+                                    ui.add_space(5.0);
 
-                                    // Login + Password on one row (mock `.auth-row`)
+                                    // ---- Login + Password side by side ----
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 8.0;
-                                        let field_w = ((row_w - 8.0) / 2.0 - 54.0).max(40.0);
-                                        dp_auth_label(ui, "Login");
-                                        let r = dp_input(
-                                            ui, "det_user", &mut user, "", field_w, false, true,
+                                        let half = ((row_w - 8.0) / 2.0).max(60.0);
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(half, DP_ROW_H),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 7.0;
+                                                ui.add(egui::Label::new(
+                                                    egui::RichText::new("Login")
+                                                        .font(crate::fonts::reg(10.5))
+                                                        .color(pl().dim),
+                                                ));
+                                                let w = ui.available_width();
+                                                let r = dp_input(
+                                                    ui, "det_user", &mut user, "", w, false, false,
+                                                );
+                                                self.hits.push((HitKind::Field("det_user"), r));
+                                            },
                                         );
-                                        self.hits.push((HitKind::Field("det_user"), r));
-                                        dp_auth_label(ui, "Password");
-                                        let r = dp_input(
-                                            ui, "det_pass", &mut pass, "", field_w, true, true,
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(half, DP_ROW_H),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 7.0;
+                                                ui.add(egui::Label::new(
+                                                    egui::RichText::new("Password")
+                                                        .font(crate::fonts::reg(10.5))
+                                                        .color(pl().dim),
+                                                ));
+                                                let w = ui.available_width();
+                                                let r = dp_input(
+                                                    ui, "det_pass", &mut pass, "", w, true, false,
+                                                );
+                                                self.hits.push((HitKind::Field("det_pass"), r));
+                                            },
                                         );
-                                        self.hits.push((HitKind::Field("det_pass"), r));
                                     });
                                 });
 
@@ -6260,9 +8789,9 @@ impl eframe::App for CraftApp {
                             );
                             egui::Frame::new()
                                 .inner_margin(egui::Margin {
-                                    left: 16,
-                                    right: 16,
-                                    top: 10,
+                                    left: 13,
+                                    right: 13,
+                                    top: 9,
                                     bottom: 10,
                                 })
                                 .show(ui, |ui| {
@@ -6296,6 +8825,7 @@ impl eframe::App for CraftApp {
                         });
 
                     // Persist the live edits (one write per changed field).
+                    self.det_start_draft.1 = start_at.clone();
                     let mut dirty = false;
                     if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
                         if d.description != desc {
@@ -6308,6 +8838,19 @@ impl eframe::App for CraftApp {
                         }
                         if d.password != pass {
                             d.password = pass;
+                            dirty = true;
+                        }
+                        // Bad input never sticks: the previous schedule stays.
+                        let next_start = start_at.trim().to_string();
+                        if crate::model::parse_hhmm(&next_start).is_some() || next_start.is_empty() {
+                            if d.start_at != next_start {
+                                d.start_at = next_start;
+                                dirty = true;
+                            }
+                        }
+                        let next_ref = referer.trim().to_string();
+                        if d.referer != next_ref {
+                            d.referer = next_ref;
                             dirty = true;
                         }
                     }
@@ -6440,7 +8983,7 @@ impl eframe::App for CraftApp {
                 job.wrap.max_width = body_w;
                 for (t, f, c) in [
                     ("Version ", f_ver.clone(), p.dim),
-                    (env!("CARGO_PKG_VERSION"), f_ver_b.clone(), accent_hi),
+                    (crate::model::APP_VERSION, f_ver_b.clone(), accent_hi),
                     (" — check this to confirm your build.", f_ver.clone(), p.dim),
                 ] {
                     job.append(
@@ -6713,6 +9256,9 @@ impl eframe::App for CraftApp {
         if let Some((id, pos)) = self.ctx_menu {
             self.render_ctx_menu(ctx, id, pos);
         }
+        if let Some(pos) = self.col_menu {
+            self.render_col_menu(ctx, pos);
+        }
         self.process_hits(ctx);
         self.diag_hits_n = self.hits.len();
     }
@@ -6792,6 +9338,17 @@ impl CraftApp {
         }
     }
 
+    /// A manually opened Add dialog starts without the last browser
+    /// capture's session: its cookie, referer, captured headers and login
+    /// would otherwise be sent to whatever URL is typed next.
+    fn clear_add_credentials(&mut self) {
+        self.add_referer.clear();
+        self.add_cookie.clear();
+        self.add_headers.clear();
+        self.add_user.clear();
+        self.add_pass.clear();
+    }
+
     /// Manual dialog/toast button dispatcher (driven by process_hits).
     /// Validate + queue the Add dialog contents (shared by Add/Download).
     fn commit_add(&mut self, download: bool) {
@@ -6813,7 +9370,11 @@ impl CraftApp {
         let existing = self
             .downloads
             .iter()
-            .position(|d| d.url == self.add_url.trim());
+            // Same download = same URL at the same quality (one page at
+            // 1080p and 720p is two files), as everywhere else.
+            .position(|d| {
+                d.url == self.add_url.trim() && crate::model::same_quality(&d.quality_pref, &self.add_quality)
+            });
         if let Some(pos) = existing {
             let dead = match &self.downloads[pos].status {
                 Status::Failed(_) => true,
@@ -6832,10 +9393,10 @@ impl CraftApp {
         if self.add_dir.trim().is_empty() {
             self.add_dir = dirs::download_dir()
                 .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "C:\\Downloads".to_string());
+                .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
         }
         let final_dir = self.save_dir_for(&self.add_file);
-        let id = match existing {
+        let mut id = match existing {
             Some(pos) => {
                 // Refresh the dead row in place (same id): drop any stale
                 // resume state so a mixed-URL resume can't corrupt the file.
@@ -6844,17 +9405,26 @@ impl CraftApp {
                 crate::model::drop_resume_state(&dp);
                 id
             }
-            None => self.alloc_id(),
+            None => 0,
         };
         let mut item = DownloadItem::new(
             id,
             self.add_url.trim().to_string(),
-            self.add_file.trim().to_string(),
+            // The last gate before a name becomes a path. Whatever the
+            // dialog holds - a capture's own name, a name taken from the
+            // URL, or something the user typed - has to be a file name and
+            // not a path, or the download would land outside the folder.
+            crate::engine::sanitize_filename(self.add_file.trim()),
             final_dir,
             self.add_conns,
         );
         item.referer = self.add_referer.clone();
         item.cookie = self.add_cookie.clone();
+        // The captured browser agent travels with the row.
+        item.user_agent = self.add_user_agent.clone();
+        // Captured headers belong to that one capture: never reuse them for
+        // a later manual add.
+        item.extra_headers = std::mem::take(&mut self.add_headers);
         item.username = self.add_user.clone();
         item.password = self.add_pass.clone();
         item.checksum_sha256 = csum;
@@ -6878,6 +9448,9 @@ impl CraftApp {
                 self.push_log(format!("Re-queued #{id}"));
             }
             None => {
+                if !self.persist_new_item(&mut item) { self.show_add=true; return; }
+                id=item.id;
+                self.downloads.retain(|d|d.id!=id);
                 self.downloads.push(item);
                 self.push_log(format!("Queued #{id}"));
             }
@@ -6889,6 +9462,7 @@ impl CraftApp {
         self.add_file.clear();
         self.add_checksum.clear();
         self.add_quality.clear();
+        self.clear_add_credentials();
         if download {
             self.queue_running = true;
             self.start(id);
@@ -6950,12 +9524,38 @@ impl CraftApp {
             ButtonId::AddAdv => self.add_adv = !self.add_adv,
             ButtonId::AddAdd => self.commit_add(false),
             ButtonId::AddDownload => self.commit_add(true),
+            ButtonId::AddToCloud => {
+                // A magnet names a torrent. The provider fetches it; this
+                // app opens no peer connection and never becomes a torrent
+                // client. The magnet goes to the cloud panel with the
+                // provider the user last chose.
+                let magnet = self.add_url.trim().to_string();
+                if !crate::model::is_magnet(&magnet) {
+                    self.show_add = true;
+                    self.push_log("Add download: that is not a magnet link.");
+                    return;
+                }
+                self.debrid_input = magnet;
+                self.show_add = false;
+                self.add_focus_req = false;
+                self.add_recent_open = false;
+                self.show_debrid = true;
+                self.debrid_picker.dismiss();
+                self.push_log("Magnet handed to the cloud provider panel.");
+            }
             ButtonId::AddCancel => {
                 self.show_add = false;
                 self.add_focus_req = false;
             }
-            ButtonId::GrabStart => self.start_grab(),
-            ButtonId::GrabQueue => self.queue_grab_results(),
+            ButtonId::ExtractStart => {
+                let id = self.extract_id;
+                self.start_extract(id);
+            }
+            ButtonId::ExtractClose => {
+                self.show_extract = false;
+                self.extract_password.clear();
+            }
+            ButtonId::GrabStart => self.start_grab(),            ButtonId::GrabQueue => self.queue_grab_results(),
             ButtonId::GrabClose => {
                 self.show_grabber = false;
             }
@@ -6964,6 +9564,30 @@ impl CraftApp {
                 const PRESETS: &[&str] =
                     &["Mixed", "Video", "Audio", "Images", "Documents", "Archives"];
                 self.grab_exts = crate::grabber::preset_exts(PRESETS[self.grab_preset]);
+            }
+            ButtonId::DebridProvider => {
+                // The provider is a list, not a cycle: the button opens
+                // it and the list does the choosing.
+                self.debrid_picker.toggle();
+            }
+            ButtonId::DebridValidate => self.start_debrid_validate(),
+            ButtonId::DebridSubmit => self.start_debrid_submit(),
+            ButtonId::DebridTorrentFile => self.start_debrid_torrent_file(),
+            ButtonId::DebridRefresh => self.start_debrid_refresh(),
+            ButtonId::DebridSelectAll => {
+                if let Some(s) = self.debrid_session.as_mut() {
+                    s.select_all();
+                }
+            }
+            ButtonId::DebridSelectNone => {
+                if let Some(s) = self.debrid_session.as_mut() {
+                    s.select_none();
+                }
+            }
+            ButtonId::DebridQueue => self.start_debrid_queue(),
+            ButtonId::DebridCancel => self.start_debrid_cancel(),
+            ButtonId::DebridClose => {
+                self.show_debrid = false;
             }
             ButtonId::RuleAdd => {
                 if self.folder_rules.len() < 8 {
@@ -7038,7 +9662,7 @@ impl CraftApp {
                 if self.add_dir.trim().is_empty() {
                     self.add_dir = dirs::download_dir()
                         .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "C:\\Downloads".to_string());
+                        .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
                 }
                 self.save_ui_state();
             }
@@ -7165,18 +9789,6 @@ impl CraftApp {
                 }
             }
             ButtonId::AbClose => self.show_about = false,
-            ButtonId::TAdd => {
-                if let Some(url) = self.clipboard_toast.clone() {
-                    self.add_url = url.clone();
-                    self.add_file = filename_from_url(&url);
-                    self.add_checksum.clear();
-                    self.add_quality.clear();
-                    self.clipboard_toast = None;
-                    self.add_focus_req = true;
-                    self.show_add = true;
-                }
-            }
-            ButtonId::TDismiss => self.clipboard_toast = None,
         }
     }
 
@@ -7261,20 +9873,55 @@ impl CraftApp {
         self.render_popup(ctx, "ctx_menu", pos, 230.0, rows);
     }
 
+    /// The Columns menu: which columns the table shows.
+    ///
+    /// Right-clicking a column header opens it. The menu stays open while
+    /// it is used, so several columns can be turned off in a row.
+    fn render_col_menu(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
+        let rows = self.column_rows();
+        self.render_popup(ctx, "col_menu", pos, 210.0, rows);
+    }
+
+    /// The rows of the Columns menu.
+    ///
+    /// The Name column is the anchor of the table and is always shown, so
+    /// it is listed and says so rather than pretending to be a choice.
+    fn column_rows(&self) -> Vec<(String, Option<HitKind>)> {
+        let mut out = Vec::new();
+        for (i, c) in SortCol::ALL.iter().enumerate() {
+            let mut label = c.title().to_string();
+            if *c == SortCol::Name {
+                label.push_str("  (always shown)");
+            } else if !self.col_hidden.contains(c) {
+                label = format!("✓ {label}");
+            }
+            out.push((label, Some(HitKind::ColMenuItem(i as u8))));
+        }
+        out.push((String::new(), None));
+        out.push(("Reset widths".into(), Some(HitKind::ColMenuItem(90))));
+        out.push(("Reset order".into(), Some(HitKind::ColMenuItem(91))));
+        out
+    }
+
     /// Match recorded hit rects (reverse = topmost first) against manual
     /// pointer state and dispatch. The single place anything "clicks".
     fn process_hits(&mut self, ctx: &egui::Context) {
-        // Active divider drag continuation (movement, not clicks).
+        // A divider drag is over once the button is up and its release frame
+        // (which still holds the capture) has passed.
+        if self.resize_cap.is_none() && !self.man.down_left() {
+            self.col_drag_used = false;
+        }
         // Active divider drag continues here (movement, not clicks).
         if let Some(cap) = self.resize_cap.take() {
             match cap {
-                ResizeCap::Col { col, start_x, start_w } => {
+                ResizeCap::Col { col, right, start_x, start_w, start_right } => {
                     if self.man.down_left() {
                         if let Some(p) = self.man.pos() {
-                            let nw = (start_w + (p.x - start_x)).clamp(col_min(col), 900.0);
-                            self.col_w.insert(col, nw);
+                            for (c, w) in divider_widths(col, right, start_w, start_right, p.x - start_x) {
+                                self.col_w.insert(c, w);
+                            }
                         }
-                        self.resize_cap = Some(ResizeCap::Col { col, start_x, start_w });
+                        self.resize_cap = Some(cap);
                     } else {
                         self.save_ui_state();
                     }
@@ -7285,6 +9932,7 @@ impl CraftApp {
         let modal_open = self.show_add
             || self.show_queues
             || self.show_about
+            || self.show_debrid
             || self.details_id.is_some();
         let mut hover_dbg = "-".to_string();
         let mut fired_any = false;
@@ -7310,6 +9958,9 @@ impl CraftApp {
                     | HitKind::Slider(..)
                     | HitKind::Field(_)
                     | HitKind::ComboAnchor
+                    | HitKind::DebridProviderRow(_)
+                    | HitKind::ColMenuItem(_)
+                    | HitKind::QMove(_, _)
             );
             if modal_open && !dialog_kind {
                 continue;
@@ -7326,7 +9977,7 @@ impl CraftApp {
                     HitKind::RowCheck(id) => format!("check:#{id}"),
                     HitKind::HdrCol(c) => format!("hdr:{}", c.key()),
                     HitKind::HdrCheck => "hdrcheck".to_string(),
-                    HitKind::ResizeCol(c) => format!("rz:{}", c.key()),
+                    HitKind::ResizeCol(c, _) => format!("rz:{}", c.key()),
                     HitKind::MenuBtn(m) => format!("menu:{m}"),
                     HitKind::MenuItem(a) => format!("menuitem:{a}"),
                     HitKind::CtxItem(_, id) => format!("ctx:#{id}"),
@@ -7335,6 +9986,9 @@ impl CraftApp {
                     HitKind::Slider(..) => "slider".to_string(),
                     HitKind::Field(f) => format!("field:{f}"),
                     HitKind::ComboAnchor => "combo".to_string(),
+                    HitKind::DebridProviderRow(i) => format!("provider:{i}"),
+                    HitKind::ColMenuItem(i) => format!("colmenu:{i}"),
+                    HitKind::QMove(id, d) => format!("qmove:#{id}:{d}"),
                 };
             }
             if clk || sec {
@@ -7353,6 +10007,15 @@ impl CraftApp {
                                 self.add_file.clear();
                                 self.add_checksum.clear();
                                 self.add_quality.clear();
+                                self.clear_add_credentials();
+                                // A link picked up from the clipboard is
+                                // pre-filled here: the lit Add URL button is
+                                // the only affordance (no banner row).
+                                if let Some(url) = self.clipboard_url.take() {
+                                    self.add_file = filename_from_url(&url);
+                                    self.add_url = url;
+                                    self.add_focus_req = true;
+                                }
                                 self.show_add = true;
                             }
                             ToolId::StartQueue => self.start_queue(),
@@ -7364,6 +10027,10 @@ impl CraftApp {
                             ToolId::Grabber => {
                                 self.grab_notice.clear();
                                 self.show_grabber = true;
+                            }
+                            ToolId::Debrid => {
+                                self.debrid_notice.clear();
+                                self.show_debrid = true;
                             }
                             ToolId::ResumeSel => {
                                 // Resume what is checked; with nothing checked,
@@ -7430,6 +10097,22 @@ impl CraftApp {
                         self.do_menu_act(ctx, a);
                     }
                 }
+                HitKind::ColMenuItem(a) => {
+                    if clk {
+                        // The menu stays open so several columns can be
+                        // turned off in a row.
+                        fired_menu = true;
+                        if a < SortCol::ALL.len() as u8 {
+                            let col = SortCol::ALL[a as usize];
+                            toggle_hidden_col(&mut self.col_hidden, col);
+                        } else if a == 90 {
+                            self.col_w.clear();
+                        } else if a == 91 {
+                            self.col_order = SortCol::ALL.to_vec();
+                        }
+                        self.save_ui_state();
+                    }
+                }
                 HitKind::SideRow(key) => {
                     if clk {
                         if key == "Queues" {
@@ -7453,6 +10136,11 @@ impl CraftApp {
                         if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
                             d.selected = !d.selected;
                         }
+                    }
+                }
+                HitKind::QMove(id, dir) => {
+                    if clk {
+                        self.move_in_queue(id, dir);
                     }
                 }
                 HitKind::Row(id) => {
@@ -7485,13 +10173,19 @@ impl CraftApp {
                     }
                 }
                 HitKind::HdrCol(c) => {
-                    if clk {
+                    if clk && !self.col_drag_used {
                         if self.sort_col == c {
                             self.sort_asc = !self.sort_asc;
                         } else {
                             self.sort_col = c;
                             self.sort_asc = true;
                         }
+                    } else if sec {
+                        // Right-clicking a header opens the Columns menu,
+                        // the way IDM does.
+                        self.col_menu = self.man.pos().or(Some(egui::pos2(120.0, 120.0)));
+                        self.drop_menu = None;
+                        self.ctx_menu = None;
                     }
                 }
                 HitKind::HdrCheck => {
@@ -7514,16 +10208,19 @@ impl CraftApp {
                         }
                     }
                 }
-                HitKind::ResizeCol(c) => {
+                HitKind::ResizeCol(c, right) => {
                     if hov {
                         zone_cursor = Some(egui::CursorIcon::ResizeColumn);
                     }
                     if self.man.press_started_in(&rect) {
                         if let Some(p) = self.man.pos() {
+                            self.col_drag_used = true;
                             self.resize_cap = Some(ResizeCap::Col {
                                 col: c,
+                                right,
                                 start_x: p.x,
                                 start_w: col_w_of(&self.col_w, c),
+                                start_right: col_w_of(&self.col_w, right),
                             });
                         }
                     }
@@ -7537,6 +10234,11 @@ impl CraftApp {
                 }
                 HitKind::Btn(b) => {
                     if clk {
+                        // A button that opens one of the app's popups is a
+                        // popup click, not "a click somewhere else".
+                        if button_opens_popup(b) {
+                            fired_menu = true;
+                        }
                         self.do_button(b);
                     }
                 }
@@ -7559,6 +10261,11 @@ impl CraftApp {
                                 self.add_overwrite = !self.add_overwrite
                             }
                             CheckId::GrabDepth => self.grab_depth = !self.grab_depth,
+                            CheckId::DebridFile(id) => {
+                                if let Some(s) = self.debrid_session.as_mut() {
+                                    s.toggle(id);
+                                }
+                            }
                             CheckId::WinOn => {
                                 self.speed_windows_on = !self.speed_windows_on;
                                 self.refresh_speed_limit();
@@ -7596,6 +10303,13 @@ impl CraftApp {
                         self.finish_open = !self.finish_open;
                     }
                 }
+                HitKind::DebridProviderRow(i) => {
+                    if clk {
+                        fired_menu = true;
+                        self.debrid_picker.choose(i);
+                        self.debrid_provider_changed();
+                    }
+                }
             }
         }
         if let Some(cur) = zone_cursor {
@@ -7612,10 +10326,257 @@ impl CraftApp {
             self.drop_menu = None;
         }
         // Clicks elsewhere dismiss open popups (standard behavior).
-        if fired_any && !fired_menu && !fired_ctx {
+        if close_popups_after_click(fired_any, fired_menu) && !fired_ctx {
             self.drop_menu = None;
             self.ctx_menu = None;
+            self.col_menu = None;
+            self.debrid_picker.dismiss();
         }
         self.man_hover_dbg = hover_dbg;
+    }
+}
+
+/// Byte counts cannot override a failed audio/duration/checksum validation.
+fn task_can_complete(shared: &SharedState, bytes_landed: bool) -> bool {
+    bytes_landed && shared.succeeded.load(Ordering::SeqCst)
+        && !shared.cancelled.load(Ordering::SeqCst)
+}
+#[cfg(test)]
+mod audit_completion_tests {
+    #[test]
+    fn column_dividers_follow_the_pointer() {
+        use super::{divider_widths, col_min, SortCol};
+        // Name | Size: Name takes the rest, so only Size changes, and
+        // dragging right gives Name more room.
+        assert_eq!(divider_widths(SortCol::Name, SortCol::Size, 300.0, 90.0, 20.0), vec![(SortCol::Size, 70.0)]);
+        // Size | Status: one grows by what the other loses (sum unchanged).
+        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, 15.0);
+        assert_eq!(w, vec![(SortCol::Size, 105.0), (SortCol::Status, 95.0)]);
+        // Never below a minimum on either side.
+        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, 500.0);
+        assert_eq!(w[1], (SortCol::Status, col_min(SortCol::Status)));
+        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, -500.0);
+        assert_eq!(w[0], (SortCol::Size, col_min(SortCol::Size)));
+    }
+    use super::*;
+    #[test]
+    fn validation_failure_never_becomes_completed_from_full_byte_count() {
+        let s=SharedState::new();
+        s.downloaded.store(100,Ordering::SeqCst);
+        s.total.store(100,Ordering::SeqCst);
+        s.set_error("finished media has no audio track");
+        assert!(!task_can_complete(&s,true));
+        let success=SharedState::new();
+        success.succeeded.store(true,Ordering::SeqCst);
+        assert!(task_can_complete(&success,true));
+        assert!(!task_can_complete(&success,false));
+        success.cancelled.store(true,Ordering::SeqCst);
+        assert!(!task_can_complete(&success,true));
+    }
+}
+
+/// The provider dropdown is a LIST, and the user reported that it never
+/// opened: the click that opens it was read as "a click somewhere else",
+/// and the app's own rule closed the list again in the same frame.
+///
+/// These tests drive the dropdown the way the mouse and the keyboard do.
+#[cfg(test)]
+mod provider_picker_tests {
+    use super::*;
+    use crate::debrid::Provider;
+
+    #[test]
+    fn the_list_opens_and_every_provider_can_be_chosen() {
+        let mut p = ProviderPicker::default();
+        assert_eq!(p.provider(), Provider::RealDebrid);
+        assert!(!p.is_open());
+
+        // The anchor opens the list and puts the keyboard on the current
+        // provider.
+        p.toggle();
+        assert!(p.is_open());
+        assert_eq!(p.highlight(), p.index());
+        p.dismiss();
+
+        // Every provider of the list can be chosen, and the choice is what
+        // the panel then talks to.
+        for (i, want) in Provider::ALL.into_iter().enumerate() {
+            p.toggle();
+            assert!(p.is_open(), "the anchor opens the list");
+            p.choose(i);
+            assert!(!p.is_open(), "choosing a row closes the list");
+            assert_eq!(p.provider(), want);
+            assert_eq!(p.index(), i);
+        }
+    }
+
+    #[test]
+    fn choosing_the_provider_that_is_already_chosen_does_not_cycle() {
+        let mut p = ProviderPicker::default();
+        p.select(2); // AllDebrid
+        p.toggle();
+        p.choose(p.index());
+        // Still AllDebrid: a list never moves on to the next one by itself.
+        assert_eq!(p.provider(), Provider::AllDebrid);
+        assert!(!p.is_open());
+    }
+
+    #[test]
+    fn the_keyboard_walks_the_list_and_enter_picks() {
+        let mut p = ProviderPicker::default();
+        p.toggle();
+        // The keyboard starts on the chosen provider and walks the list.
+        assert_eq!(p.highlight(), 0);
+        p.move_highlight(1);
+        assert_eq!(p.highlight(), 1);
+        p.move_highlight(-1);
+        assert_eq!(p.highlight(), 0);
+        // Up from the first row wraps round to the last.
+        p.move_highlight(-1);
+        assert_eq!(p.highlight(), Provider::ALL.len() - 1);
+        p.accept();
+        assert_eq!(p.provider(), Provider::DebridLink);
+        assert!(!p.is_open());
+
+        // Escape closes the list without choosing anything.
+        p.toggle();
+        p.move_highlight(1);
+        p.dismiss();
+        assert!(!p.is_open());
+        assert_eq!(p.provider(), Provider::DebridLink);
+    }
+
+    #[test]
+    fn a_stale_index_cannot_point_the_panel_at_nothing() {
+        let mut p = ProviderPicker::default();
+        p.select(99);
+        assert!(p.index() < Provider::ALL.len());
+        assert_eq!(p.provider(), Provider::ALL[99 % Provider::ALL.len()]);
+    }
+
+    #[test]
+    fn the_click_that_opens_the_list_survives_the_end_of_frame_rule() {
+        use super::{button_opens_popup, close_popups_after_click};
+        // The frame: the user clicks the provider button, the list opens,
+        // and then the app applies its "a click elsewhere closes the
+        // popups" rule.
+        let mut p = ProviderPicker::default();
+        let clicked = ButtonId::DebridProvider;
+        p.toggle();
+        let popup_click = button_opens_popup(clicked);
+        if close_popups_after_click(true, popup_click) {
+            p.dismiss();
+        }
+        assert!(
+            p.is_open(),
+            "the provider list must still be open after the click that opened it"
+        );
+    }
+
+    #[test]
+    fn only_the_provider_button_opens_a_popup() {
+        use super::button_opens_popup;
+        assert!(button_opens_popup(ButtonId::DebridProvider));
+        // Every other button is an ordinary click.
+        assert!(!button_opens_popup(ButtonId::DebridValidate));
+        assert!(!button_opens_popup(ButtonId::DebridSubmit));
+        assert!(!button_opens_popup(ButtonId::DebridClose));
+        assert!(!button_opens_popup(ButtonId::DebridQueue));
+    }
+
+    #[test]
+    fn a_click_elsewhere_still_closes_the_list() {
+        use super::{button_opens_popup, close_popups_after_click};
+        let mut p = ProviderPicker::default();
+        p.toggle();
+        let popup_click = button_opens_popup(ButtonId::DebridValidate);
+        assert!(close_popups_after_click(true, popup_click));
+        if close_popups_after_click(true, popup_click) {
+            p.dismiss();
+        }
+        assert!(!p.is_open());
+    }
+
+    #[test]
+    fn the_chosen_provider_survives_a_round_trip_through_its_key() {
+        // The NAME is remembered across restarts; a token never is.
+        for p in Provider::ALL {
+            let mut picker = ProviderPicker::default();
+            picker.select(p.index());
+            let key = picker.provider().key();
+            let back = Provider::from_key(key).expect("the key must be known");
+            assert_eq!(back, p);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cloud_queue_tests {
+    use super::*;
+
+    fn target(conns: Option<usize>, size: u64) -> crate::debrid::QueueTarget {
+        crate::debrid::QueueTarget {
+            url: "https://cdn.example.test/file.bin".to_string(),
+            filename: "file.bin".to_string(),
+            size,
+            connections: conns,
+            expires_at: None,
+        }
+    }
+
+    /// A cloud row keeps the provider's own connection limit, so the
+    /// download never opens more sockets than the provider allows.
+    #[test]
+    fn a_cloud_row_keeps_the_provider_connection_limit() {
+        // The provider's limit wins over the app default.
+        assert_eq!(cloud_row_settings(&target(Some(4), 10), 12), (4, Some(10)));
+        // No limit from the provider: the app default stands.
+        assert_eq!(cloud_row_settings(&target(None, 10), 12), (12, Some(10)));
+        // A limit outside the usable range is brought back into it.
+        assert_eq!(cloud_row_settings(&target(Some(0), 10), 12), (1, Some(10)));
+        assert_eq!(cloud_row_settings(&target(Some(99), 10), 12), (16, Some(10)));
+        // A size the provider did not report stays unknown.
+        assert_eq!(cloud_row_settings(&target(Some(4), 0), 12), (4, None));
+    }
+    /// A column can be turned off and back on, and the Name column - the
+    /// anchor of the table - is never one of them.
+    #[test]
+    fn a_column_can_be_hidden_and_shown_again() {
+        let mut hidden: Vec<SortCol> = Vec::new();
+        toggle_hidden_col(&mut hidden, SortCol::Speed);
+        assert_eq!(hidden, vec![SortCol::Speed]);
+        // The Name column hangs the table off itself and stays.
+        toggle_hidden_col(&mut hidden, SortCol::Name);
+        assert_eq!(hidden, vec![SortCol::Speed]);
+        // Turning it off again brings it back.
+        toggle_hidden_col(&mut hidden, SortCol::Speed);
+        assert!(hidden.is_empty());
+        // Turning the same column off and on again leaves it shown.
+        toggle_hidden_col(&mut hidden, SortCol::Eta);
+        assert_eq!(hidden, vec![SortCol::Eta]);
+        toggle_hidden_col(&mut hidden, SortCol::Eta);
+        assert!(hidden.is_empty());
+    }
+
+    /// The table shows the ordered columns minus the hidden ones, and Name
+    /// is always in there.
+    #[test]
+    fn the_table_keeps_its_name_column() {
+        let order = SortCol::ALL.to_vec();
+        assert_eq!(visible_cols(&order, &[]).len(), 6);
+        let hidden = vec![SortCol::Speed, SortCol::Eta, SortCol::Date];
+        let shown = visible_cols(&order, &hidden);
+        assert_eq!(shown, vec![
+            SortCol::Name,
+            SortCol::Size,
+            SortCol::Status
+        ]);
+        // Even with everything else hidden, the table still has its anchor.
+        let all_hidden: Vec<SortCol> = SortCol::ALL
+            .iter()
+            .copied()
+            .filter(|c| *c != SortCol::Name)
+            .collect();
+        assert_eq!(visible_cols(&order, &all_hidden), vec![SortCol::Name]);
     }
 }

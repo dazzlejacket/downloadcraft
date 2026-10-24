@@ -1,0 +1,42 @@
+{
+  "rust": "test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.44s",
+  "build": "Finished `release` profile [optimized] target(s) in 19.23s",
+  "buildWarnings": 112,
+  "javascript": {
+    "tests": 279,
+    "pass": 279,
+    "fail": 0,
+    "suites": 35
+  },
+  "codeCommit": "599e46853b477d158830909f3f30133b12cf23e6",
+  "desktopVersion": "0.9.8",
+  "extensionVersion": "0.9.8.2",
+  "edge": {
+    "passed": true,
+    "checks": {
+      "directVideo": true,
+      "audio": true,
+      "embeddedVideo": true,
+      "hls": true,
+      "dash": true,
+      "falsePositivesExcluded": true,
+      "audioControl": true,
+      "videoControl": true,
+      "dynamicAudioControl": true
+    }
+  },
+  "brave": {
+    "passed": true,
+    "checks": {
+      "directVideo": true,
+      "audio": true,
+      "embeddedVideo": true,
+      "hls": true,
+      "dash": true,
+      "falsePositivesExcluded": true,
+      "audioControl": true,
+      "videoControl": true,
+      "dynamicAudioControl": true
+    }
+  }
+}

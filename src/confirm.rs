@@ -37,38 +37,36 @@ fn ui_path() -> Option<std::path::PathBuf> {
 
 /// Claim (remove) our URL from the native inbox so the main window does not
 /// prompt for it too. Runs at dialog open; Cancel therefore discards.
-fn claim_inbox(url: &str) {
-    let Some(path) = crate::native_host::inbox_path() else {
-        return;
-    };
-    let _guard = crate::model::fs_lock("inbox");
-    let data = match std::fs::read_to_string(&path) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let items: Vec<crate::native_host::InboxItem> =
-        serde_json::from_str(&data).unwrap_or_default();
-    let rest: Vec<_> = items.into_iter().filter(|i| i.url != url).collect();
-    if rest.is_empty() {
-        let _ = std::fs::remove_file(&path);
-    } else if let Ok(json) = serde_json::to_string_pretty(&rest) {
-        let _ = atomic_write(&path, json.as_bytes());
-    }
+fn claim_inbox(url: &str) -> Option<crate::native_host::InboxItem> {
+    let path=crate::native_host::inbox_path()?;
+    let guard=crate::model::fs_lock("inbox");
+    if !guard.owned() {return None;}
+    claim_inbox_at(&path,url)
+}
+fn claim_inbox_at(path:&std::path::Path,url:&str) -> Option<crate::native_host::InboxItem> {
+    let data=std::fs::read_to_string(path).ok()?;
+    // Retain unreadable pending captures for recovery.
+    let items:Vec<crate::native_host::InboxItem>=serde_json::from_str(&data).ok()?;
+    let claimed=items.iter().find(|i|i.url==url)?.clone();
+    let rest:Vec<_>=items.into_iter().filter(|i|i.url!=url).collect();
+    if rest.is_empty() {std::fs::remove_file(path).ok()?;}
+    else {atomic_write(path,serde_json::to_string_pretty(&rest).ok()?.as_bytes()).ok()?;}
+    Some(claimed)
 }
 
 #[derive(Debug, Default)]
-struct UiPrefs {
-    save_dir: String,
-    connections: usize,
-    category_folders: bool,
-    user_agent: String,
-    proxy_url: String,
-    timeout_secs: u64,
-    rename_template: String,
-    folder_rules: Vec<crate::model::FolderRule>,
+pub(crate) struct UiPrefs {
+    pub(crate) save_dir: String,
+    pub(crate) connections: usize,
+    pub(crate) category_folders: bool,
+    pub(crate) user_agent: String,
+    pub(crate) proxy_url: String,
+    pub(crate) timeout_secs: u64,
+    pub(crate) rename_template: String,
+    pub(crate) folder_rules: Vec<crate::model::FolderRule>,
 }
 
-fn load_prefs() -> UiPrefs {
+pub(crate) fn load_prefs() -> UiPrefs {
     let mut p = UiPrefs {
         connections: 8,
         category_folders: true,
@@ -87,7 +85,7 @@ fn load_prefs() -> UiPrefs {
     if p.save_dir.is_empty() {
         p.save_dir = dirs::download_dir()
             .map(|x| x.to_string_lossy().to_string())
-            .unwrap_or_else(|| "C:\\Downloads".to_string());
+            .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
     }
     if let Some(n) = v.get("connections_default").and_then(|x| x.as_u64()) {
         p.connections = (n as usize).clamp(1, 16);
@@ -158,7 +156,7 @@ fn main_app_running() -> bool {
 
 /// Launch the main window detached (fire-and-forget).
 fn launch_main_app() {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::platform::launch_path() else {
         return;
     };
     let mut cmd = std::process::Command::new(exe);
@@ -180,6 +178,8 @@ struct ConfirmApp {
     description: String,
     referer: String,
     cookie: String,
+    /// Captured request headers of this browser capture (from the inbox).
+    headers: std::collections::BTreeMap<String, String>,
     pair_url: String,
     pair_mime: String,
     /// Page/media MIME from the extension (first hint for naming when the
@@ -187,6 +187,7 @@ struct ConfirmApp {
     page_mime: String,
     /// Media duration in seconds from the extension (best-effort badge).
     duration_secs: u64,
+    expects_audio: bool,
     quality_pref: String,
     connections: usize,
     user_agent: String,
@@ -196,6 +197,12 @@ struct ConfirmApp {
     folder_rules: Vec<crate::model::FolderRule>,
     probing: bool,
     probe_size: Option<u64>,
+    /// Size the browser measured in its own session (`--size`): what a
+    /// refused off-session re-probe falls back to instead of "—".
+    browser_size: Option<u64>,
+    /// The name the dialog made up itself (no `--filename`), while the user
+    /// has not changed it: a server/title name may replace exactly that.
+    auto_name: Option<String>,
     probe_rx: Option<Receiver<(Option<u64>, Option<String>)>>,
     rt: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     centered: bool,
@@ -211,11 +218,30 @@ struct ConfirmApp {
     adding_cat: bool,
     new_cat: String,
     custom_cats: Vec<String>,
+    /// A duplicate the capture would create. The first press on "Download"
+    /// only asks; the second one goes ahead (or focuses the transfer that is
+    /// already running).
+    dup: DupPrompt,
+    /// Where this window sits in the cascade of open dialogs.
+    slot: crate::window::CascadeSlot,
+    /// The window handle, once it exists (used to keep the focus).
+    hwnd: Option<isize>,
+}
+
+/// What the dialog has to say about a file it already knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DupPrompt {
+    /// Nothing to report.
+    None,
+    /// The file was already downloaded. The next press downloads it again.
+    Completed(crate::dupcheck::DuplicateHit),
+    /// The file is still on its way. The next press focuses that transfer.
+    Active(u64),
 }
 
 const CATEGORIES: &[&str] = &[
     "Video",
-    "Music",
+    "Audio",
     "Image",
     "Document",
     "Compressed",
@@ -494,14 +520,18 @@ impl ConfirmApp {
         let page_mime = self.page_mime.clone();
         let opts = EngineOpts {
             user_agent: if self.user_agent.trim().is_empty() {
-                format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
+                format!("download_craft/{}", crate::model::APP_VERSION)
             } else {
                 self.user_agent.clone()
             },
             timeout_secs: self.timeout_secs,
             proxy_url: self.proxy_url.clone(),
             referer,
+            // The browser session claimed from the inbox: without it a
+            // login-gated file probes as 403 or as the login page's size.
+            cookie: self.cookie.clone(),
             quality_pref,
+            captured_headers: engine::CapturedHeaders::for_url(&url, &self.headers),
             ..Default::default()
         };
         rt.spawn(async move {
@@ -509,12 +539,12 @@ impl ConfirmApp {
                 Ok(client) => {
                     let (mut total, _, ctype, mut disp) =
                         engine::probe(&client, &opts, &url).await;
-                    let is_page = ctype
-                        .as_deref()
-                        .map(|c| c.contains("text/html"))
-                        .unwrap_or(false)
-                        || url.contains("youtube.com")
-                        || url.contains("youtu.be");
+                    // A playlist's length is its text, not the video: show
+                    // the duration instead (as IDM does for streams).
+                    if engine::is_stream_manifest(&url, ctype.as_deref(), &page_mime) {
+                        total = None;
+                    }
+                    let is_page = engine::needs_resolve(&url, ctype.as_deref());
                     if total.is_none() && is_page {
                         let shared =
                             std::sync::Arc::new(engine::SharedState::new());
@@ -568,15 +598,59 @@ impl ConfirmApp {
         if self.filename.trim().is_empty() {
             self.filename = filename_from_url(&self.url);
         }
+        // A transfer that is already running: point the user at it instead
+        // of starting a second copy of the same file.
+        if let DupPrompt::Active(id) = self.dup {
+            self.focus_targets(&[id]);
+            self.done = true;
+            return;
+        }
+        let filename = engine::sanitize_filename(self.filename.trim());
+        let dir = self.effective_dir();
+        match std::mem::replace(&mut self.dup, DupPrompt::None) {
+            // The user pressed the button a second time: they meant it.
+            DupPrompt::Completed(_) => {}
+            // First press on a file this app already has: ask before making a
+            // second copy. A capture must never silently duplicate a file.
+            DupPrompt::None | DupPrompt::Active(_) => {
+                if let Some(hit) = crate::dupcheck::find_duplicate_in_queue(&self.url, &filename, &dir)
+                {
+                    match hit.state {
+                        crate::dupcheck::DuplicateState::Completed => {
+                            // The dialog shows the first 78 characters of the
+                            // notice, so the name is cut to fit.
+                            let name: String = hit.filename.chars().take(26).collect();
+                            self.notice = format!(
+                                "Already downloaded: {name}. Press again to fetch it."
+                            );
+                            self.dup = DupPrompt::Completed(hit);
+                            return;
+                        }
+                        crate::dupcheck::DuplicateState::Active => {
+                            self.notice = format!(
+                                "Already downloading (#{}). Press to go to that one.",
+                                hit.id
+                            );
+                            self.dup = DupPrompt::Active(hit.id);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         let mut item = DownloadItem::new(
             0, // id assigned atomically under the queue lock below
             self.url.trim().to_string(),
-            engine::sanitize_filename(self.filename.trim()),
-            self.effective_dir(),
+            filename,
+            dir,
             self.connections,
         );
         item.referer = self.referer.clone();
         item.cookie = self.cookie.clone();
+        // The captured browser agent travels with the row, so a resumed
+        // download still looks like the browser that captured it.
+        item.user_agent = self.user_agent.clone();
+        item.extra_headers = self.headers.clone();
         item.description = self.description.trim().to_string();
         // Browser-measured size (extension HEAD/Range in the real session):
         // keep it so the engine and progress UI know the total even when a
@@ -588,6 +662,7 @@ impl ConfirmApp {
         }
         item.quality_pref = self.quality_pref.trim().to_string();
         item.duration_secs = self.duration_secs;
+        item.expects_audio = self.expects_audio;
         let id = match crate::model::append_to_queue(&mut item) {
             crate::model::AppendResult::Added(id) => {
                 save_remember_category(self.remember_path);
@@ -596,15 +671,18 @@ impl ConfirmApp {
             crate::model::AppendResult::AlreadyQueued(id) => {
                 // Not an error. The URL is already in the list; if the user
                 // asked to start it we wake that row, so this is never a dead
-                // end. Stay open so the notice is actually read.
-                self.notice = if start {
-                    format!("Already in the queue (#{id}) — starting it.")
-                } else {
-                    format!("Already in the queue (#{id}).")
+                // end. Stay open so the notice is actually read. The notice
+                // names what really happens to the row.
+                use crate::model::Status;
+                self.notice = match crate::model::queued_status(id) {
+                    Some(Status::Completed) => format!("Already downloaded (#{id}) — see Finished."),
+                    Some(Status::Downloading) => format!("Already downloading (#{id})."),
+                    _ if start => {
+                        self.wake_targets(&[id]);
+                        format!("Already in the queue (#{id}) — starting it.")
+                    }
+                    _ => format!("Already in the queue (#{id})."),
                 };
-                if start {
-                    self.wake_targets(&[id]);
-                }
                 return;
             }
             crate::model::AppendResult::Error(e) => {
@@ -621,36 +699,74 @@ impl ConfirmApp {
         self.done = true;
     }
 
+    /// Point the main window at rows that already exist, so the user is
+    /// taken to the running transfer instead of starting a second one.
+    fn focus_targets(&self, targets: &[u64]) {
+        wake_focus(targets);
+    }
+
     /// Ask the main app to start these ids (consumed on its next poll, or at
     /// startup when we launch it below).
     fn wake_targets(&self, targets: &[u64]) {
-        if let Some(p) = wake_path() {
-            let _guard = crate::model::fs_lock("wake");
-            let mut ids: Vec<u64> = std::fs::read_to_string(&p)
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("start").cloned())
-                .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
-                .unwrap_or_default();
-            for id in targets {
-                if !ids.contains(id) {
-                    ids.push(*id);
-                }
-            }
-            if let Ok(json) =
-                serde_json::to_string_pretty(&serde_json::json!({ "start": ids }))
-            {
-                let _ = atomic_write(&p, json.as_bytes());
+        wake_ids(targets);
+    }
+}
+
+/// Ask the main app to start these ids (consumed on its next poll, or at
+/// startup when we launch it below).
+pub(crate) fn wake_ids(targets: &[u64]) {
+    wake_requests(targets, targets);
+}
+
+/// Point the main window at rows that already exist, so the user is taken
+/// to the running transfer instead of starting a second one.
+pub(crate) fn wake_focus(targets: &[u64]) {
+    wake_requests(&[], targets);
+}
+
+/// Write the "start" and "focus" requests into wake.json in one go.
+///
+/// The two arrays are different requests — start these queued rows, focus
+/// these running rows — but they share one file, and the main window reads
+/// both keys from it. Two independent writers would lose whichever request
+/// came second, so there is exactly one writer here.
+fn wake_requests(start: &[u64], focus: &[u64]) {
+    if let Some(p) = wake_path() {
+        let _guard = crate::model::fs_lock("wake");
+        if !_guard.owned() { return; }
+        let mut obj: serde_json::Value = std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut start_ids: Vec<u64> = obj.get("start").cloned()
+            .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
+            .unwrap_or_default();
+        let mut focus_ids: Vec<u64> = obj.get("focus").cloned()
+            .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
+            .unwrap_or_default();
+        for id in start {
+            if !start_ids.contains(id) {
+                start_ids.push(*id);
             }
         }
-        // tasklist + cold-start spawn can take seconds (debug builds
-        // especially) — never block the dialog on it; close at once.
-        std::thread::spawn(|| {
-            if !main_app_running() {
-                launch_main_app();
+        for id in focus {
+            if !focus_ids.contains(id) {
+                focus_ids.push(*id);
             }
-        });
+        }
+        obj["start"] = serde_json::json!(start_ids);
+        obj["focus"] = serde_json::json!(focus_ids);
+        if let Ok(json) = serde_json::to_string_pretty(&obj) {
+            let _ = atomic_write(&p, json.as_bytes());
+        }
     }
+    // tasklist + cold-start spawn can take seconds (debug builds
+    // especially) — never block the dialog on it; close at once.
+    std::thread::spawn(|| {
+        if !main_app_running() {
+            launch_main_app();
+        }
+    });
 }
 
 /// Entry point for `--confirm-download`. Never returns normally
@@ -691,28 +807,59 @@ pub fn run() -> eframe::Result<()> {
         std::process::exit(2);
     }
     let page_mime = get("--mime").filter(|s| !s.trim().is_empty()).unwrap_or_default();
-    let filename = get("--filename")
-        .filter(|f| !f.trim().is_empty())
-        .unwrap_or_else(|| {
-            crate::model::filename_from_url_with_mime(&url, Some(page_mime.as_str()))
-        });
+    // `get` consumes the flag, so read it once.
+    let caller_name = get("--filename").filter(|f| !f.trim().is_empty());
+    let named_by_caller = caller_name.is_some();
+    let filename = caller_name.unwrap_or_else(|| {
+        crate::model::filename_from_url_with_mime(&url, Some(page_mime.as_str()))
+    });
     let referer = get("--referer").unwrap_or_default();
-    let cookie = get("--cookie").unwrap_or_default();
+    let mut cookie = get("--cookie").unwrap_or_default();
     let pair_url = get("--pair-url").filter(|s| s.starts_with("http")).unwrap_or_default();
     let pair_mime = get("--pair-mime").unwrap_or_default();
     let quality_pref = get("--quality").filter(|s| !s.trim().is_empty()).unwrap_or_default();
     // Browser-measured size (menu HEAD/Range): trust it, skip probing.
     let known_size: Option<u64> = get("--size")
         .and_then(|s| s.parse::<u64>().ok())
-        .filter(|s| *s > 0);
+        .filter(|s| *s > 0)
+        // An older extension sends a playlist's text length as its size.
+        .filter(|_| !engine::is_stream_manifest(&url, None, &page_mime));
     // Browser-known media duration in seconds (best-effort badge).
     let duration_secs: u64 = get("--dur")
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|s| *s > 0 && *s < 86400)
         .unwrap_or(0);
 
+    // The captured request headers (an `Authorization` bearer token and
+    // `x-*` tokens) travel here through the inherited environment, never on
+    // the disk and never on the command line where another local user could
+    // read them. The variable is taken out of this process' environment
+    // right away, so the main window this dialog may start does not inherit
+    // the token.
+    let env_headers = {
+        let raw = std::env::var(crate::native_host::CAPTURE_HEADERS_ENV).ok();
+        std::env::remove_var(crate::native_host::CAPTURE_HEADERS_ENV);
+        raw
+    };
+    let mut env_headers = crate::native_host::decode_capture_headers(env_headers.as_deref());
+
     // Claim the inbox entry first so the main window won't prompt too.
-    claim_inbox(url.trim());
+    let mut browser_user_agent = String::new();
+    let mut headers = std::collections::BTreeMap::new();
+    if let Some(item)=claim_inbox(url.trim()) {
+        // The native host leaves the session cookie in the private inbox, not
+        // in the process command line where other local users can inspect it.
+        if cookie.is_empty() {cookie=item.cookie.unwrap_or_default();}
+        // The browser's own agent comes with the capture: a site that
+        // checks the browser only answers that browser.
+        browser_user_agent = item.user_agent.unwrap_or_default();
+        // The inbox holds the headers only when this dialog could not be
+        // started the first time; otherwise the environment is the source.
+        headers = item.headers.unwrap_or_default();
+    }
+    if headers.is_empty() {
+        headers = std::mem::take(&mut env_headers);
+    }
 
     let prefs = load_prefs();
     let category = category_of(&filename).to_string();
@@ -720,7 +867,7 @@ pub fn run() -> eframe::Result<()> {
     // its file present) is reported up front. A dead row (failed, or finished
     // with the file gone) is refreshed by the capture instead, so the buttons
     // never dead-end on a stale "already in queue".
-    let initial_notice = match crate::model::queued_entry(url.trim()) {
+    let initial_notice = match crate::model::queued_entry(url.trim(), &quality_pref) {
         Some((id, false)) => format!("Already in the queue (#{id})."),
         _ => String::new(),
     };
@@ -731,22 +878,34 @@ pub fn run() -> eframe::Result<()> {
             .build()
             .expect("tokio runtime"),
     );
+    // Take the next slot of the cascade before the window is built: the
+    // position depends on it.
+    let slot = crate::window::take_cascade_slot();
+    let start_name = crate::model::apply_rename_template(&prefs.rename_template, &engine::sanitize_filename(&filename), url.trim());
     let mut app = ConfirmApp {
+        auto_name: (!named_by_caller).then(|| start_name.clone()),
+        browser_size: known_size,
         url: url.trim().to_string(),
-        filename: crate::model::apply_rename_template(&prefs.rename_template, &engine::sanitize_filename(&filename), url.trim()),
+        filename: start_name,
         category,
         remember_path: prefs.category_folders,
         save_base: prefs.save_dir,
         description: String::new(),
         referer,
         cookie,
+        headers,
         pair_url,
         pair_mime,
         page_mime,
         duration_secs,
+        expects_audio: args.iter().any(|s| s == "--expect-audio"),
         quality_pref,
         connections: prefs.connections,
-        user_agent: prefs.user_agent,
+        user_agent: if browser_user_agent.trim().is_empty() {
+            prefs.user_agent
+        } else {
+            browser_user_agent
+        },
         proxy_url: prefs.proxy_url,
         timeout_secs: prefs.timeout_secs,
         rename_template: prefs.rename_template,
@@ -766,6 +925,9 @@ pub fn run() -> eframe::Result<()> {
         adding_cat: false,
         new_cat: String::new(),
         custom_cats: Vec::new(),
+        dup: DupPrompt::None,
+        slot,
+        hwnd: None,
     };
     // Prefill filename from server when the extension sent none useful.
     // A browser-known size skips probing entirely (server re-probes of
@@ -781,11 +943,17 @@ pub fn run() -> eframe::Result<()> {
         .with_resizable(false)
         .with_decorations(false)
         .with_transparent(true)
-        .with_always_on_top();
+        // Normal Z-order: the dialog is an ordinary window, not a layer that
+        // floats above everything else. Several dialogs stack down and to the
+        // right instead of hiding each other.
+        .with_window_level(egui::WindowLevel::Normal);
+    // Take the next slot of the cascade, on the monitor the pointer is on.
+    let (cx, cy) = crate::window::cascade_position((DM_W, DM_H), slot.index);
+    viewport = viewport.with_position(egui::pos2(cx, cy));
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
-    eframe::run_native(
+    let result = eframe::run_native(
         "Add download",
         eframe::NativeOptions {
             viewport,
@@ -796,7 +964,10 @@ pub fn run() -> eframe::Result<()> {
             crate::app::apply_theme(&cc.egui_ctx, &crate::app::stored_theme());
             Ok(Box::new(app))
         }),
-    )
+    );
+    // The dialog is gone: free its place in the cascade.
+    crate::window::release_cascade_slot();
+    result
 }
 
 impl eframe::App for ConfirmApp {
@@ -820,21 +991,49 @@ impl eframe::App for ConfirmApp {
             }
             return;
         }
-        // Middle of the work area (taskbar excluded), once the monitor
-        // geometry is known; Windows would otherwise cascade the window.
-        if !self.centered && crate::model::center_window(ctx, egui::vec2(DM_W, DM_H)) {
+        // The cascade picked the position before the window existed: it is
+        // already inside the work area of the monitor the pointer was on, at
+        // that monitor's scale, so there is nothing to centre here.
+        if !self.centered {
             self.centered = true;
+        }
+        // Find our own window handle once. A dialog that is not the first of
+        // the cascade must not pull the keyboard away from what the user is
+        // typing in: it appears without focus and only takes it when the
+        // user clicks it.
+        match self.hwnd {
+            None => {
+                if let Some(h) = crate::window::own_window_handle("Add download") {
+                    self.hwnd = Some(h);
+                    if !self.slot.may_activate() {
+                        crate::window::suppress_activation(h);
+                    }
+                }
+            }
+            Some(h) => {
+                if crate::window::activation_suppressed(h)
+                    && ctx.input(|i| i.pointer.any_pressed())
+                    && crate::window::pointer_inside(h)
+                {
+                    crate::window::allow_activation(h);
+                }
+            }
         }
         // Collect probe result.
         if let Some(rx) = self.probe_rx.as_ref() {
             while let Ok((sz, nm)) = rx.try_recv() {
                 self.probing = false;
-                self.probe_size = sz;
+                // A refused re-probe (off-session 403) must not erase the
+                // size the browser measured in its own session.
+                self.probe_size = sz.or(self.browser_size);
                 if let Some(n) = nm {
-                    // Prefer the server/video title when our name is a bare
-                    // URL guess (or a last-resort fallback whose timestamp
-                    // drifted since dialog open).
-                    if self.filename == filename_from_url(&self.url)
+                    // Prefer the server/video title while our name is still a
+                    // guess we made (or a last-resort fallback whose timestamp
+                    // drifted since dialog open) — never over a name the
+                    // extension chose or the user typed.
+                    let untouched_guess = self.auto_name.as_deref() == Some(self.filename.as_str());
+                    if untouched_guess
+                        || self.filename == filename_from_url(&self.url)
                         || crate::model::is_fallback_filename(&self.filename)
                     {
                         self.filename = crate::model::apply_rename_template(
@@ -843,6 +1042,9 @@ impl eframe::App for ConfirmApp {
                             &self.url,
                         );
                         self.category = category_of(&self.filename).to_string();
+                        if untouched_guess {
+                            self.auto_name = Some(self.filename.clone());
+                        }
                     }
                 }
             }
@@ -1053,6 +1255,9 @@ impl eframe::App for ConfirmApp {
                         format!("{} • {}", format_dur(self.duration_secs), format_bytes(sz))
                     }
                     Some(sz) => format_bytes(sz),
+                    // Streams (HLS/DASH) have no size until assembled; the
+                    // duration is the useful fact, as IDM shows it.
+                    None if self.duration_secs > 0 => format_dur(self.duration_secs),
                     None => "—".to_string(),
                 }
             };
@@ -1091,10 +1296,20 @@ impl eframe::App for ConfirmApp {
                 "Filename",
                 false,
             );
-            let r_b = ui.interact(refr_btn, egui::Id::new("popup-refresh"), egui::Sense::click());
-            let g_b = ui.interact(gear_btn, egui::Id::new("popup-gear"), egui::Sense::click());
-            icon_btn(&p, refr_btn, r_b.hovered(), DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
-            icon_btn(
+            let r_b = ui
+                .interact(refr_btn, egui::Id::new("popup-refresh"), egui::Sense::click())
+                .on_hover_text("Check the size and file name again");
+            let g_b = ui
+                .interact(gear_btn, egui::Id::new("popup-gear"), egui::Sense::click())
+                .on_hover_text(if self.show_adv {
+                    "Hide more options"
+                } else {
+                    "More options: category, description, referer, cookie"
+                });
+            // Square field-surface buttons, so they read as part of the
+            // filename row (bare glyphs looked like stray icons).
+            icon_btn_box(&p, refr_btn, r_b.hovered(), DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
+            icon_btn_box(
                 &p,
                 gear_btn,
                 g_b.hovered(),
@@ -1283,7 +1498,11 @@ impl eframe::App for ConfirmApp {
             p.text(
                 dl_r.center(),
                 egui::Align2::CENTER_CENTER,
-                "Download",
+                match self.dup {
+                    DupPrompt::Completed(_) => "Download again",
+                    DupPrompt::Active(_) => "Focus existing",
+                    DupPrompt::None => "Download",
+                },
                 semi(13.0),
                 egui::Color32::WHITE,
             );
@@ -1312,5 +1531,27 @@ impl eframe::App for ConfirmApp {
                 );
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod audit_inbox_tests {
+    #[test]
+    fn claiming_a_capture_returns_private_cookies_and_preserves_other_entries() {
+        let dir=std::env::temp_dir().join(format!("dc-inbox-audit-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();let path=dir.join("inbox.json");
+        let data=serde_json::json!([
+            {"url":"https://example.com/a","received_at":"2026-10-20","cookie":"session=secret"},
+            {"url":"https://example.com/b","received_at":"2026-10-20"}
+        ]);
+        super::atomic_write(&path,serde_json::to_string(&data).unwrap().as_bytes()).unwrap();
+        let capture=super::claim_inbox_at(&path,"https://example.com/a").unwrap();
+        assert_eq!(capture.cookie.as_deref(),Some("session=secret"));
+        let left:Vec<crate::native_host::InboxItem>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(left.len(),1);assert_eq!(left[0].url,"https://example.com/b");
+        std::fs::write(&path,b"{broken").unwrap();
+        assert!(super::claim_inbox_at(&path,"https://example.com/b").is_none());
+        assert_eq!(std::fs::read(&path).unwrap(),b"{broken");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
