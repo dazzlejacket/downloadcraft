@@ -48,6 +48,53 @@ impl Provider {
         }
     }
 
+    /// A stable key for this provider, used in the settings file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::RealDebrid => "realdebrid",
+            Self::TorBox => "torbox",
+            Self::AllDebrid => "alldebrid",
+            Self::Premiumize => "premiumize",
+            Self::DebridLink => "debridlink",
+        }
+    }
+
+    /// The provider with this key, or `None` when the key is unknown.
+    ///
+    /// A settings file may hold anything, so an unknown key is `None` and
+    /// the caller keeps its default.
+    pub fn from_key(key: &str) -> Option<Provider> {
+        Provider::ALL.into_iter().find(|p| p.key() == key)
+    }
+
+    /// The workflows this provider's own API does not offer, in one short
+    /// line for a menu row.
+    ///
+    /// Every part is read from the provider's capability flags, so the line
+    /// cannot drift from what the panel will actually do. A workflow the
+    /// API does not have is named here rather than glossed over.
+    pub fn limits_summary(self) -> String {
+        let c = self.capabilities();
+        let mut bits: Vec<&str> = Vec::new();
+        if !c.cache_query {
+            bits.push("no cache query");
+        }
+        if !c.provider_file_selection {
+            bits.push("fetches every file");
+        }
+        if !c.direct_hosting {
+            bits.push("host link becomes a record");
+        }
+        if !c.torrent_metadata {
+            bits.push("magnets only");
+        }
+        if bits.is_empty() {
+            "every workflow this panel offers".to_string()
+        } else {
+            bits.join(" · ")
+        }
+    }
+
     /// Provider order used by the (later) settings UI.
     pub fn index(self) -> usize {
         match self {
@@ -4516,5 +4563,61 @@ mod tests {
         assert!(!safe_id("a/b"));
         assert!(!safe_id("a?b"));
         assert!(!safe_id("a#b"));
+    }
+    /// A provider's key survives a round trip, and an unknown key is
+    /// refused rather than guessed at.
+    ///
+    /// The key is what the settings file holds: the provider NAME, never a
+    /// token.
+    #[test]
+    fn a_provider_key_is_a_closed_set() {
+        for p in Provider::ALL {
+            assert_eq!(Provider::from_key(p.key()), Some(p));
+        }
+        // A settings file may hold anything.
+        assert_eq!(Provider::from_key("not-a-provider"), None);
+        assert_eq!(Provider::from_key(""), None);
+        assert_eq!(Provider::from_key("Real-Debrid"), None);
+        // The keys are distinct, so one cannot stand in for another.
+        let mut keys: Vec<&str> = Provider::ALL.iter().map(|p| p.key()).collect();
+        let n = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), n);
+    }
+
+    /// The one-line summary of what a provider cannot do is read from its
+    /// own capability flags, so it cannot drift from what the panel does.
+    #[test]
+    fn a_limits_summary_follows_the_capability_flags() {
+        for p in Provider::ALL {
+            let c = p.capabilities();
+            let line = p.limits_summary();
+            if !c.cache_query {
+                assert!(line.contains("no cache query"), "{p:?}: {line}");
+            }
+            if !c.provider_file_selection {
+                assert!(line.contains("fetches every file"), "{p:?}: {line}");
+            }
+            if !c.direct_hosting {
+                assert!(line.contains("host link becomes a record"), "{p:?}: {line}");
+            }
+            if !c.torrent_metadata {
+                assert!(line.contains("magnets only"), "{p:?}: {line}");
+            }
+            // A provider that offers everything says so, rather than
+            // listing nothing.
+            if c.cache_query
+                && c.provider_file_selection
+                && c.direct_hosting
+                && c.torrent_metadata
+            {
+                assert_eq!(line, "every workflow this panel offers");
+            }
+            // The line never promises a workflow the provider lacks.
+            if !c.cache_query {
+                assert!(!line.contains("cache query."));
+            }
+        }
     }
 }

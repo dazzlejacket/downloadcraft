@@ -521,6 +521,33 @@ fn dm_icon_btn(
     crate::dm::icon_btn(p, rect, man.hover(&rect), icon, size, w, color);
 }
 
+/// The concept's small upper-case field label, painted above a field.
+///
+/// The concept itself uses placeholders instead of labels, but a panel with
+/// several fields has to say what each one is.
+fn dm_field_label(ui: &mut egui::Ui, text: &str) {
+    let (r, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 13.0),
+        egui::Sense::hover(),
+    );
+    crate::dm::micro_label(ui.painter(), egui::pos2(r.min.x, r.center().y), text);
+}
+
+/// One line of small text in the concept's own muted grey.
+fn dm_note(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32) {
+    let (r, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), size + 4.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().text(
+        egui::pos2(r.min.x, r.center().y),
+        egui::Align2::LEFT_CENTER,
+        text.to_string(),
+        crate::fonts::reg(size),
+        color,
+    );
+}
+
 /// Icon button on the field surface (same fill/border as an input box).
 fn dm_icon_btn_box(
     p: &egui::Painter,
@@ -810,6 +837,8 @@ enum ButtonId {
     /// Debrid panel (cloud providers).
     DebridProvider,
     DebridValidate,
+    /// A magnet pasted into the Add dialog: hand it to the cloud panel.
+    AddToCloud,
     DebridSubmit,
     DebridTorrentFile,
     DebridRefresh,
@@ -1821,6 +1850,9 @@ enum HitKind {
     Slider(SliderId, f64, f64, bool), // id, min, max, log
     Field(&'static str),
     ComboAnchor,
+    /// A provider row in the cloud-provider dropdown: the index into
+    /// `Provider::ALL`.
+    DebridProviderRow(usize),
     /// Queue v2 reorder: (item id, -1 up / +1 down).
     QMove(u64, i32),
 }
@@ -2068,6 +2100,10 @@ pub struct CraftApp {
     /// download row. One token per provider is what keeps one provider's
     /// token from being shown - or sent - under another provider's name.
     debrid_tokens: crate::debrid::TokenStore,
+    /// The provider dropdown is open.
+    debrid_provider_open: bool,
+    /// The provider row the keyboard is on.
+    debrid_provider_highlight: usize,
     /// The magnet link or hosting URL to submit.
     debrid_input: String,
     /// The hosting password, when the host needs one.
@@ -2243,6 +2279,8 @@ impl CraftApp {
             show_debrid: false,
             debrid_provider_index: 0,
             debrid_tokens: crate::debrid::TokenStore::default(),
+            debrid_provider_open: false,
+            debrid_provider_highlight: 0,
             debrid_input: String::new(),
             debrid_password: String::new(),
             debrid_notice: String::new(),
@@ -2554,6 +2592,9 @@ impl CraftApp {
                 "speed_windows": self.speed_windows,
                 "speed_windows_on": self.speed_windows_on,
                 "update_check_on": self.update_check_on,
+                // The provider NAME only. A token lives in memory and is
+                // never written down.
+                "debrid_provider": self.debrid_provider().key(),
             });
             // Overlay our keys, never replace the whole file: the Settings
             // window keeps its own keys here too (helper paths and their
@@ -2656,6 +2697,14 @@ impl CraftApp {
                     }
                     if let Some(s) = g("theme").and_then(|x| x.as_str()) {
                         self.theme = s.to_string();
+                    }
+                    // The provider is a closed set: an unknown key keeps
+                    // the default rather than pointing the panel at
+                    // nothing.
+                    if let Some(s) = g("debrid_provider").and_then(|x| x.as_str()) {
+                        if let Some(p) = crate::debrid::Provider::from_key(s) {
+                            self.debrid_provider_index = p.index();
+                        }
                     }
                     if let Some(n) = g("connections_default").and_then(|x| x.as_u64()) {
                         self.connections_default = (n as usize).clamp(1, 16);
@@ -3321,6 +3370,434 @@ impl CraftApp {
     fn debrid_token_mut(&mut self) -> &mut String {
         let provider = self.debrid_provider();
         self.debrid_tokens.field(provider)
+    }
+
+    /// Point the panel at another provider.
+    ///
+    /// The account, the session and the notice belong to the old provider
+    /// and are dropped. The TOKEN is not: it stays in its own provider's
+    /// slot, so it can never be shown - or sent - under the new provider's
+    /// name, and switching back finds it where it was left.
+    fn debrid_set_provider(&mut self, index: usize) {
+        let n = crate::debrid::Provider::ALL.len();
+        self.debrid_provider_index = index % n;
+        self.debrid_account = None;
+        self.debrid_session = None;
+        self.debrid_notice.clear();
+        self.debrid_provider_highlight = self.debrid_provider_index;
+        // The NAME is a preference and is remembered. A token never is.
+        self.save_ui_state();
+    }
+
+    /// The cloud-provider panel.
+    ///
+    /// The same design language as the Add-download dialog: the concept's
+    /// field boxes, the accent gradient on the primary action, small
+    /// upper-case field labels, and no stock egui chrome.
+    ///
+    /// The provider is a real dropdown - a list of every provider the app
+    /// can talk to, each with what its own API cannot do - rather than a
+    /// button that moves on to the next one.
+    fn debrid_panel_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        rows: &[(u64, String, u64)],
+        selected: &[u64],
+        status: &str,
+        state: &str,
+        cache: crate::debrid::CacheState,
+    ) {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        let p = ui.painter().clone();
+        let provider = self.debrid_provider();
+        let n_providers = crate::debrid::Provider::ALL.len();
+
+        // ---- keyboard ----
+        // While the list is open the arrows move, Enter picks and Escape
+        // closes it. Otherwise Escape closes the panel. The app never asks
+        // for the keyboard, so it does not take it away either.
+        let ctx = ui.ctx().clone();
+        if self.debrid_provider_open {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                self.debrid_provider_highlight = (self.debrid_provider_highlight + 1) % n_providers;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                self.debrid_provider_highlight =
+                    (self.debrid_provider_highlight + n_providers - 1) % n_providers;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let pick = self.debrid_provider_highlight;
+                self.debrid_set_provider(pick);
+                self.debrid_provider_open = false;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                || ctx.input(|i| i.key_pressed(egui::Key::Tab))
+            {
+                self.debrid_provider_open = false;
+            }
+        } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_debrid = false;
+        }
+
+        // ---- header: mark, title, close ----
+        let (hdr, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 26.0),
+            egui::Sense::hover(),
+        );
+        dm_mark(
+            &p,
+            egui::Rect::from_min_size(
+                egui::pos2(hdr.min.x, hdr.min.y + 4.0),
+                egui::vec2(18.0, 18.0),
+            ),
+        );
+        p.text(
+            egui::pos2(hdr.min.x + 26.0, hdr.center().y),
+            egui::Align2::LEFT_CENTER,
+            "Cloud providers",
+            crate::fonts::semi(13.0),
+            pl().dm_txt,
+        );
+        let close = egui::Rect::from_center_size(
+            egui::pos2(hdr.max.x - 10.0, hdr.center().y),
+            egui::vec2(16.0, 16.0),
+        );
+        dm_icon_btn(&p, &self.man, close, DmIcon::Close, 12.0, 2.0, pl().dm_dim);
+        if self.man.clicked(&close) {
+            self.show_debrid = false;
+            self.debrid_provider_open = false;
+        }
+        // The header rule.
+        let (rule, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 1.0),
+            egui::Sense::hover(),
+        );
+        p.rect_filled(rule, 0.0, pl().dm_line);
+        ui.add_space(3.0);
+
+        // ---- provider ----
+        dm_field_label(ui, "Provider");
+        let mut combo = egui::Rect::NOTHING;
+        ui.horizontal(|ui| {
+            let (c, _) = ui.allocate_exact_size(egui::vec2(300.0, DM_BOX_H), egui::Sense::hover());
+            combo = c;
+            let hov = self.man.hover(&c);
+            crate::dm::select_field(
+                &p,
+                c,
+                hov,
+                provider.label(),
+                self.debrid_provider_open,
+            );
+            self.hits.push((HitKind::Btn(ButtonId::DebridProvider), c));
+            let (v, _) = ui.allocate_exact_size(egui::vec2(110.0, DM_BOX_H), egui::Sense::hover());
+            crate::dm::btn_flat(&p, v, self.man.hover(&v), "Validate");
+            self.hits.push((HitKind::Btn(ButtonId::DebridValidate), v));
+        });
+        // What this provider cannot do, in one line. Every word comes from
+        // the provider's own capability flags.
+        dm_note(
+            ui,
+            &format!("{} — {}", provider.label(), provider.limits_summary()),
+            pl().dm_lbl,
+            10.5,
+        );
+
+        // ---- token ----
+        dm_field_label(ui, "API token");
+        {
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), DM_BOX_H),
+                egui::Sense::hover(),
+            );
+            crate::dm::dm_field(
+                ui,
+                "debrid_token",
+                r,
+                r.max.x - 8.0,
+                self.debrid_token_mut(),
+                "paste the provider's API token",
+                true,
+            );
+            self.hits.push((HitKind::Field("debrid_token"), r));
+        }
+        dm_note(
+            ui,
+            "The token stays in memory only. It is never written to a settings file, a queue file or a download row.",
+            pl().dm_lbl,
+            10.5,
+        );
+
+        // ---- what to hand to the provider ----
+        dm_field_label(ui, "Magnet or hosting link");
+        {
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), DM_BOX_H),
+                egui::Sense::hover(),
+            );
+            crate::dm::dm_field(
+                ui,
+                "debrid_input",
+                r,
+                r.max.x - 8.0,
+                &mut self.debrid_input,
+                "magnet:… or https://host/…",
+                false,
+            );
+            self.hits.push((HitKind::Field("debrid_input"), r));
+        }
+        dm_field_label(ui, "Host password (optional)");
+        {
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), DM_BOX_H),
+                egui::Sense::hover(),
+            );
+            crate::dm::dm_field(
+                ui,
+                "debrid_password",
+                r,
+                r.max.x - 8.0,
+                &mut self.debrid_password,
+                "only when the host asks for one",
+                true,
+            );
+            self.hits.push((HitKind::Field("debrid_password"), r));
+        }
+
+        // A .torrent file is only offered when the provider's own API
+        // takes one. A provider that does not gets a disabled button and
+        // the reason.
+        let torrent_reason = provider.unsupported_reason(crate::debrid::Workflow::TorrentMetadata);
+        {
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(150.0, DM_BOX_H),
+                egui::Sense::hover(),
+            );
+            if torrent_reason.is_some() {
+                p.rect(
+                    r,
+                    DM_RAD,
+                    pl().dm_trough,
+                    egui::Stroke::new(1.0_f32, pl().dm_box_bd),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Torrent file…",
+                    crate::fonts::reg(12.0),
+                    pl().dm_lbl,
+                );
+            } else {
+                crate::dm::btn_flat(&p, r, self.man.hover(&r), "Torrent file…");
+                self.hits.push((HitKind::Btn(ButtonId::DebridTorrentFile), r));
+            }
+        }
+        if let Some(reason) = torrent_reason {
+            dm_note(ui, reason, pl().dm_lbl, 10.5);
+        }
+
+        // ---- what the provider said ----
+        if let Some(a) = &self.debrid_account {
+            let text = format!("Signed in as {}", a.summary());
+            dm_note(ui, &text, pl().dm_txt, 11.5);
+        }
+        if !self.debrid_notice.is_empty() {
+            let text = self.debrid_notice.clone();
+            dm_note(ui, &text, pl().notice, 11.5);
+        }
+        if self.debrid_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Talking to the provider…");
+            });
+        }
+
+        // ---- the provider's files ----
+        if !rows.is_empty() {
+            ui.add_space(3.0);
+            let text = format!("{} file(s) — provider says {status} ({state})", rows.len());
+            dm_note(ui, &text, pl().dm_txt, 11.5);
+            match provider.unsupported_reason(crate::debrid::Workflow::CacheQuery) {
+                Some(reason) => {
+                    let text = format!("Provider cache: {reason}");
+                    dm_note(ui, &text, pl().dm_lbl, 10.5);
+                }
+                None => {
+                    let text = format!(
+                        "Provider cache: {} — {}",
+                        cache.label(),
+                        cache_hint(cache)
+                    );
+                    dm_note(ui, &text, pl().dm_lbl, 10.5);
+                }
+            }
+            // Some providers fetch every file of a torrent and leave the
+            // choice to this app; the panel says so instead of implying
+            // the provider narrowed it.
+            if let Some(reason) =
+                provider.unsupported_reason(crate::debrid::Workflow::ProviderFileSelection)
+            {
+                let text = format!(
+                    "{reason} The checkboxes still pick which of those files DownloadCraft downloads."
+                );
+                dm_note(ui, &text, pl().dm_lbl, 10.5);
+            }
+            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                for (id, name, bytes) in rows {
+                    let checked = selected.contains(id);
+                    let label = if *bytes > 0 {
+                        format!("{}  ({})", elide_left(name, 44), format_bytes(*bytes))
+                    } else {
+                        elide_left(name, 52)
+                    };
+                    let (r, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 22.0),
+                        egui::Sense::hover(),
+                    );
+                    if self.man.hover(&r) {
+                        ui.painter().rect_filled(r, 4.0, pl().dm_hover);
+                    }
+                    let box_r = egui::Rect::from_center_size(
+                        egui::pos2(r.min.x + 9.0, r.center().y),
+                        egui::Vec2::splat(14.0),
+                    );
+                    crate::dm::dm_check(ui.painter(), box_r, checked);
+                    ui.painter().text(
+                        egui::pos2(r.min.x + 22.0, r.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        crate::fonts::reg(11.5),
+                        pl().dm_txt,
+                    );
+                    self.hits.push((HitKind::Check(CheckId::DebridFile(*id)), r));
+                }
+            });
+            ui.horizontal(|ui| {
+                for (label, w, id) in [
+                    ("Select all", 110.0f32, ButtonId::DebridSelectAll),
+                    ("Select none", 110.0, ButtonId::DebridSelectNone),
+                    ("Refresh", 100.0, ButtonId::DebridRefresh),
+                ] {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
+                    crate::dm::btn_flat(&p, r, self.man.hover(&r), label);
+                    self.hits.push((HitKind::Btn(id), r));
+                }
+            });
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(160.0, 36.0), egui::Sense::hover());
+                crate::dm::dm_gradient(&p, r, DM_RAD, DM_ACC, DM_ACC2);
+                if self.man.hover(&r) {
+                    p.rect_filled(r, DM_RAD, egui::Color32::from_white_alpha(22));
+                }
+                p.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Queue selected",
+                    crate::fonts::semi(13.0),
+                    egui::Color32::WHITE,
+                );
+                self.hits.push((HitKind::Btn(ButtonId::DebridQueue), r));
+                let (r, _) = ui.allocate_exact_size(egui::vec2(170.0, 36.0), egui::Sense::hover());
+                crate::dm::btn_flat(&p, r, self.man.hover(&r), "Cancel at provider");
+                self.hits.push((HitKind::Btn(ButtonId::DebridCancel), r));
+            });
+        }
+
+        // ---- actions ----
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(120.0, 36.0), egui::Sense::hover());
+            crate::dm::dm_gradient(&p, r, DM_RAD, DM_ACC, DM_ACC2);
+            if self.man.hover(&r) {
+                p.rect_filled(r, DM_RAD, egui::Color32::from_white_alpha(22));
+            }
+            p.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                "Submit",
+                crate::fonts::semi(13.0),
+                egui::Color32::WHITE,
+            );
+            self.hits.push((HitKind::Btn(ButtonId::DebridSubmit), r));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(100.0, 36.0), egui::Sense::hover());
+            crate::dm::btn_flat(&p, r, self.man.hover(&r), "Close");
+            self.hits.push((HitKind::Btn(ButtonId::DebridClose), r));
+        });
+
+        // ---- the provider dropdown ----
+        // Painted last, so it sits over the card. The rows are real hits:
+        // the list is drawn where the pointer can reach it.
+        if self.debrid_provider_open && !combo.is_negative() {
+            let row_h = 42.0;
+            let list_w = 320.0;
+            let list_h = n_providers as f32 * row_h + 10.0;
+            let mut list = egui::Rect::from_min_size(
+                egui::pos2(combo.min.x, combo.max.y + 6.0),
+                egui::vec2(list_w, list_h),
+            );
+            // Keep the list on the screen.
+            let scr = ctx.screen_rect();
+            if list.max.y > scr.max.y - 8.0 {
+                list = list.translate(egui::vec2(0.0, scr.max.y - 8.0 - list.max.y));
+            }
+            p.rect(
+                list,
+                8.0,
+                pl().dm_card,
+                egui::Stroke::new(1.0_f32, pl().dm_line),
+                egui::StrokeKind::Inside,
+            );
+            for (i, prov) in crate::debrid::Provider::ALL.into_iter().enumerate() {
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(list.min.x + 6.0, list.min.y + 5.0 + i as f32 * row_h),
+                    egui::vec2(list_w - 12.0, row_h),
+                );
+                let hot = self.man.hover(&r) || self.debrid_provider_highlight == i;
+                if hot {
+                    p.rect_filled(r, 4.0, pl().dm_hover);
+                }
+                if i == self.debrid_provider_index {
+                    let cr = egui::Rect::from_center_size(
+                        egui::pos2(r.min.x + 12.0, r.center().y),
+                        egui::Vec2::splat(14.0),
+                    );
+                    crate::dm::dm_icon(&p, cr, DmIcon::Check, DM_ACC, 2.0);
+                }
+                p.text(
+                    egui::pos2(r.min.x + 24.0, r.min.y + 13.0),
+                    egui::Align2::LEFT_CENTER,
+                    prov.label().to_string(),
+                    crate::fonts::semi(11.5),
+                    pl().dm_txt,
+                );
+                p.text(
+                    egui::pos2(r.min.x + 24.0, r.min.y + 28.0),
+                    egui::Align2::LEFT_CENTER,
+                    prov.limits_summary(),
+                    crate::fonts::reg(10.0),
+                    pl().dm_lbl,
+                );
+                // The validation state, for the provider the panel is on.
+                // The others are not known, and are not guessed.
+                if i == self.debrid_provider_index {
+                    let text = if self.debrid_account.is_some() {
+                        "signed in"
+                    } else {
+                        "not connected"
+                    };
+                    p.text(
+                        egui::pos2(r.max.x - 10.0, r.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        text.to_string(),
+                        crate::fonts::reg(10.0),
+                        pl().dm_dim,
+                    );
+                }
+                self.hits.push((HitKind::DebridProviderRow(i), r));
+            }
+        }
     }
 
     /// Build a provider client, or explain why the token cannot be used.
@@ -6730,6 +7207,35 @@ impl eframe::App for CraftApp {
                     // ---- actions (manual hit table, as before) ----
                     let act_y = DM_ACT + adv_h;
                     let add_btn = at(DM_X, act_y, 100.0, 36.0);
+                    // A magnet names a torrent, not a file. The app has no
+                    // torrent client of its own, so it goes to the cloud
+                    // provider instead of the download queue.
+                    let magnet = crate::model::is_magnet(&self.add_url);
+                    if magnet {
+                        let cloud_btn = egui::Rect::from_min_size(
+                            egui::pos2(add_btn.min.x, add_btn.min.y),
+                            egui::vec2(248.0, 36.0),
+                        );
+                        dm_gradient(&p, cloud_btn, DM_RAD, DM_ACC, DM_ACC2);
+                        if self.man.hover(&cloud_btn) {
+                            p.rect_filled(cloud_btn, DM_RAD, egui::Color32::from_white_alpha(22));
+                        }
+                        p.text(
+                            cloud_btn.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Resolve with cloud provider",
+                            crate::fonts::semi(13.0),
+                            egui::Color32::WHITE,
+                        );
+                        self.hits.push((HitKind::Btn(ButtonId::AddToCloud), cloud_btn));
+                        p.text(
+                            egui::pos2(cloud_btn.max.x + 10.0, cloud_btn.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "Your provider fetches it — this app opens no peer connections.",
+                            crate::fonts::reg(10.0),
+                            pl().dm_lbl,
+                        );
+                    } else {
                     dm_btn_flat(&p, &self.man, add_btn, "Add");
                     self.hits.push((HitKind::Btn(ButtonId::AddAdd), add_btn));
                     let dl_btn = egui::Rect::from_min_size(
@@ -6748,6 +7254,7 @@ impl eframe::App for CraftApp {
                         egui::Color32::WHITE,
                     );
                     self.hits.push((HitKind::Btn(ButtonId::AddDownload), dl_btn));
+                    }
                     let cancel_btn = egui::Rect::from_min_size(
                         egui::pos2(o.x + DM_W - 17.0 - 100.0, add_btn.min.y),
                         egui::vec2(100.0, 36.0),
@@ -7059,11 +7566,16 @@ impl eframe::App for CraftApp {
                 ),
             };
             let mut open = self.show_debrid;
+            // The panel is a Compact Blue card, the same design language as
+            // the Add-download dialog: the concept field boxes, the accent
+            // gradient on the primary action, small upper-case field labels,
+            // and no stock egui chrome.
             let debrid_w = modal_width(ctx, 620.0);
-            egui::Window::new("Cloud Providers")
+            egui::Window::new("Cloud providers")
                 .id(egui::Id::new("debrid_modal"))
                 .order(egui::Order::Foreground)
                 .open(&mut open)
+                .title_bar(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .pivot(egui::Align2::CENTER_CENTER)
                 .collapsible(false)
@@ -7071,163 +7583,16 @@ impl eframe::App for CraftApp {
                 .default_width(debrid_w)
                 .min_width(debrid_w.min(320.0))
                 .max_width(debrid_w)
-                .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
-                .frame(modal_frame())
+                .max_height((ctx.screen_rect().height() * 0.9).clamp(300.0, 900.0))
+                .frame(
+                    egui::Frame::new()
+                        .fill(pl().dm_card)
+                        .stroke(egui::Stroke::new(1.0_f32, pl().dm_line))
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::same(16)),
+                )
                 .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing.y = 10.0;
-                    // The provider the panel is pointed at. Its own API
-                    // decides what the panel may offer.
-                    let provider = self.debrid_provider();
-                    ui.horizontal(|ui| {
-                        let r = mbutton(
-                            ui,
-                            &self.man,
-                            &format!("Provider: {}", provider.label()),
-                            200.0,
-                            32.0,
-                            false,
-                        );
-                        self.hits.push((HitKind::Btn(ButtonId::DebridProvider), r));
-                        let r = mbutton(ui, &self.man, "Validate", 110.0, 32.0, false);
-                        self.hits.push((HitKind::Btn(ButtonId::DebridValidate), r));
-                    });
-                    ui.horizontal(|ui| {
-                        let r = mtext(
-                            ui,
-                            "debrid_token",
-                            self.debrid_token_mut(),
-                            "API token",
-                            300.0,
-                            true,
-                        );
-                        self.hits.push((HitKind::Field("debrid_token"), r));
-                    });
-                    ui.weak("The token stays in memory only. It is never written to a settings file, a queue file or a download row.");
-                    if let Some(a) = &self.debrid_account {
-                        ui.label(
-                            egui::RichText::new(format!("Signed in as {}", a.summary()))
-                                .size(12.0)
-                                .color(pl().txt),
-                        );
-                    }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        let r = mtext(
-                            ui,
-                            "debrid_input",
-                            &mut self.debrid_input,
-                            "magnet:… or https://host/…",
-                            320.0,
-                            false,
-                        );
-                        self.hits.push((HitKind::Field("debrid_input"), r));
-                    });
-                    ui.horizontal(|ui| {
-                        let r = mtext(
-                            ui,
-                            "debrid_password",
-                            &mut self.debrid_password,
-                            "host password (optional)",
-                            220.0,
-                            true,
-                        );
-                        self.hits.push((HitKind::Field("debrid_password"), r));
-                        let r = mbutton(ui, &self.man, "Submit", 120.0, 32.0, true);
-                        self.hits.push((HitKind::Btn(ButtonId::DebridSubmit), r));
-                    });
-                    // A .torrent file is only offered when the provider's
-                    // own API takes one. A provider that does not gets a
-                    // disabled button and the reason.
-                    match provider.unsupported_reason(crate::debrid::Workflow::TorrentMetadata) {
-                        Some(reason) => {
-                            ui.horizontal(|ui| {
-                                ui.add_enabled(
-                                    false,
-                                    egui::Button::new("Torrent File…")
-                                        .min_size(egui::vec2(140.0, 30.0)),
-                                );
-                                ui.weak(reason);
-                            });
-                        }
-                        None => {
-                            let r = mbutton(ui, &self.man, "Torrent File…", 140.0, 30.0, false);
-                            self.hits.push((HitKind::Btn(ButtonId::DebridTorrentFile), r));
-                        }
-                    }
-                    if !self.debrid_notice.is_empty() {
-                        ui.colored_label(pl().notice, &self.debrid_notice);
-                    }
-                    if self.debrid_busy {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Talking to the provider…");
-                        });
-                    }
-                    if !rows.is_empty() {
-                        ui.label(format!(
-                            "{} file(s) — provider says {status} ({state})",
-                            rows.len()
-                        ));
-                        // The provider's own answer about the torrent, or
-                        // the reason it cannot give one.
-                        match provider.unsupported_reason(crate::debrid::Workflow::CacheQuery) {
-                            Some(reason) => {
-                                ui.weak(format!("Provider cache: {reason}"));
-                            }
-                            None => {
-                                ui.weak(format!(
-                                    "Provider cache: {} — {}",
-                                    cache.label(),
-                                    cache_hint(cache)
-                                ));
-                            }
-                        }
-                        // Some providers fetch every file of a torrent and
-                        // leave the choice to this app; the panel says so
-                        // instead of implying the provider narrowed it.
-                        if let Some(reason) =
-                            provider.unsupported_reason(crate::debrid::Workflow::ProviderFileSelection)
-                        {
-                            ui.weak(format!(
-                                "{reason} The checkboxes still pick which of those files DownloadCraft downloads."
-                            ));
-                        }
-                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                            for (id, name, bytes) in &rows {
-                                let checked = selected.contains(id);
-                                let label = if *bytes > 0 {
-                                    format!("{}  ({})", elide_left(name, 44), format_bytes(*bytes))
-                                } else {
-                                    elide_left(name, 52)
-                                };
-                                let r = mcheck(ui, &self.man, &label, checked);
-                                self.hits.push((HitKind::Check(CheckId::DebridFile(*id)), r));
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            let r = mbutton(ui, &self.man, "Select All", 110.0, 28.0, false);
-                            self.hits.push((HitKind::Btn(ButtonId::DebridSelectAll), r));
-                            let r = mbutton(ui, &self.man, "Select None", 110.0, 28.0, false);
-                            self.hits.push((HitKind::Btn(ButtonId::DebridSelectNone), r));
-                            let r = mbutton(ui, &self.man, "Refresh", 100.0, 28.0, false);
-                            self.hits.push((HitKind::Btn(ButtonId::DebridRefresh), r));
-                        });
-                        ui.horizontal(|ui| {
-                            let r = mbutton(ui, &self.man, "Queue Selected", 150.0, 36.0, true);
-                            self.hits.push((HitKind::Btn(ButtonId::DebridQueue), r));
-                            let r = mbutton(ui, &self.man, "Cancel at Provider", 170.0, 36.0, false);
-                            self.hits.push((HitKind::Btn(ButtonId::DebridCancel), r));
-                        });
-                    }
-                    ui.horizontal(|ui| {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let r = mbutton(ui, &self.man, "Close", 110.0, 36.0, false);
-                                self.hits.push((HitKind::Btn(ButtonId::DebridClose), r));
-                            },
-                        );
-                    });
+                    self.debrid_panel_ui(ui, &rows, &selected, &status, &state, cache);
                 });
             self.show_debrid = open && self.show_debrid;
         }
@@ -8639,6 +9004,25 @@ impl CraftApp {
             ButtonId::AddAdv => self.add_adv = !self.add_adv,
             ButtonId::AddAdd => self.commit_add(false),
             ButtonId::AddDownload => self.commit_add(true),
+            ButtonId::AddToCloud => {
+                // A magnet names a torrent. The provider fetches it; this
+                // app opens no peer connection and never becomes a torrent
+                // client. The magnet goes to the cloud panel with the
+                // provider the user last chose.
+                let magnet = self.add_url.trim().to_string();
+                if !crate::model::is_magnet(&magnet) {
+                    self.show_add = true;
+                    self.push_log("Add download: that is not a magnet link.");
+                    return;
+                }
+                self.debrid_input = magnet;
+                self.show_add = false;
+                self.add_focus_req = false;
+                self.add_recent_open = false;
+                self.show_debrid = true;
+                self.debrid_provider_open = false;
+                self.push_log("Magnet handed to the cloud provider panel.");
+            }
             ButtonId::AddCancel => {
                 self.show_add = false;
                 self.add_focus_req = false;
@@ -8662,18 +9046,10 @@ impl CraftApp {
                 self.grab_exts = crate::grabber::preset_exts(PRESETS[self.grab_preset]);
             }
             ButtonId::DebridProvider => {
-                // Another provider means another account and another task:
-                // what was read for the old one is dropped.
-                //
-                // The TOKEN is not dropped - it is kept in its own provider's
-                // slot, so it can never be shown or sent under the new
-                // provider's name, and switching back finds it where it was
-                // left.
-                self.debrid_provider_index =
-                    (self.debrid_provider_index + 1) % crate::debrid::Provider::ALL.len();
-                self.debrid_account = None;
-                self.debrid_session = None;
-                self.debrid_notice.clear();
+                // The provider is a list, not a cycle: the button opens
+                // it and the list does the choosing.
+                self.debrid_provider_open = !self.debrid_provider_open;
+                self.debrid_provider_highlight = self.debrid_provider_index;
             }
             ButtonId::DebridValidate => self.start_debrid_validate(),
             ButtonId::DebridSubmit => self.start_debrid_submit(),
@@ -9028,6 +9404,7 @@ impl CraftApp {
                     | HitKind::Slider(..)
                     | HitKind::Field(_)
                     | HitKind::ComboAnchor
+                    | HitKind::DebridProviderRow(_)
                     | HitKind::QMove(_, _)
             );
             if modal_open && !dialog_kind {
@@ -9054,6 +9431,7 @@ impl CraftApp {
                     HitKind::Slider(..) => "slider".to_string(),
                     HitKind::Field(f) => format!("field:{f}"),
                     HitKind::ComboAnchor => "combo".to_string(),
+                    HitKind::DebridProviderRow(i) => format!("provider:{i}"),
                     HitKind::QMove(id, d) => format!("qmove:#{id}:{d}"),
                 };
             }
@@ -9338,6 +9716,13 @@ impl CraftApp {
                         self.finish_open = !self.finish_open;
                     }
                 }
+                HitKind::DebridProviderRow(i) => {
+                    if clk {
+                        fired_menu = true;
+                        self.debrid_set_provider(i);
+                        self.debrid_provider_open = false;
+                    }
+                }
             }
         }
         if let Some(cur) = zone_cursor {
@@ -9357,6 +9742,7 @@ impl CraftApp {
         if fired_any && !fired_menu && !fired_ctx {
             self.drop_menu = None;
             self.ctx_menu = None;
+            self.debrid_provider_open = false;
         }
         self.man_hover_dbg = hover_dbg;
     }

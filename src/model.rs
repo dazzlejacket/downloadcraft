@@ -447,6 +447,21 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&raw).into_owned()
 }
 
+/// Whether this text is a magnet link.
+///
+/// A magnet is not a file the app can fetch: it names a torrent, and the
+/// only way to get the file is for a cloud provider to fetch it. The app
+/// has no torrent client of its own, so a magnet is handed to the cloud
+/// provider panel instead of the download queue.
+pub fn is_magnet(s: &str) -> bool {
+    let t = s.trim();
+    t.len() > 16
+        && t.len() < 4096
+        && !t.contains(' ')
+        && t.to_ascii_lowercase().starts_with("magnet:")
+        && t.to_ascii_lowercase().contains("xt=urn:bt")
+}
+
 pub fn is_download_url(s: &str) -> bool {
     let t = s.trim();
     // `ftps://` passes the gate so the engine can refuse it loudly with
@@ -1192,6 +1207,28 @@ pub fn pick_windows_asset(v: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A magnet is recognised, and only a magnet.
+    ///
+    /// The Add dialog hands a magnet to the cloud provider panel, so this
+    /// must not fire for an ordinary URL and must not miss a real magnet.
+    #[test]
+    fn a_magnet_is_told_apart_from_a_url() {
+        assert!(is_magnet(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=film"
+        ));
+        assert!(is_magnet("  MAGNET:?XT=URN:BTIH:0123456789ABCDEF  "));
+        // Not magnets.
+        assert!(!is_magnet("https://example.com/file.mp4"));
+        assert!(!is_magnet("magnet:?dn=only-a-name"));
+        assert!(!is_magnet("magnet:"));
+        assert!(!is_magnet(""));
+        assert!(!is_magnet("not a magnet:?xt=urn:btih:0123456789abcdef"));
+        // A magnet is not something the download queue can take.
+        assert!(!is_download_url(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+        ));
+    }
 
     #[test]
     fn queue_start_times() {

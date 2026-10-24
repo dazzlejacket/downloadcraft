@@ -591,8 +591,7 @@ pub fn slider(
 }
 
 /// Concept checkbox (16px): accent fill plus a white tick when checked.
-pub fn dm_check(p: &egui::Painter, r: egui::Rect, checked: bool) {
-    if checked {
+pub fn dm_check(p: &egui::Painter, r: egui::Rect, checked: bool) {    if checked {
         p.rect_filled(r, 4.0, DM_ACC);
         dm_icon(
             p,
@@ -610,6 +609,55 @@ pub fn dm_check(p: &egui::Painter, r: egui::Rect, checked: bool) {
             egui::StrokeKind::Inside,
         );
     }
+}
+
+/// The concept's small upper-case field label, painted above a field.
+///
+/// The concept itself uses placeholders instead of labels, but a panel with
+/// several fields needs to say what each one is; this keeps that label in
+/// the concept's own muted grey.
+pub fn micro_label(p: &egui::Painter, pos: egui::Pos2, text: &str) {
+    p.text(
+        pos,
+        egui::Align2::LEFT_CENTER,
+        text.to_uppercase(),
+        crate::fonts::semi(9.5),
+        pl().dm_lbl,
+    );
+}
+
+/// A closed-set field: the concept's box with a value and a chevron.
+///
+/// The chevron turns over when the list is open, so the field says it is a
+/// chooser and not a plain text box.
+pub fn select_field(p: &egui::Painter, rect: egui::Rect, hovered: bool, value: &str, open: bool) {
+    dm_box(p, rect);
+    if hovered {
+        p.rect_stroke(
+            rect,
+            DM_RAD,
+            egui::Stroke::new(1.0_f32, DM_ACC),
+            egui::StrokeKind::Inside,
+        );
+    }
+    p.text(
+        egui::pos2(rect.min.x + 13.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        value.to_string(),
+        crate::fonts::reg(11.5),
+        pl().dm_txt,
+    );
+    let chev = egui::Rect::from_center_size(
+        egui::pos2(rect.max.x - 18.0, rect.center().y),
+        egui::Vec2::splat(14.0),
+    );
+    dm_icon(
+        p,
+        chev,
+        if open { DmIcon::ChevronUp } else { DmIcon::Chevron },
+        pl().dm_dim,
+        1.6,
+    );
 }
 
 /// Recent-folders menu geometry, derived from the caret button so the render
