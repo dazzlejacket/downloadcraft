@@ -805,6 +805,16 @@ enum ButtonId {
     GrabQueue,
     GrabClose,
     GrabPreset,
+    /// Debrid panel (cloud providers).
+    DebridProvider,
+    DebridValidate,
+    DebridSubmit,
+    DebridRefresh,
+    DebridSelectAll,
+    DebridSelectNone,
+    DebridQueue,
+    DebridCancel,
+    DebridClose,
     RuleAdd,
     RuleDel(usize),
     RuleUp(usize),
@@ -814,6 +824,25 @@ enum ButtonId {
     WinDel(usize),
     UpdCheck,
     UpdDownload,
+}
+
+/// A one-line, safe message for the cloud panel.
+///
+/// The provider errors never carry the request address (the token travels
+/// in the `Authorization` header, not in the URL), so the text can be
+/// shown to the user as it is.
+fn debrid_error_text(e: &anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
+/// What the provider's cache state means for the user.
+fn cache_hint(state: crate::debrid::CacheState) -> &'static str {
+    match state {
+        crate::debrid::CacheState::Cached => "the provider already has it, it will be ready at once",
+        crate::debrid::CacheState::Partial => "the provider holds only part of it",
+        crate::debrid::CacheState::Uncached => "the provider has to fetch it first",
+        crate::debrid::CacheState::Unknown => "the provider did not say",
+    }
 }
 
 /// Checkbox identity for manual routing.
@@ -827,6 +856,27 @@ enum CheckId {
     GrabDepth,
     WinOn,
     UpdOn,
+    /// One cloud file in the debrid panel.
+    DebridFile(u64),
+}
+
+/// What a finished cloud-provider task reports back to the UI.
+///
+/// The provider client owns the token, so it travels inside the session
+/// and never through a download row or a saved file.
+enum DebridOutcome {
+    /// The token was accepted; this is the account behind it.
+    Account(crate::debrid::Account),
+    /// The provider task and the files it reported.
+    Session(crate::debrid::CloudSession),
+    /// The direct links of the picked files, with the session they came
+    /// from, so the panel stays usable afterwards.
+    Targets(Vec<crate::debrid::QueueTarget>, crate::debrid::CloudSession),
+    /// The provider task was deleted.
+    Cancelled,
+    /// The task failed. The message is safe to show. A session that still
+    /// exists comes back with it, so the panel keeps its state.
+    Failed(String, Option<crate::debrid::CloudSession>),
 }
 
 /// Slider identity for manual routing (values live in self fields/items).
@@ -1696,6 +1746,8 @@ enum ToolId {
     Queues,
     Settings,
     Grabber,
+    /// Toolbar "Debrid": cloud providers (Real-Debrid, TorBox).
+    Debrid,
     /// Toolbar "Resume": resume the checked rows (all paused when none).
     ResumeSel,
     /// Toolbar "Stop": pause the checked rows (all active when none).
@@ -1841,6 +1893,22 @@ pub struct CraftApp {
     grab_results: Vec<crate::grabber::GrabLink>,
     grab_notice: String,
     grab_rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::grabber::GrabLink>, String>>>,
+    // ---- cloud providers (debrid) ----
+    show_debrid: bool,
+    /// 0 = Real-Debrid, 1 = TorBox.
+    debrid_provider_index: usize,
+    /// The API token. It lives in memory only: never written to a
+    /// settings file, a queue file or a download row.
+    debrid_token: String,
+    /// The magnet link or hosting URL to submit.
+    debrid_input: String,
+    /// The hosting password, when the host needs one.
+    debrid_password: String,
+    debrid_notice: String,
+    debrid_busy: bool,
+    debrid_account: Option<crate::debrid::Account>,
+    debrid_session: Option<crate::debrid::CloudSession>,
+    debrid_rx: Option<std::sync::mpsc::Receiver<DebridOutcome>>,
     // ---- P3: folder rules + rename templates ----
     folder_rules: Vec<crate::model::FolderRule>,
     rename_template: String,
@@ -1995,6 +2063,16 @@ impl CraftApp {
             grab_results: Vec::new(),
             grab_notice: String::new(),
             grab_rx: None,
+            show_debrid: false,
+            debrid_provider_index: 0,
+            debrid_token: String::new(),
+            debrid_input: String::new(),
+            debrid_password: String::new(),
+            debrid_notice: String::new(),
+            debrid_busy: false,
+            debrid_account: None,
+            debrid_session: None,
+            debrid_rx: None,
             folder_rules: crate::model::default_folder_rules(),
             rename_template: "{name}".to_string(),
             speed_windows: vec![crate::model::SpeedWindow {
@@ -2924,6 +3002,188 @@ impl CraftApp {
         }
         self.push_log(format!("Grabber queued {n} link(s)."));
         self.grab_notice.clear();
+    }
+
+    // ---- cloud providers (debrid) ----
+
+    /// The provider the panel is pointed at.
+    fn debrid_provider(&self) -> crate::debrid::Provider {
+        match self.debrid_provider_index {
+            0 => crate::debrid::Provider::RealDebrid,
+            _ => crate::debrid::Provider::TorBox,
+        }
+    }
+
+    /// Build a provider client, or explain why the token cannot be used.
+    ///
+    /// The token is copied into the client and stays in memory: it is
+    /// never written to a settings file, a queue file or a download row.
+    fn debrid_client(&self) -> Result<crate::debrid::Api, String> {
+        crate::debrid::Api::new(self.debrid_provider(), self.debrid_token.trim().to_string())
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    /// Ask the provider who the token belongs to.
+    ///
+    /// A wrong token is refused here, before any torrent is submitted.
+    fn start_debrid_validate(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let api = match self.debrid_client() {
+            Ok(api) => api,
+            Err(e) => {
+                self.debrid_notice = e;
+                return;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let out = match api.account().await {
+                Ok(a) => DebridOutcome::Account(a),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), None),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Hand the entered magnet link or hosting URL to the provider.
+    ///
+    /// The provider runs the swarm; this app has no local torrent engine.
+    fn start_debrid_submit(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let input = self.debrid_input.trim().to_string();
+        if input.is_empty() {
+            self.debrid_notice = "Enter a magnet link or a hosting URL.".to_string();
+            return;
+        }
+        let api = match self.debrid_client() {
+            Ok(api) => api,
+            Err(e) => {
+                self.debrid_notice = e;
+                return;
+            }
+        };
+        let password = self.debrid_password.clone();
+        let magnet = input.starts_with("magnet:");
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let session = if magnet {
+                crate::debrid::CloudSession::submit_torrent(api, &input).await
+            } else {
+                crate::debrid::CloudSession::submit_hosting(api, &input, &password).await
+            };
+            let out = match session {
+                Ok(s) => DebridOutcome::Session(s),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), None),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Read the provider task again: its status and its file list.
+    fn start_debrid_refresh(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let Some(mut session) = self.debrid_session.take() else {
+            self.debrid_notice = "Nothing to refresh yet.".to_string();
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            // The session comes back even when the provider refused, so the
+            // panel keeps what it already knows.
+            let out = match session.refresh().await {
+                Ok(()) => DebridOutcome::Session(session),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), Some(session)),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Ask the provider for the direct links of the picked files.
+    ///
+    /// The links are ordinary HTTPS addresses that carry no provider
+    /// credential, so they go into the normal queue.
+    fn start_debrid_queue(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let Some(session) = self.debrid_session.take() else {
+            self.debrid_notice = "Nothing to queue yet.".to_string();
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let out = match session.resolve().await {
+                Ok(targets) => DebridOutcome::Targets(targets, session),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), Some(session)),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Delete the provider task.
+    fn start_debrid_cancel(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        let Some(session) = self.debrid_session.take() else {
+            self.debrid_notice = "Nothing to cancel.".to_string();
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let out = match session.cancel().await {
+                Ok(()) => DebridOutcome::Cancelled,
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), Some(session)),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Queue the direct links of the picked cloud files.
+    ///
+    /// They go through the same dedupe + destination-clash path as every
+    /// other capture, so a cloud file never bypasses the queue rules.
+    /// The provider's own connection limit is kept for the row.
+    fn queue_cloud_targets(&mut self, targets: Vec<crate::debrid::QueueTarget>) -> usize {
+        let mut n = 0;
+        for t in targets {
+            let url = t.url.clone();
+            let size = if t.size > 0 { Some(t.size) } else { None };
+            if !self.queue_url(url.clone(), Some(t.filename.clone()), false, size) {
+                continue;
+            }
+            if let Some(limit) = t.connections {
+                if let Some(row) = self.downloads.iter_mut().find(|d| d.url == url) {
+                    row.connections = limit.clamp(1, 16);
+                }
+            }
+            n += 1;
+        }
+        if self.queue_running {
+            self.fill_next();
+        }
+        n
     }
 
     /// Recompute the live scheduler cap from speed windows (P3.4).
@@ -5303,6 +5563,7 @@ impl eframe::App for CraftApp {
                 tools.push((ToolId::StopQueue, MI_STOP, "Stop Queue", true, "Stop starting new downloads (active ones finish)"));
                 tools.push((ToolId::Queues, MI_REORDER, "Open Queue", true, "Queue status, scheduler and log"));
                 tools.push((ToolId::Grabber, MI_PUBLIC, "Site Grabber", true, "Collect file links from a web page"));
+                tools.push((ToolId::Debrid, MI_CLOUD_DL, "Debrid", true, "Resolve magnet and hosting links with a cloud provider"));
                 tools.push((ToolId::Settings, MI_TUNE, "Settings", true, "Open Settings in its own window"));
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(10.0);
@@ -6240,6 +6501,212 @@ impl eframe::App for CraftApp {
                     });
                 });
             self.show_grabber = open && self.show_grabber;
+        }
+
+        // ================= cloud providers (debrid) =================
+        if self.show_debrid {
+            // Collect the finished provider call without holding borrows
+            // across UI code.
+            let mut got: Option<DebridOutcome> = None;
+            if let Some(rx) = self.debrid_rx.as_ref() {
+                while let Ok(r) = rx.try_recv() {
+                    got = Some(r);
+                }
+            }
+            if let Some(outcome) = got {
+                self.debrid_busy = false;
+                match outcome {
+                    DebridOutcome::Account(a) => {
+                        self.debrid_notice = format!("Signed in as {}", a.summary());
+                        self.debrid_account = Some(a);
+                    }
+                    DebridOutcome::Session(s) => {
+                        self.debrid_notice = format!("Provider status: {}", s.status());
+                        self.debrid_session = Some(s);
+                    }
+                    DebridOutcome::Targets(targets, session) => {
+                        let n = self.queue_cloud_targets(targets);
+                        self.debrid_session = Some(session);
+                        self.debrid_notice = format!("Queued {n} cloud file(s).");
+                        self.push_log(format!("Debrid queued {n} cloud file(s)."));
+                    }
+                    DebridOutcome::Cancelled => {
+                        self.debrid_session = None;
+                        self.debrid_notice = "Task removed at the provider.".to_string();
+                        self.push_log("Debrid task removed at the provider.");
+                    }
+                    DebridOutcome::Failed(msg, session) => {
+                        self.debrid_notice = msg;
+                        if let Some(s) = session {
+                            self.debrid_session = Some(s);
+                        }
+                    }
+                }
+            }
+            if self.debrid_busy {
+                ctx.request_repaint();
+            }
+            // The file list is copied out, so the UI code never borrows the
+            // session while it records its own hits.
+            let (rows, selected, status, state, cache) = match self.debrid_session.as_ref() {
+                Some(s) => {
+                    let mut rows: Vec<(u64, String, u64)> = s
+                        .files()
+                        .iter()
+                        .map(|f| (f.id, f.name.clone(), f.bytes))
+                        .collect();
+                    // A hosting link that the provider resolved right away
+                    // has no task: its files are numbered from one.
+                    for (n, h) in s.hosted_files().iter().enumerate() {
+                        rows.push((n as u64 + 1, h.name.clone(), 0));
+                    }
+                    (
+                        rows,
+                        s.selected().to_vec(),
+                        s.status().to_string(),
+                        s.state().label().to_string(),
+                        s.cache_state(),
+                    )
+                }
+                None => (
+                    Vec::new(),
+                    Vec::new(),
+                    String::new(),
+                    String::new(),
+                    crate::debrid::CacheState::Unknown,
+                ),
+            };
+            let mut open = self.show_debrid;
+            let debrid_w = modal_width(ctx, 620.0);
+            egui::Window::new("Cloud Providers")
+                .id(egui::Id::new("debrid_modal"))
+                .order(egui::Order::Foreground)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(debrid_w)
+                .min_width(debrid_w.min(320.0))
+                .max_width(debrid_w)
+                .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
+                .frame(modal_frame())
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    ui.horizontal(|ui| {
+                        let r = mbutton(
+                            ui,
+                            &self.man,
+                            &format!("Provider: {}", self.debrid_provider().label()),
+                            200.0,
+                            32.0,
+                            false,
+                        );
+                        self.hits.push((HitKind::Btn(ButtonId::DebridProvider), r));
+                        let r = mbutton(ui, &self.man, "Validate", 110.0, 32.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::DebridValidate), r));
+                    });
+                    ui.horizontal(|ui| {
+                        let r = mtext(
+                            ui,
+                            "debrid_token",
+                            &mut self.debrid_token,
+                            "API token",
+                            300.0,
+                            true,
+                        );
+                        self.hits.push((HitKind::Field("debrid_token"), r));
+                    });
+                    ui.weak("The token stays in memory only. It is never written to a settings file, a queue file or a download row.");
+                    if let Some(a) = &self.debrid_account {
+                        ui.label(
+                            egui::RichText::new(format!("Signed in as {}", a.summary()))
+                                .size(12.0)
+                                .color(pl().txt),
+                        );
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let r = mtext(
+                            ui,
+                            "debrid_input",
+                            &mut self.debrid_input,
+                            "magnet:… or https://host/…",
+                            320.0,
+                            false,
+                        );
+                        self.hits.push((HitKind::Field("debrid_input"), r));
+                    });
+                    ui.horizontal(|ui| {
+                        let r = mtext(
+                            ui,
+                            "debrid_password",
+                            &mut self.debrid_password,
+                            "host password (optional)",
+                            220.0,
+                            true,
+                        );
+                        self.hits.push((HitKind::Field("debrid_password"), r));
+                        let r = mbutton(ui, &self.man, "Submit", 120.0, 32.0, true);
+                        self.hits.push((HitKind::Btn(ButtonId::DebridSubmit), r));
+                    });
+                    if !self.debrid_notice.is_empty() {
+                        ui.colored_label(pl().notice, &self.debrid_notice);
+                    }
+                    if self.debrid_busy {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Talking to the provider…");
+                        });
+                    }
+                    if !rows.is_empty() {
+                        ui.label(format!(
+                            "{} file(s) — provider says {status} ({state})",
+                            rows.len()
+                        ));
+                        ui.weak(format!(
+                            "Provider cache: {} — {}",
+                            cache.label(),
+                            cache_hint(cache)
+                        ));
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            for (id, name, bytes) in &rows {
+                                let checked = selected.contains(id);
+                                let label = if *bytes > 0 {
+                                    format!("{}  ({})", elide_left(name, 44), format_bytes(*bytes))
+                                } else {
+                                    elide_left(name, 52)
+                                };
+                                let r = mcheck(ui, &self.man, &label, checked);
+                                self.hits.push((HitKind::Check(CheckId::DebridFile(*id)), r));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let r = mbutton(ui, &self.man, "Select All", 110.0, 28.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::DebridSelectAll), r));
+                            let r = mbutton(ui, &self.man, "Select None", 110.0, 28.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::DebridSelectNone), r));
+                            let r = mbutton(ui, &self.man, "Refresh", 100.0, 28.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::DebridRefresh), r));
+                        });
+                        ui.horizontal(|ui| {
+                            let r = mbutton(ui, &self.man, "Queue Selected", 150.0, 36.0, true);
+                            self.hits.push((HitKind::Btn(ButtonId::DebridQueue), r));
+                            let r = mbutton(ui, &self.man, "Cancel at Provider", 170.0, 36.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::DebridCancel), r));
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let r = mbutton(ui, &self.man, "Close", 110.0, 36.0, false);
+                                self.hits.push((HitKind::Btn(ButtonId::DebridClose), r));
+                            },
+                        );
+                    });
+                });
+            self.show_debrid = open && self.show_debrid;
         }
 
         if self.show_queues {
@@ -7662,6 +8129,32 @@ impl CraftApp {
                     &["Mixed", "Video", "Audio", "Images", "Documents", "Archives"];
                 self.grab_exts = crate::grabber::preset_exts(PRESETS[self.grab_preset]);
             }
+            ButtonId::DebridProvider => {
+                // Another provider means another account and another task:
+                // what was read for the old one is dropped.
+                self.debrid_provider_index = (self.debrid_provider_index + 1) % 2;
+                self.debrid_account = None;
+                self.debrid_session = None;
+                self.debrid_notice.clear();
+            }
+            ButtonId::DebridValidate => self.start_debrid_validate(),
+            ButtonId::DebridSubmit => self.start_debrid_submit(),
+            ButtonId::DebridRefresh => self.start_debrid_refresh(),
+            ButtonId::DebridSelectAll => {
+                if let Some(s) = self.debrid_session.as_mut() {
+                    s.select_all();
+                }
+            }
+            ButtonId::DebridSelectNone => {
+                if let Some(s) = self.debrid_session.as_mut() {
+                    s.select_none();
+                }
+            }
+            ButtonId::DebridQueue => self.start_debrid_queue(),
+            ButtonId::DebridCancel => self.start_debrid_cancel(),
+            ButtonId::DebridClose => {
+                self.show_debrid = false;
+            }
             ButtonId::RuleAdd => {
                 if self.folder_rules.len() < 8 {
                     self.folder_rules.push(crate::model::FolderRule {
@@ -8060,6 +8553,10 @@ impl CraftApp {
                                 self.grab_notice.clear();
                                 self.show_grabber = true;
                             }
+                            ToolId::Debrid => {
+                                self.debrid_notice.clear();
+                                self.show_debrid = true;
+                            }
                             ToolId::ResumeSel => {
                                 // Resume what is checked; with nothing checked,
                                 // every paused row (so the button never sits
@@ -8259,6 +8756,11 @@ impl CraftApp {
                                 self.add_overwrite = !self.add_overwrite
                             }
                             CheckId::GrabDepth => self.grab_depth = !self.grab_depth,
+                            CheckId::DebridFile(id) => {
+                                if let Some(s) = self.debrid_session.as_mut() {
+                                    s.toggle(id);
+                                }
+                            }
                             CheckId::WinOn => {
                                 self.speed_windows_on = !self.speed_windows_on;
                                 self.refresh_speed_limit();

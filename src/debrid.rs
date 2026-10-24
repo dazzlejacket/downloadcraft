@@ -1,9 +1,13 @@
 //! Explicit opt-in cloud providers. Tokens stay in memory and are never
 //! forwarded to generated download URLs or persisted with queue entries.
 //!
-//! Phase A (provider port): the providers are reachable and tested, but
-//! nothing calls them yet. The UI and queue wiring is a later phase, so
-//! the public API is intentionally unused for now.
+//! The panel in `app.rs` is the only caller: it validates the account,
+//! hands the magnet or hosting link to the provider, lets the user pick
+//! files and puts the direct links into the normal queue.
+//!
+//! The provider surface is complete — cache checks, link expiry, error
+//! codes — but the panel uses only part of it, so the rest would read as
+//! dead code even though the tests cover it.
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
@@ -60,6 +64,7 @@ pub struct CloudFile {
     pub id: u64,
     pub name: String,
     pub bytes: u64,
+    /// The provider's own "this file is picked" flag.
     pub selected: bool,
     pub link: String,
 }
@@ -164,6 +169,37 @@ impl CloudStatus {
     }
 }
 
+/// The provider account behind a token.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Account {
+    pub provider: Provider,
+    /// The account name or address the provider reports.
+    pub username: String,
+    /// The plan the provider reports ("premium", "Pro", …).
+    pub plan: String,
+    /// Does the account have a paid plan?
+    pub premium: bool,
+    /// Unix seconds when the account expires, when the provider says.
+    pub expires_at: Option<u64>,
+}
+
+impl Account {
+    /// One line for the user: who the account is and what it may do.
+    pub fn summary(&self) -> String {
+        let who = if self.username.is_empty() {
+            self.provider.label().to_string()
+        } else {
+            self.username.clone()
+        };
+        let plan = if self.plan.is_empty() {
+            "plan unknown".to_string()
+        } else {
+            self.plan.clone()
+        };
+        format!("{who} — {plan}")
+    }
+}
+
 /// A provider refusal, carrying the provider's own code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderError {
@@ -183,7 +219,7 @@ impl std::fmt::Display for ProviderError {
             write!(f, " (HTTP {status})")?;
         }
         if let Some(code) = &self.code {
-            write!(f, " Ã¢â‚¬â€ {code}")?;
+            write!(f, " — {code}")?;
             if let Some(text) = realdebrid_error_text(code) {
                 write!(f, " ({text})")?;
             }
@@ -679,7 +715,7 @@ impl Api {
                 .unwrap_or_default();
             let note = row["note"].as_str().unwrap_or("");
             lines.push(format!(
-                "{name} Ã¢â‚¬â€ {status}\n{domains}{}",
+                "{name} — {status}\n{domains}{}",
                 if note.is_empty() {
                     String::new()
                 } else {
@@ -939,6 +975,116 @@ impl Api {
             Provider::TorBox => TORBOX_LINK_LIFETIME_S,
         }
     }
+
+    /// Read the account behind the token.
+    ///
+    /// Real-Debrid answers `GET /user`, TorBox answers `GET /user/me`.
+    /// A wrong token is refused here, before any torrent is submitted.
+    pub async fn account(&self) -> Result<Account> {
+        let value = match self.provider {
+            Provider::RealDebrid => {
+                self.json(|| self.auth(self.client.get(self.url("user"))))
+                    .await?
+            }
+            Provider::TorBox => {
+                self.json(|| self.auth(self.client.get(self.url("user/me"))))
+                    .await?
+            }
+        };
+        let data = if self.provider == Provider::TorBox {
+            value.get("data").unwrap_or(&value)
+        } else {
+            &value
+        };
+        let (username, plan, premium, expires_at) = match self.provider {
+            Provider::RealDebrid => {
+                let kind = data["type"].as_str().unwrap_or("").to_string();
+                (
+                    data["username"].as_str().unwrap_or("").to_string(),
+                    kind.clone(),
+                    kind.eq_ignore_ascii_case("premium"),
+                    data["expiration"].as_str().and_then(iso_seconds),
+                )
+            }
+            Provider::TorBox => {
+                let plan = data["plan"].as_i64().unwrap_or(0);
+                (
+                    data["email"].as_str().unwrap_or("").to_string(),
+                    torbox_plan_name(plan).to_string(),
+                    plan > 0,
+                    data["premium_expires_at"]
+                        .as_str()
+                        .and_then(iso_seconds),
+                )
+            }
+        };
+        if username.is_empty() && plan.is_empty() {
+            return Err(anyhow!(
+                "{} did not return an account for this token",
+                self.provider.label()
+            ));
+        }
+        Ok(Account {
+            provider: self.provider,
+            username,
+            plan,
+            premium,
+            expires_at,
+        })
+    }
+
+    /// Tell the provider which files of a torrent it should fetch.
+    ///
+    /// Real-Debrid selects files itself. TorBox has no per-file selection:
+    /// its API downloads every file of a torrent, and this says so instead
+    /// of pretending to select.
+    pub async fn select_files(&self, job: &CloudJob, ids: &[u64]) -> Result<()> {
+        match self.provider {
+            Provider::RealDebrid => {
+                if job.kind != Kind::Torrent {
+                    return Err(anyhow!("Only torrent jobs have selectable files"));
+                }
+                let list = ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if list.is_empty() {
+                    return Err(anyhow!("Select at least one file"));
+                }
+                self.json(|| {
+                    self.auth(
+                        self.client
+                            .post(self.url(&format!("torrents/selectFiles/{}", job.id))),
+                    )
+                    .form(&[("files", list.as_str())])
+                })
+                .await?;
+                Ok(())
+            }
+            Provider::TorBox => Err(anyhow!(
+                "TorBox downloads every file of a torrent; the provider offers no per-file selection"
+            )),
+        }
+    }
+}
+
+/// The plan name TorBox reports for a plan number.
+fn torbox_plan_name(plan: i64) -> &'static str {
+    match plan {
+        0 => "Free",
+        1 => "Essential",
+        2 => "Pro",
+        3 => "Standard",
+        _ => "Unknown",
+    }
+}
+
+/// An ISO 8601 timestamp as Unix seconds.
+fn iso_seconds(text: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(text.trim())
+        .ok()
+        .map(|d| d.timestamp().max(0) as u64)
 }
 
 /// Unix seconds, or 0 when the clock is before the epoch.
@@ -949,10 +1095,257 @@ fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// One cloud file, resolved to a direct link and ready for the queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueTarget {
+    /// The direct HTTPS address. It never carries the API token.
+    pub url: String,
+    /// The file name the provider reported.
+    pub filename: String,
+    /// The size the provider reported, when it did.
+    pub size: u64,
+    /// The provider's connection limit for this file, when it sent one.
+    pub connections: Option<usize>,
+}
+
+/// A cloud task the user is working with.
+///
+/// The session owns the provider client, so the token never leaves the
+/// process and is never written to a download row.
+pub struct CloudSession {
+    api: Api,
+    /// The provider task, when the work is one.
+    job: Option<CloudJob>,
+    /// The files of the task.
+    files: Vec<CloudFile>,
+    /// Hosting links the provider resolved without a task.
+    hosted: Vec<HostedFile>,
+    /// The provider's own status word.
+    status: String,
+    /// The same status, normalized.
+    state: CloudStatus,
+    /// The file ids the user picked.
+    selected: Vec<u64>,
+    /// What the provider already held for this torrent, when it answered.
+    cache: Option<CacheStatus>,
+}
+
+impl CloudSession {
+    /// Submit a magnet link and read the task's first state.
+    ///
+    /// The provider is asked first whether it already holds the torrent,
+    /// so the panel can say whether the file will be ready at once or has
+    /// to be fetched first. A provider that cannot answer does not stop
+    /// the submission: the cache state stays unknown.
+    pub async fn submit_torrent(api: Api, magnet: &str) -> Result<Self> {
+        let cache = match magnet_hash(magnet) {
+            Some(hash) if is_torrent_hash(&hash) => api.cache_status(&hash, None).await.ok(),
+            _ => None,
+        };
+        let job = api.add(magnet).await?;
+        let mut session = Self {
+            api,
+            job: Some(job),
+            files: Vec::new(),
+            hosted: Vec::new(),
+            status: "Submitted".into(),
+            state: CloudStatus::Queued,
+            selected: Vec::new(),
+            cache,
+        };
+        session.refresh().await?;
+        Ok(session)
+    }
+
+    /// Submit a hosting link.
+    ///
+    /// Real-Debrid resolves a supported host right away; TorBox creates a
+    /// hosting task that is polled like a torrent task.
+    pub async fn submit_hosting(api: Api, link: &str, password: &str) -> Result<Self> {
+        let (job, hosted) = api.hosting(link, password).await?;
+        let mut session = Self {
+            api,
+            job,
+            files: Vec::new(),
+            hosted,
+            status: "Hosting link submitted".into(),
+            state: CloudStatus::Queued,
+            selected: Vec::new(),
+            cache: None,
+        };
+        session.refresh().await?;
+        Ok(session)
+    }
+
+    /// Read the task's current state and file list again.
+    pub async fn refresh(&mut self) -> Result<()> {
+        let Some(job) = self.job.clone() else {
+            // A resolved hosting link has no task to poll.
+            self.state = CloudStatus::Ready;
+            self.status = "Hosting link resolved".into();
+            if self.selected.is_empty() {
+                self.select_all();
+            }
+            return Ok(());
+        };
+        // The provider's own cached list is skipped: TorBox caches its
+        // torrent list, so a refresh that reads the cache would report a
+        // finished job as still running.
+        let listing = self.api.list_fresh(&job).await?;
+        self.files = listing.files;
+        self.status = listing.status;
+        self.state = listing.state;
+        // A file that vanished must not stay selected.
+        self.selected
+            .retain(|id| self.files.iter().any(|f| f.id == *id));
+        if self.selected.is_empty() && self.state == CloudStatus::Ready {
+            self.select_all();
+        }
+        Ok(())
+    }
+
+    /// The provider's files.
+    pub fn files(&self) -> &[CloudFile] {
+        &self.files
+    }
+
+    /// The hosting files the provider resolved right away.
+    ///
+    /// Real-Debrid answers a hosting link with the file itself, so there
+    /// is no task and no file list: the resolved links live here.
+    pub fn hosted_files(&self) -> &[HostedFile] {
+        &self.hosted
+    }
+
+    /// The provider's own status word.
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    /// The normalized state.
+    pub fn state(&self) -> CloudStatus {
+        self.state
+    }
+
+    /// The file ids the user picked.
+    pub fn selected(&self) -> &[u64] {
+        &self.selected
+    }
+
+    /// Pick or unpick one file.
+    pub fn toggle(&mut self, id: u64) {
+        if let Some(at) = self.selected.iter().position(|x| *x == id) {
+            self.selected.remove(at);
+        } else {
+            self.selected.push(id);
+        }
+    }
+
+    /// Pick every file the provider reported.
+    pub fn select_all(&mut self) {
+        self.selected = if self.job.is_some() {
+            self.files.iter().map(|f| f.id).collect()
+        } else {
+            (1..=self.hosted.len() as u64).collect()
+        };
+    }
+
+    /// Pick nothing.
+    pub fn select_none(&mut self) {
+        self.selected.clear();
+    }
+
+    /// The provider task, when the work is one.
+    pub fn job(&self) -> Option<&CloudJob> {
+        self.job.as_ref()
+    }
+
+    /// What the provider already held for this torrent.
+    ///
+    /// `Cached` means the file can be had at once, `Uncached` means the
+    /// provider has to fetch it first, `Partial` means it holds some of
+    /// the files, and `Unknown` means the provider did not say.
+    pub fn cache_state(&self) -> CacheState {
+        self.cache.as_ref().map(|c| c.state).unwrap_or(CacheState::Unknown)
+    }
+
+    /// The provider's answer about the torrent, when it gave one.
+    pub fn cache(&self) -> Option<&CacheStatus> {
+        self.cache.as_ref()
+    }
+
+    /// Ask the provider for the direct links of the selected files.
+    ///
+    /// The result is what the queue downloads: ordinary HTTPS addresses
+    /// that carry no provider credential.
+    pub async fn resolve(&self) -> Result<Vec<QueueTarget>> {
+        let mut out = Vec::new();
+        if let Some(job) = &self.job {
+            if self.selected.is_empty() {
+                return Err(anyhow!("Select at least one cloud file"));
+            }
+            // Real-Debrid needs to know which files to fetch in the cloud
+            // before it can hand out links.
+            if self.api.provider == Provider::RealDebrid {
+                self.api.select_files(job, &self.selected).await?;
+            }
+            for file in &self.files {
+                if !self.selected.contains(&file.id) {
+                    continue;
+                }
+                let link = self.api.link_info(job, file).await?;
+                out.push(QueueTarget {
+                    url: link.url,
+                    filename: file.name.clone(),
+                    size: file.bytes,
+                    connections: link.connections,
+                });
+            }
+            return Ok(out);
+        }
+        // A resolved hosting link needs no further provider call.
+        for (n, hosted) in self.hosted.iter().enumerate() {
+            if !self.selected.contains(&(n as u64 + 1)) {
+                continue;
+            }
+            out.push(QueueTarget {
+                url: hosted.url.clone(),
+                filename: hosted.name.clone(),
+                size: 0,
+                connections: hosted.connections,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete the task at the provider.
+    pub async fn cancel(&self) -> Result<()> {
+        let Some(job) = &self.job else {
+            // A resolved hosting link has nothing to cancel.
+            return Ok(());
+        };
+        self.api.delete_job(job).await
+    }
+}
+
 /// A torrent info hash: hex only, so it can never change the request
 /// path or query.
 fn is_torrent_hash(hash: &str) -> bool {
     (hash.len() == 40 || hash.len() == 64) && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The torrent info hash inside a magnet link.
+///
+/// The hash is the one part of a magnet link the provider can be asked
+/// about, so it is the only part the panel sends.
+fn magnet_hash(magnet: &str) -> Option<String> {
+    let u = url::Url::parse(magnet.trim()).ok()?;
+    if u.scheme() != "magnet" {
+        return None;
+    }
+    u.query_pairs()
+        .find(|(k, v)| k == "xt" && v.starts_with("urn:btih:"))
+        .map(|(_, v)| v["urn:btih:".len()..].to_string())
 }
 
 /// Read a bounded response body.
@@ -1197,14 +1590,43 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// A magnet link with a full info hash, so the provider's cache check
+    /// runs against it.
+    const MAGNET: &str =
+        "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+
     /// The canned provider answer for a request line.
-    fn mock_payload(path: &str) -> &'static str {
+    fn mock_payload(path: &str) -> String {
+        // Real-Debrid keys its availability answer by the hash, so the
+        // answer has to carry the hash that was asked for.
+        if let Some(rest) = path.strip_prefix("GET /torrents/instantAvailability/") {
+            let hash = rest.split(['?', ' ']).next().unwrap_or("").to_string();
+            return format!(
+                r#"{{"{hash}":{{"rd":[{{"1":{{"filename":"file.bin","filesize":123}}}}]}}}}"#
+            );
+        }
+        mock_static_payload(path).to_string()
+    }
+
+    /// The canned answers that do not depend on the request.
+    fn mock_static_payload(path: &str) -> &'static str {
         if path.contains("unrestrict/link") {
             r#"{"download":"https://cdn.example.test/file.bin","filename":"file.bin"}"#
+        } else if path.contains("user/me") {
+            r#"{"success":true,"data":{"email":"tester@example.test","plan":2,"premium_expires_at":"2051-02-18T04:08:43Z"}}"#
+        } else if path.contains("/user") {
+            r#"{"username":"tester","type":"premium","expiration":"2032-06-06T04:42:42.000Z"}"#
         } else if path.contains("createwebdownload") {
             r#"{"success":true,"data":{"webdownload_id":42}}"#
+        } else if path.contains("checkcached") {
+            r#"{"success":true,"data":{"cached":true,"files":[{"id":3,"name":"file.bin","size":123}]}}"#
+        } else if path.contains("torrents/info/") {
+            r#"{"status":"downloaded","links":["https://real-debrid.com/d/ABC"],"files":[{"id":1,"path":"file.bin","bytes":123,"selected":1}]}"#
         } else if path.contains("webdl/mylist") {
             r#"{"success":true,"data":{"download_state":"cached","files":[{"id":3,"name":"file.bin","size":123}]}}"#
+        } else if path.contains("torrents/mylist") {
+            // TorBox answers the torrent list with an array of torrents.
+            r#"{"success":true,"data":[{"id":71,"download_state":"cached","files":[{"id":3,"name":"file.bin","size":123}]}]}"#
         } else if path.contains("requestdl") {
             r#"{"success":true,"data":"https://cdn.example.test/file.bin"}"#
         } else if path.contains("addMagnet") || path.contains("addTorrent") {
@@ -1795,8 +2217,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_stated_expiry_wins_over_the_default_lifetime() {
-        let now = 1_700_000_000u64;
+    fn a_provider_stated_expiry_wins_over_the_default_lifetime() {        let now = 1_700_000_000u64;
         let value = serde_json::json!({"download": "https://cdn.example.test/f", "expires": now + 60});
         let expiry = link_expiry(&value).unwrap();
         assert_eq!(expiry, now + 60);
@@ -1814,5 +2235,168 @@ mod tests {
         // A relative expiry is read as seconds from now.
         let value = serde_json::json!({"expires_in": 120});
         assert!(link_expiry(&value).unwrap() >= now + 119);
+    }
+
+    // ---- Phase C: account, files, queue hand-off ------------------------
+
+    #[tokio::test]
+    async fn an_account_is_validated_before_anything_is_submitted() {
+        let (api, requests, task) = mock(Provider::RealDebrid).await;
+        let account = api.account().await.unwrap();
+        assert_eq!(account.provider, Provider::RealDebrid);
+        assert_eq!(account.username, "tester");
+        assert_eq!(account.plan, "premium");
+        assert!(account.premium);
+        assert!(account.expires_at.is_some());
+        assert!(account.summary().contains("tester"));
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(request.starts_with("GET /user "));
+        assert!(request.contains("authorization: Bearer private-api-token"));
+        task.abort();
+        let (api, requests, task) = mock(Provider::TorBox).await;
+        let account = api.account().await.unwrap();
+        assert_eq!(account.username, "tester@example.test");
+        assert_eq!(account.plan, "Pro");
+        assert!(account.premium);
+        assert!(account.expires_at.is_some());
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(request.starts_with("GET /user/me "));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn file_selection_follows_what_the_provider_offers() {
+        let (api, requests, task) = mock(Provider::RealDebrid).await;
+        let job = CloudJob {
+            provider: Provider::RealDebrid,
+            id: "rd123".into(),
+            kind: Kind::Torrent,
+        };
+        api.select_files(&job, &[1, 3]).await.unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /torrents/selectFiles/rd123 "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("files=1%2C3"));
+        task.abort();
+        // TorBox downloads every file: it offers no per-file selection.
+        let (api, _requests, task) = mock(Provider::TorBox).await;
+        let job = CloudJob {
+            provider: Provider::TorBox,
+            id: "71".into(),
+            kind: Kind::Torrent,
+        };
+        let err = api
+            .select_files(&job, &[1])
+            .await
+            .expect_err("TorBox has no per-file selection");
+        assert!(err.to_string().contains("every file"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_torrent_session_runs_from_magnet_to_queue_targets() {
+        let (api, requests, task) = mock(Provider::RealDebrid).await;
+        let mut session = CloudSession::submit_torrent(api, MAGNET)
+            .await
+            .unwrap();
+        // The task was submitted and then read back.
+        assert!(session.job().is_some());
+        assert_eq!(session.state(), CloudStatus::Ready);
+        assert_eq!(session.files().len(), 1);
+        assert_eq!(session.files()[0].name, "file.bin");
+        // The provider said it already holds this torrent.
+        assert_eq!(session.cache_state(), CacheState::Cached);
+        // A ready task selects its files on its own.
+        assert_eq!(session.selected(), &[1]);
+        // The user picks one file.
+        session.toggle(1);
+        assert!(session.selected().is_empty());
+        session.toggle(1);
+        assert_eq!(session.selected(), &[1]);
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].filename, "file.bin");
+        assert_eq!(targets[0].size, 123);
+        assert!(targets[0].url.starts_with("https://"));
+        assert!(!targets[0].url.contains("private-api-token"));
+        let requests = requests.lock().unwrap();
+        // The provider was told which files to fetch before the link.
+        let select = requests
+            .iter()
+            .position(|r| r.starts_with("POST /torrents/selectFiles/"))
+            .expect("the provider must be told which files to fetch");
+        let link = requests
+            .iter()
+            .position(|r| r.contains("unrestrict/link"))
+            .expect("the provider must hand out the link");
+        assert!(select < link, "selection must come before the link");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_hosting_session_resolves_without_a_provider_task() {
+        let (api, _requests, task) = mock(Provider::RealDebrid).await;
+        let session = CloudSession::submit_hosting(api, "https://mega.nz/file/abc#key", "pw")
+            .await
+            .unwrap();
+        // Real-Debrid resolves the host right away: there is no task.
+        assert!(session.job().is_none());
+        assert_eq!(session.state(), CloudStatus::Ready);
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url, "https://cdn.example.test/file.bin");
+        assert!(!targets[0].url.contains("private-api-token"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_torbox_torrent_session_reads_its_own_list() {
+        let (api, requests, task) = mock(Provider::TorBox).await;
+        let session = CloudSession::submit_torrent(api, MAGNET).await.unwrap();
+        assert_eq!(session.state(), CloudStatus::Ready);
+        assert_eq!(session.files().len(), 1);
+        assert_eq!(session.files()[0].id, 3);
+        // TorBox answers the cache question with its own list.
+        assert_eq!(session.cache_state(), CacheState::Cached);
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url, "https://cdn.example.test/file.bin");
+        let requests = requests.lock().unwrap();
+        // TorBox has no selectFiles step.
+        assert!(!requests
+            .iter()
+            .any(|r| r.contains("selectFiles")));
+        assert!(requests.iter().any(|r| r.contains("requestdl")));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_cloud_session_can_be_cancelled_at_the_provider() {
+        let (api, requests, task) = mock(Provider::RealDebrid).await;
+        let session = CloudSession::submit_torrent(api, MAGNET).await.unwrap();
+        session.cancel().await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.starts_with("DELETE /torrents/delete/rd123 ")),
+            "the task must be deleted at the provider: {requests:?}"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_session_never_resolves_without_a_selection() {
+        let (api, _requests, task) = mock(Provider::RealDebrid).await;
+        let mut session = CloudSession::submit_torrent(api, MAGNET).await.unwrap();
+        session.select_none();
+        let err = session
+            .resolve()
+            .await
+            .expect_err("nothing selected means nothing to resolve");
+        assert!(err.to_string().contains("at least one"));
+        task.abort();
     }
 }
