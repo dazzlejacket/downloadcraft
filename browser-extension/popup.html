@@ -5,6 +5,8 @@ body { width: 320px; font: 13px system-ui, sans-serif; margin: 10px; background:
 h3 { margin: 0 0 8px; }
 .row { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
 input[type=text] { flex: 1; padding: 5px; background: #2a2b2f; border: 1px solid #3a3b44; color: #e0e0e0; border-radius: 6px; }
+select { flex: 1; padding: 5px; background: #2a2b2f; border: 1px solid #3a3b44; color: #e0e0e0; border-radius: 6px; }
+label[for] { flex: 0 0 auto; }
 button { padding: 5px 10px; cursor: pointer; background: #2a2b2f; color: #e0e0e0; border: 1px solid #3a3b44; border-radius: 6px; }
 button:hover { background: #35363e; }
 .item { border-top: 1px solid #333; padding: 6px 0; }
@@ -15,6 +17,7 @@ label.toggle { display: flex; gap: 6px; align-items: center; margin-bottom: 8px;
 @media (prefers-color-scheme: light) {
   body { background: #ffffff; color: #202124; }
   input[type=text] { background: #f1f3f4; border-color: #e1e3e6; color: #202124; }
+  select { background: #f1f3f4; border-color: #e1e3e6; color: #202124; }
   button { background: #ffffff; color: #202124; border-color: #e1e3e6; }
   button:hover { background: #f1f3f4; }
   .item { border-top-color: #e1e3e6; }
@@ -28,6 +31,13 @@ label.toggle { display: flex; gap: 6px; align-items: center; margin-bottom: 8px;
 <label class="toggle"><input type="checkbox" id="hideUI"> Hide browser download bubble</label>
 <div style="font-size:11px;opacity:.75;margin-bottom:10px">Affects all browser downloads while automatic capture is on and the app is connected. Does not hide Save As dialogs.</div>
 <div class="row">
+  <label for="overlayStyle">Overlay style</label>
+  <select id="overlayStyle">
+    <option value="modern">Modern (round icon)</option>
+    <option value="classic" selected>Classic (download bar)</option>
+  </select>
+</div>
+<div class="row">
   <input type="text" id="minSize" placeholder="Min KB (e.g. 100)" style="max-width:110px">
   <button id="saveFilters" title="Save capture filters">Save filters</button>
 </div>
@@ -39,6 +49,7 @@ label.toggle { display: flex; gap: 6px; align-items: center; margin-bottom: 8px;
   <button id="send">Send</button>
 </div>
 <div class="row"><button id="restoreVideoButtons">Show video download buttons again</button></div>
+<div class="row"><button id="hideOverlay">Hide the overlay on this page</button></div>
 <div id="status"></div>
 <div id="videos"></div>
 <div id="list"></div>

@@ -210,6 +210,25 @@ struct ConfirmApp {
     adding_cat: bool,
     new_cat: String,
     custom_cats: Vec<String>,
+    /// A duplicate the capture would create. The first press on "Download"
+    /// only asks; the second one goes ahead (or focuses the transfer that is
+    /// already running).
+    dup: DupPrompt,
+    /// Where this window sits in the cascade of open dialogs.
+    slot: crate::window::CascadeSlot,
+    /// The window handle, once it exists (used to keep the focus).
+    hwnd: Option<isize>,
+}
+
+/// What the dialog has to say about a file it already knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DupPrompt {
+    /// Nothing to report.
+    None,
+    /// The file was already downloaded. The next press downloads it again.
+    Completed(crate::dupcheck::DuplicateHit),
+    /// The file is still on its way. The next press focuses that transfer.
+    Active(u64),
 }
 
 const CATEGORIES: &[&str] = &[
@@ -567,15 +586,58 @@ impl ConfirmApp {
         if self.filename.trim().is_empty() {
             self.filename = filename_from_url(&self.url);
         }
+        // A transfer that is already running: point the user at it instead
+        // of starting a second copy of the same file.
+        if let DupPrompt::Active(id) = self.dup {
+            self.focus_targets(&[id]);
+            self.done = true;
+            return;
+        }
+        let filename = engine::sanitize_filename(self.filename.trim());
+        let dir = self.effective_dir();
+        match std::mem::replace(&mut self.dup, DupPrompt::None) {
+            // The user pressed the button a second time: they meant it.
+            DupPrompt::Completed(_) => {}
+            // First press on a file this app already has: ask before making a
+            // second copy. A capture must never silently duplicate a file.
+            DupPrompt::None | DupPrompt::Active(_) => {
+                if let Some(hit) = crate::dupcheck::find_duplicate_in_queue(&self.url, &filename, &dir)
+                {
+                    match hit.state {
+                        crate::dupcheck::DuplicateState::Completed => {
+                            // The dialog shows the first 78 characters of the
+                            // notice, so the name is cut to fit.
+                            let name: String = hit.filename.chars().take(26).collect();
+                            self.notice = format!(
+                                "Already downloaded: {name}. Press again to fetch it."
+                            );
+                            self.dup = DupPrompt::Completed(hit);
+                            return;
+                        }
+                        crate::dupcheck::DuplicateState::Active => {
+                            self.notice = format!(
+                                "Already downloading (#{}). Press to go to that one.",
+                                hit.id
+                            );
+                            self.dup = DupPrompt::Active(hit.id);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         let mut item = DownloadItem::new(
             0, // id assigned atomically under the queue lock below
             self.url.trim().to_string(),
-            engine::sanitize_filename(self.filename.trim()),
-            self.effective_dir(),
+            filename,
+            dir,
             self.connections,
         );
         item.referer = self.referer.clone();
         item.cookie = self.cookie.clone();
+        // The captured browser agent travels with the row, so a resumed
+        // download still looks like the browser that captured it.
+        item.user_agent = self.user_agent.clone();
         item.description = self.description.trim().to_string();
         // Browser-measured size (extension HEAD/Range in the real session):
         // keep it so the engine and progress UI know the total even when a
@@ -621,10 +683,31 @@ impl ConfirmApp {
         self.done = true;
     }
 
+    /// Point the main window at rows that already exist, so the user is
+    /// taken to the running transfer instead of starting a second one.
+    fn focus_targets(&self, targets: &[u64]) {
+        let Some(p) = wake_path() else {
+            return;
+        };
+        let _guard = crate::model::fs_lock("wake");
+        if !_guard.owned() {
+            return;
+        }
+        if let Ok(json) =
+            serde_json::to_string_pretty(&serde_json::json!({ "focus": targets }))
+        {
+            let _ = atomic_write(&p, json.as_bytes());
+        }
+        std::thread::spawn(|| {
+            if !main_app_running() {
+                launch_main_app();
+            }
+        });
+    }
+
     /// Ask the main app to start these ids (consumed on its next poll, or at
     /// startup when we launch it below).
-    fn wake_targets(&self, targets: &[u64]) {
-        if let Some(p) = wake_path() {
+    fn wake_targets(&self, targets: &[u64]) {        if let Some(p) = wake_path() {
             let _guard = crate::model::fs_lock("wake");
             if !_guard.owned() { return; }
             let mut ids: Vec<u64> = std::fs::read_to_string(&p)
@@ -713,10 +796,14 @@ pub fn run() -> eframe::Result<()> {
         .unwrap_or(0);
 
     // Claim the inbox entry first so the main window won't prompt too.
+    let mut browser_user_agent = String::new();
     if let Some(item)=claim_inbox(url.trim()) {
         // The native host leaves credentials in the private inbox, not the
         // process command line where other local users can inspect them.
         if cookie.is_empty() {cookie=item.cookie.unwrap_or_default();}
+        // The browser's own agent comes with the capture: a site that
+        // checks the browser only answers that browser.
+        browser_user_agent = item.user_agent.unwrap_or_default();
     }
 
     let prefs = load_prefs();
@@ -736,6 +823,9 @@ pub fn run() -> eframe::Result<()> {
             .build()
             .expect("tokio runtime"),
     );
+    // Take the next slot of the cascade before the window is built: the
+    // position depends on it.
+    let slot = crate::window::take_cascade_slot();
     let mut app = ConfirmApp {
         url: url.trim().to_string(),
         filename: crate::model::apply_rename_template(&prefs.rename_template, &engine::sanitize_filename(&filename), url.trim()),
@@ -752,7 +842,11 @@ pub fn run() -> eframe::Result<()> {
         expects_audio: args.iter().any(|s| s == "--expect-audio"),
         quality_pref,
         connections: prefs.connections,
-        user_agent: prefs.user_agent,
+        user_agent: if browser_user_agent.trim().is_empty() {
+            prefs.user_agent
+        } else {
+            browser_user_agent
+        },
         proxy_url: prefs.proxy_url,
         timeout_secs: prefs.timeout_secs,
         rename_template: prefs.rename_template,
@@ -772,6 +866,9 @@ pub fn run() -> eframe::Result<()> {
         adding_cat: false,
         new_cat: String::new(),
         custom_cats: Vec::new(),
+        dup: DupPrompt::None,
+        slot,
+        hwnd: None,
     };
     // Prefill filename from server when the extension sent none useful.
     // A browser-known size skips probing entirely (server re-probes of
@@ -787,11 +884,17 @@ pub fn run() -> eframe::Result<()> {
         .with_resizable(false)
         .with_decorations(false)
         .with_transparent(true)
-        .with_always_on_top();
+        // Normal Z-order: the dialog is an ordinary window, not a layer that
+        // floats above everything else. Several dialogs stack down and to the
+        // right instead of hiding each other.
+        .with_window_level(egui::WindowLevel::Normal);
+    // Take the next slot of the cascade, on the monitor the pointer is on.
+    let (cx, cy) = crate::window::cascade_position((DM_W, DM_H), slot.index);
+    viewport = viewport.with_position(egui::pos2(cx, cy));
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
-    eframe::run_native(
+    let result = eframe::run_native(
         "Add download",
         eframe::NativeOptions {
             viewport,
@@ -802,7 +905,10 @@ pub fn run() -> eframe::Result<()> {
             crate::app::apply_theme(&cc.egui_ctx, &crate::app::stored_theme());
             Ok(Box::new(app))
         }),
-    )
+    );
+    // The dialog is gone: free its place in the cascade.
+    crate::window::release_cascade_slot();
+    result
 }
 
 impl eframe::App for ConfirmApp {
@@ -826,10 +932,33 @@ impl eframe::App for ConfirmApp {
             }
             return;
         }
-        // Middle of the work area (taskbar excluded), once the monitor
-        // geometry is known; Windows would otherwise cascade the window.
-        if !self.centered && crate::model::center_window(ctx, egui::vec2(DM_W, DM_H)) {
+        // The cascade picked the position before the window existed: it is
+        // already inside the work area of the monitor the pointer was on, at
+        // that monitor's scale, so there is nothing to centre here.
+        if !self.centered {
             self.centered = true;
+        }
+        // Find our own window handle once. A dialog that is not the first of
+        // the cascade must not pull the keyboard away from what the user is
+        // typing in: it appears without focus and only takes it when the
+        // user clicks it.
+        match self.hwnd {
+            None => {
+                if let Some(h) = crate::window::own_window_handle("Add download") {
+                    self.hwnd = Some(h);
+                    if !self.slot.may_activate() {
+                        crate::window::suppress_activation(h);
+                    }
+                }
+            }
+            Some(h) => {
+                if crate::window::activation_suppressed(h)
+                    && ctx.input(|i| i.pointer.any_pressed())
+                    && crate::window::pointer_inside(h)
+                {
+                    crate::window::allow_activation(h);
+                }
+            }
         }
         // Collect probe result.
         if let Some(rx) = self.probe_rx.as_ref() {
@@ -1289,7 +1418,11 @@ impl eframe::App for ConfirmApp {
             p.text(
                 dl_r.center(),
                 egui::Align2::CENTER_CENTER,
-                "Download",
+                match self.dup {
+                    DupPrompt::Completed(_) => "Download again",
+                    DupPrompt::Active(_) => "Focus existing",
+                    DupPrompt::None => "Download",
+                },
                 semi(13.0),
                 egui::Color32::WHITE,
             );

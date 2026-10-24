@@ -3,8 +3,12 @@
 //! Protocol (Chrome/Edge/Firefox native messaging = 4-byte LE length + UTF-8 JSON):
 //!   -> {"type":"ping"}                                  <- {"type":"pong","version":1}
 //!   -> {"type":"download","url":"https://...","filename":"optional",
-//!       "pageUrl":"https://page...","referer":"...","cookie":"...","mime":"..."}
-//!                                                      <- {"type":"ok","queued":true}
+//!       "pageUrl":"https://page...","referer":"...","cookie":"...","mime":"...",
+//!       "userAgent":"Mozilla/5.0 ..."}                  <- {"type":"ok","queued":true}
+//!
+//! `userAgent` is optional (older extensions omit it): it carries the
+//! browser's own User-Agent for the capture, so the app can talk to the
+//! server with the same voice the browser used.
 //!
 //! Download requests are appended to an inbox file that the GUI polls and
 //! imports as queued (auto-started) downloads.
@@ -24,6 +28,11 @@ struct Incoming {
     referer: Option<String>,
     #[serde(default)]
     cookie: Option<String>,
+    /// The browser's own User-Agent for this capture. It is the agent that
+    /// already passed whatever check the site applies, so the app should
+    /// speak with the same voice (optional: older extensions omit it).
+    #[serde(default, alias = "userAgent")]
+    user_agent: Option<String>,
     #[serde(default)]
     mime: Option<String>,
     /// Browser-measured size bytes (HEAD/Range from the page session).
@@ -53,6 +62,11 @@ struct Incoming {
     pub dur: Option<u64>,
     #[serde(default, alias = "audioExpected")]
     pub audio_expected: bool,
+    /// Video overlay the extension should draw (`"modern"` or `"classic"`).
+    /// The extension sends this when the user picks a style in its popup;
+    /// the app adopts it so both places agree.
+    #[serde(default, alias = "style")]
+    pub overlay_style: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,14 +81,21 @@ struct Reply {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     urls: Option<Vec<String>>,
+    /// Video overlay style, answered to a `prefs` request.
+    #[serde(rename = "overlayStyle", skip_serializing_if = "Option::is_none")]
+    overlay_style: Option<String>,
+    /// Who owns the overlay style: the app ("app") or the extension
+    /// ("extension"). The side that owns it wins.
+    #[serde(rename = "overlayStyleSource", skip_serializing_if = "Option::is_none")]
+    overlay_style_source: Option<String>,
 }
 
 impl Reply {
     fn ok() -> Self {
-        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None }
+        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, overlay_style: None, overlay_style_source: None }
     }
     fn err(e: impl Into<String>) -> Self {
-        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None }
+        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, overlay_style: None, overlay_style_source: None }
     }
 }
 
@@ -107,6 +128,11 @@ pub struct InboxItem {
     pub referer: Option<String>,
     #[serde(default)]
     pub cookie: Option<String>,
+    /// The browser's own User-Agent for this capture. It is the agent that
+    /// already passed whatever check the site applies, so the app should
+    /// speak with the same voice (optional: older extensions omit it).
+    #[serde(default, alias = "userAgent")]
+    pub user_agent: Option<String>,
     #[serde(default)]
     pub mime: Option<String>,
     #[serde(default)]
@@ -210,6 +236,7 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         page_url: msg.page_url.clone(),
         referer,
         cookie: msg.cookie.clone().filter(|s| !s.trim().is_empty()),
+        user_agent: msg.user_agent.clone().filter(|s| !s.trim().is_empty()),
         mime: msg.mime.clone().filter(|s| !s.trim().is_empty()),
         size: msg.size.filter(|s| *s > 0),
         pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
@@ -319,7 +346,35 @@ pub fn run() -> eframe::Result<()> {
                 queued: None,
                 error: None,
                 urls: None,
+                overlay_style: None,
+                overlay_style_source: None,
             }),
+            "prefs" => {
+                // What the app currently wants the extension to draw. The
+                // extension asks for this so a style chosen in the desktop
+                // settings reaches the browser.
+                write_message(&Reply {
+                    kind: "prefs".into(),
+                    version: None,
+                    queued: None,
+                    error: None,
+                    urls: None,
+                    overlay_style: Some(crate::model::overlay_style()),
+                    overlay_style_source: Some(crate::model::overlay_style_source()),
+                });
+            }
+            "setOverlayStyle" => {
+                // The extension tells the app what the user picked in its
+                // popup; from now on the extension owns that choice.
+                match msg.overlay_style.as_deref() {
+                    Some(v @ ("modern" | "classic")) => {
+                        crate::model::set_overlay_style(v, "extension");
+                        write_message(&Reply::ok());
+                    }
+                    Some(_) => write_message(&Reply::err("unknown overlay style")),
+                    None => write_message(&Reply::err("no overlay style given")),
+                }
+            }
             "query" => {
                 // Presence check only: no queueing, no dialogs, no locks held
                 // beyond the read.
@@ -331,6 +386,8 @@ pub fn run() -> eframe::Result<()> {
                     queued: None,
                     error: None,
                     urls: Some(hits),
+                    overlay_style: None,
+                    overlay_style_source: None,
                 });
             }
             "download" => {
@@ -382,5 +439,40 @@ mod media_tests {
         assert!(stored.audio_expected);
         let old: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://cdn.example.org/video.mp4"}"#).unwrap();
         assert!(!old.audio_expected);
+    }
+
+    /// The capture carries the browser's own User-Agent: the extension sends
+    /// `userAgent` (camelCase, like `pageUrl`), and the inbox keeps it so
+    /// the engine can speak with the same voice the browser used.
+    #[test]
+    fn browser_user_agent_survives_the_capture() {
+        let msg: Incoming = serde_json::from_str(
+            r#"{"type":"download","url":"https://archive.chirpmyradio.com/download?stream=next","userAgent":"Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg.user_agent.as_deref(),
+            Some("Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0")
+        );
+        // The snake_case spelling is accepted too, and an old extension that
+        // sends no User-Agent at all still parses.
+        let alt: Incoming = serde_json::from_str(
+            r#"{"type":"download","url":"https://h/f.zip","user_agent":"Mozilla/5.0 Chrome/126.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(alt.user_agent.as_deref(), Some("Mozilla/5.0 Chrome/126.0"));
+        let old: Incoming =
+            serde_json::from_str(r#"{"type":"download","url":"https://h/f.zip"}"#).unwrap();
+        assert!(old.user_agent.is_none());
+        // The stored inbox entry keeps the field (and tolerates its absence).
+        let stored: InboxItem = serde_json::from_str(
+            r#"{"url":"https://h/f.zip","filename":null,"received_at":"now","user_agent":"Mozilla/5.0 Chrome/126.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(stored.user_agent.as_deref(), Some("Mozilla/5.0 Chrome/126.0"));
+        let legacy: InboxItem =
+            serde_json::from_str(r#"{"url":"https://h/f.zip","filename":null,"received_at":"now"}"#)
+                .unwrap();
+        assert!(legacy.user_agent.is_none());
     }
 }

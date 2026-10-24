@@ -33,6 +33,9 @@ pub struct SharedState {
     pub part_done: std::sync::Mutex<Vec<u64>>,
     /// Set when YouTube answers with a bot-check wall (HTTP 429 /sorry).
     pub rate_limited: AtomicBool,
+    /// Set when the server answered with a Cloudflare browser check instead
+    /// of the file (the "Just a moment..." interstitial).
+    pub challenged: AtomicBool,
     /// What the transfer is doing when it is not moving bytes — the helper's
     /// own phase names ("Getting info", "Merging"), empty for the built-in
     /// engine, which is always transferring once it has started. yt-dlp spends
@@ -74,6 +77,7 @@ impl SharedState {
             part_total: std::sync::Mutex::new(Vec::new()),
             part_done: std::sync::Mutex::new(Vec::new()),
             rate_limited: AtomicBool::new(false),
+            challenged: AtomicBool::new(false),
             phase: std::sync::Mutex::new(String::new()),
             error: std::sync::Mutex::new(None),
             note: std::sync::Mutex::new(None),
@@ -875,6 +879,67 @@ fn is_final_http_error(e: &anyhow::Error) -> bool {
     e.downcast_ref::<FinalHttp>().is_some()
 }
 
+/// Cloudflare marks the browser check it wants the visitor to solve with
+/// `Cf-Mitigated: challenge` (the "Just a moment…" interstitial). The
+/// header is the reliable signal: the page itself is a normal HTML error
+/// document, and its text varies between Cloudflare's templates.
+fn cloudflare_challenge_header(h: &reqwest::header::HeaderMap) -> bool {
+    h.get("cf-mitigated")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("challenge"))
+        .unwrap_or(false)
+}
+
+/// Text markers of Cloudflare's interstitial page. Used when the header is
+/// missing (some edge configurations answer the challenge without it) and
+/// when the page is served with a 200 instead of a 403.
+fn cloudflare_challenge_body(body: &str) -> bool {
+    let low = body.to_ascii_lowercase();
+    // Unambiguous: the challenge widget, the challenge script, or the
+    // interstitial's own instruction line.
+    const STRONG: &[&str] = &[
+        "cf-browser-verification",
+        "cf-chl-",
+        "cf_chl_opt",
+        "__cf_chl_",
+        "cdn-cgi/challenge-platform",
+        "enable javascript and cookies to continue",
+        "checking your browser",
+        "attention required! | cloudflare",
+        "ddos protection by cloudflare",
+    ];
+    if STRONG.iter().any(|m| low.contains(m)) {
+        return true;
+    }
+    // "Just a moment..." is the interstitial's title, but a page may just
+    // mention it - it only counts together with Cloudflare's own wording.
+    low.contains("just a moment")
+        && (low.contains("cloudflare") || low.contains("cf-chl") || low.contains("challenge"))
+}
+
+/// The refusal for a browser check. The check can only be completed in the
+/// user's own browser, so the message says exactly that: the app does not
+/// try to solve it, and nothing is written to disk.
+fn cloudflare_challenge_err() -> anyhow::Error {
+    final_err(
+        "the server wants a browser check (Cloudflare challenge) — open the link in your browser, let the \"Just a moment...\" page finish, then capture the download again with the Download Craft extension (no file was saved)".to_string(),
+    )
+}
+
+/// True when the row expects a file rather than a web page. A name without
+/// an extension (the `download_123.bin` fallback) or with a non-HTML one
+/// means the row wants bytes: an HTML body there is an error page, never
+/// the download.
+fn expects_binary_file(dest: &std::path::Path) -> bool {
+    match dest.extension().and_then(|e| e.to_str()) {
+        Some(ext) => {
+            let low = ext.to_ascii_lowercase();
+            !matches!(low.as_str(), "html" | "htm" | "xhtml")
+        }
+        None => true,
+    }
+}
+
 /// Saturating counter decrement (plain `fetch_sub` wraps to u64::MAX on
 /// underflow — which once painted a stuck-full progress bar).
 fn sub_saturating(a: &std::sync::atomic::AtomicU64, n: u64) {
@@ -1121,6 +1186,24 @@ pub async fn verify_checksum(path: &PathBuf, expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
+/// What one probe learned about a URL.
+#[derive(Debug, Default, Clone)]
+pub struct ProbeInfo {
+    /// Total size in bytes, when the server said so.
+    pub total: Option<u64>,
+    /// Whether the server honors Range requests.
+    pub supports_range: bool,
+    /// Content-Type of the final response.
+    pub content_type: Option<String>,
+    /// File name from the final response's Content-Disposition.
+    pub disposition: Option<String>,
+    /// The URL the redirects finally landed on. The file may live somewhere
+    /// else than the captured URL, and only the final URL knows its name.
+    pub final_url: Option<String>,
+    /// The server answered with a Cloudflare browser check, not a file.
+    pub challenged: bool,
+}
+
 /// Probe total size + range support with HEAD, falling back to a 0-0 range GET.
 /// Returns (total, supports_range, content_type, disposition_filename).
 pub async fn probe(
@@ -1128,7 +1211,26 @@ pub async fn probe(
     opts: &EngineOpts,
     url: &str,
 ) -> (Option<u64>, bool, Option<String>, Option<String>) {
+    let info = probe_full(client, opts, url).await;
+    (
+        info.total,
+        info.supports_range,
+        info.content_type,
+        info.disposition,
+    )
+}
+
+/// Probe a URL and report everything the engine learned about it: size, range
+/// support, content type, the server's file name, the URL the redirects
+/// landed on, and whether a Cloudflare browser check answered instead of the
+/// file.
+pub async fn probe_full(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+) -> ProbeInfo {
     let dbg = std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok();
+    let mut info = ProbeInfo::default();
     // Try HEAD first — but ONLY trust success responses. Error pages
     // (403/404 with `Content-Length: 0`) must fall through to the Range
     // fallback: treating 0 as a real total poisons everything downstream
@@ -1137,6 +1239,9 @@ pub async fn probe(
         if dbg {
             eprintln!("[dbg] probe HEAD status={}", resp.status());
         }
+        // Redirects are followed by the client, so this is the URL the
+        // response really came from.
+        info.final_url = Some(resp.url().to_string());
         if resp.status().is_success() {
             let h = resp.headers();
             let total = h
@@ -1153,13 +1258,19 @@ pub async fn probe(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
             let disp = disposition_filename(h);
-            if total.is_some() || disp.is_some() {
-                return (total, accept, ctype, disp);
+            let learned = total.is_some() || disp.is_some();
+            info.total = total;
+            info.supports_range = accept;
+            info.content_type = ctype;
+            info.disposition = disp;
+            info.challenged = cloudflare_challenge_header(h);
+            if learned {
+                return info;
             }
         }
     }
     // Fallback: GET bytes=0-0, parse Content-Range: bytes 0-0/12345
-    if let Ok(resp) = opts
+    if let Ok(mut resp) = opts
         .get(client, url)
         .header(reqwest::header::RANGE, "bytes=0-0")
         .send()
@@ -1169,11 +1280,18 @@ pub async fn probe(
         if dbg {
             eprintln!("[dbg] probe GET 0-0 status={status}");
         }
+        info.final_url = Some(resp.url().to_string());
+        // The GET fallback reports no content type (see `probe`), so the
+        // interstitial check below works on the body instead.
+        info.content_type = None;
+        info.supports_range = false;
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
             if let Some(cr) = resp.headers().get(reqwest::header::CONTENT_RANGE) {
                 if let Ok(s) = cr.to_str() {
                     if let Some(total) = s.split('/').next_back().and_then(|t| t.parse::<u64>().ok()) {
-                        return (Some(total), true, None, None);
+                        info.total = Some(total);
+                        info.supports_range = true;
+                        return info;
                     }
                 }
             }
@@ -1184,14 +1302,35 @@ pub async fn probe(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
         let disp = disposition_filename(resp.headers());
+        info.disposition = disp;
+        // A browser check is not a file. Recognize it here so the download
+        // fails with a clear message instead of saving the interstitial.
+        if cloudflare_challenge_header(resp.headers()) {
+            info.challenged = true;
+        } else if !status.is_success() || content_type_is_html(resp.headers()) {
+            // Error and interstitial pages are small: read a bounded prefix
+            // of the body to recognize Cloudflare's "Just a moment..." page.
+            let body = read_prefix(&mut resp, 32 * 1024).await;
+            info.challenged = cloudflare_challenge_body(&body);
+        }
         // Error statuses teach nothing: a 403 page's `Content-Length: 0` is
         // not a total (see the HEAD gate above).
         if status.is_success() {
-            return (total, false, None, disp);
+            info.total = total;
+            return info;
         }
-        return (None, false, None, disp);
+        info.total = None;
+        return info;
     }
-    (None, false, None, None)
+    info
+}
+
+/// True when the response announces an HTML body.
+fn content_type_is_html(h: &reqwest::header::HeaderMap) -> bool {
+    h.get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
 }
 
 /// One-shot Range check for expiring signed CDN links: a single
@@ -1361,6 +1500,26 @@ pub fn sanitize_filename(s: &str) -> String {
     out
 }
 
+/// A file name for a response whose URL carried none: the final URL's last
+/// meaningful segment, plus an extension from the MIME type when that type
+/// is a known binary one. An HTML response never gets an invented extension
+/// (`ext_for_mime` knows no HTML type), and a URL with nothing usable keeps
+/// the clearly-fallback name.
+fn derived_file_name(final_url: &str, ctype: Option<&str>) -> Option<String> {
+    let base = crate::model::filename_from_url(final_url);
+    if crate::model::is_fallback_filename(&base) {
+        return None;
+    }
+    let base = sanitize_filename(&base);
+    if base.contains('.') {
+        return Some(base);
+    }
+    match ctype.and_then(crate::model::ext_for_mime) {
+        Some(ext) => Some(base + ext),
+        None => Some(base),
+    }
+}
+
 /// A resolved playable stream: the video URL plus an optional companion
 /// audio URL (adaptive video-only qualities, merged with ffmpeg on
 /// completion — the only way to deliver 1080p+).
@@ -1424,6 +1583,13 @@ pub async fn resolve_media(
                 return Some(hit);
             }
         }
+        return None;
+    }
+    // Cloudflare's browser check is not a page either: it carries no media,
+    // and the caller must say "complete the check in your browser" instead
+    // of "this page has no video".
+    if cloudflare_challenge_body(&html) {
+        shared.challenged.store(true, Ordering::SeqCst);
         return None;
     }
     if walled {
@@ -3713,8 +3879,42 @@ async fn sleep_live(shared: &Arc<SharedState>, secs: u64) -> Result<()> {
     }
 }
 
-/// Entry point used by the UI. Downloads `url` to `dest` with N connections.
-/// If `url` is an HTML page (e.g. YouTube), a direct media stream is
+/// Ask Google Drive for the real download URL of a file.
+///
+/// Drive answers a capture with a web page for anything that is not tiny.
+/// That page carries a form with a one-time confirm token, and the token
+/// cannot be made up — it has to be read off the page the server sent. A
+/// file that is served straight away (a redirect to the bytes) is left
+/// alone: the normal transfer follows it.
+async fn follow_drive_interstitial(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+) -> Option<String> {
+    // A link that already points at the download endpoint needs no page.
+    if url.contains("drive.usercontent.google.com") {
+        return None;
+    }
+    let id = crate::drive::file_id(url)?;
+    let probe = crate::drive::download_url(&id);
+    let resp = opts.get(client, &probe).send().await.ok()?;
+    let is_html = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.contains("text/html"))
+        .unwrap_or(false);
+    if !is_html {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    if !crate::drive::looks_like_interstitial(&body) {
+        return None;
+    }
+    crate::drive::interstitial_target(&body)
+}
+
+/// Entry point used by the UI. Downloads `url` to `dest` with N connections./// If `url` is an HTML page (e.g. YouTube), a direct media stream is
 /// auto-detected first, like the video capture in classic download managers.
 /// Plain (non-encrypted) HLS VOD playlists (.m3u8) are assembled
 /// segment-by-segment; DASH (.mpd) likewise; `ftp://` URLs go to the
@@ -3828,6 +4028,19 @@ async fn download_inner(
     })?;
     let client = opts.build_client()?;
 
+    // Google Drive answers a capture with a web page instead of the file for
+    // anything that is not tiny, and that page carries the form which points
+    // at the real download. The confirm token in it cannot be made up: it has
+    // to be read off the page the server just sent.
+    if crate::drive::is_drive_url(&url) {
+        if let Some(direct) = follow_drive_interstitial(&client, &opts, &url).await {
+            if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
+                eprintln!("[dbg] drive interstitial followed");
+            }
+            url = direct;
+        }
+    }
+
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -3866,9 +4079,28 @@ async fn download_inner(
             Err(e) => return Err(e), // expired/refused: fail fast, loudly
         }
     }
+    // The URL the redirects landed on: the captured URL may name nothing at
+    // all (`/download?stream=next`) while the final path names the file
+    // (`/chirp_next/next-20261023`).
+    let mut final_url: Option<String> = None;
     let (mut total_opt, mut supports_range, ctype, disp) = match range_verified {
         Some(verified) => (verified.or(seeded_total), verified.is_some(), None, None),
-        None => probe(&client, &opts, &url).await,
+        None => {
+            let info = probe_full(&client, &opts, &url).await;
+            // A Cloudflare browser check is not the file. Fail here, before
+            // anything is written, and say what the user has to do.
+            if info.challenged {
+                drop(_job);
+                return Err(cloudflare_challenge_err());
+            }
+            final_url = info.final_url.clone();
+            (
+                info.total,
+                info.supports_range,
+                info.content_type,
+                info.disposition,
+            )
+        }
     };
     // Some CDNs use opaque manifest URLs. Route by the actual response
     // type as well as extension, instead of saving playlist text as video.
@@ -3904,19 +4136,31 @@ async fn download_inner(
             // URL yielded no usable name (`download_123.bin` or bare
             // `song` + video/mp4 → `song.mp4`).
             if let Some(cur) = dest.file_name().map(|s| s.to_string_lossy().to_string()) {
-                let fixed = if crate::model::is_fallback_filename(&cur) {
-                    ctype
+                // A redirect can land on a path that names the file even
+                // when the captured URL did not (`/download?stream=next` →
+                // `/chirp_next/next-20261023`).
+                let derived = if crate::model::is_fallback_filename(&cur) {
+                    final_url
                         .as_deref()
-                        .and_then(crate::model::ext_for_mime)
-                        .map(|ext| cur.trim_end_matches(".bin").to_string() + ext)
-                } else if !cur.contains('.') {
-                    ctype
-                        .as_deref()
-                        .and_then(crate::model::ext_for_mime)
-                        .map(|ext| cur.clone() + ext)
+                        .and_then(|u| derived_file_name(u, ctype.as_deref()))
                 } else {
                     None
                 };
+                let fixed = derived.or_else(|| {
+                    if crate::model::is_fallback_filename(&cur) {
+                        ctype
+                            .as_deref()
+                            .and_then(crate::model::ext_for_mime)
+                            .map(|ext| cur.trim_end_matches(".bin").to_string() + ext)
+                    } else if !cur.contains('.') {
+                        ctype
+                            .as_deref()
+                            .and_then(crate::model::ext_for_mime)
+                            .map(|ext| cur.clone() + ext)
+                    } else {
+                        None
+                    }
+                });
                 if let Some(fixed) = fixed {
                     dest.set_file_name(&fixed);
                     mutex_guard(&shared.resolved_name).replace(fixed);
@@ -4125,6 +4369,9 @@ async fn download_inner(
                 }
             }
             None => {
+                if shared.challenged.load(Ordering::SeqCst) {
+                    return Err(cloudflare_challenge_err());
+                }
                 if shared.rate_limited.load(Ordering::SeqCst) {
                     return Err(anyhow!(
                         "YouTube is rate-limiting this network right now (bot check) — open the video in your browser, click the floating ⬇ Download this video button, and pick a quality there; the app will confirm the download"
@@ -7007,6 +7254,53 @@ async fn single_stream(
     }
 }
 
+/// Read at most `limit` bytes of a response body. Error and interstitial
+/// pages are small; a body that keeps coming is not one of them, so the
+/// rest of the response is dropped instead of downloaded.
+async fn read_prefix(resp: &mut reqwest::Response, limit: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < limit {
+        match resp.chunk().await {
+            Ok(Some(c)) => {
+                let take = (limit - buf.len()).min(c.len());
+                buf.extend_from_slice(&c[..take]);
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Refuse a response that is not the file: a Cloudflare browser check, or a
+/// web page where a file was expected. Both are caught BEFORE a single byte
+/// is written — saving a "Just a moment..." page as the download is worse
+/// than a clear failure.
+async fn refuse_web_page(
+    resp: &mut reqwest::Response,
+    dest: &std::path::Path,
+) -> Option<anyhow::Error> {
+    // Cloudflare marks its browser check explicitly.
+    if cloudflare_challenge_header(resp.headers()) {
+        return Some(cloudflare_challenge_err());
+    }
+    if !content_type_is_html(resp.headers()) {
+        return None;
+    }
+    // The body decides whether this is Cloudflare's check or an ordinary
+    // error page. A web page is never the download: the engine resolves
+    // media FROM a page, it never saves one.
+    let body = read_prefix(resp, 64 * 1024).await;
+    if cloudflare_challenge_body(&body) {
+        return Some(cloudflare_challenge_err());
+    }
+    Some(final_err(if expects_binary_file(dest) {
+        "the server answered with a web page, not a file — open the link in your browser and capture it with the Download Craft extension (no file was saved)".to_string()
+    } else {
+        "the server answered with a web page — Download Craft downloads media, not pages: open the link in your browser and capture the media from there (no file was saved)".to_string()
+    }))
+}
+
 async fn single_stream_once(
     client: &reqwest::Client,
     opts: &EngineOpts,
@@ -7068,15 +7362,23 @@ async fn single_stream_once(
             req = req.header(reqwest::header::IF_RANGE, c);
         }
     }
-    let resp = match req.send().await?.error_for_status() {
+    let mut resp = req.send().await?;
+    // A browser check (Cloudflare) or a web page where a file was expected
+    // is never the download: refuse it before a single byte is written.
+    if let Some(e) = refuse_web_page(&mut resp, dest).await {
+        return Err(e);
+    }
+    let resp = match resp.error_for_status() {
         Ok(r) => r,
         Err(e) => {
             let mapped = http_status_err(url, e);
             if start_at == 0 && !is_final_http_error(&mapped) {
                 // server dislikes Range (but isn't refusing us): plain GET
-                opts.get(client, url)
-                    .send()
-                    .await?
+                let mut plain = opts.get(client, url).send().await?;
+                if let Some(e) = refuse_web_page(&mut plain, dest).await {
+                    return Err(e);
+                }
+                plain
                     .error_for_status()
                     .map_err(|e| http_status_err(url, e))?
             } else {
@@ -7535,7 +7837,12 @@ async fn chunked_once(
             req = req.header(reqwest::header::IF_RANGE, c);
         }
     }
-    let resp = req.send().await?;
+    let mut resp = req.send().await?;
+    // A browser check (Cloudflare) or a web page where a file was expected
+    // is never the download: refuse it before a single byte is written.
+    if let Some(e) = refuse_web_page(&mut resp, tmp).await {
+        return Err(e);
+    }
     let resp = resp
         .error_for_status()
         .map_err(|e| http_status_err(url, e))?;
@@ -7966,9 +8273,13 @@ async fn download_range_once(
             req = req.header(reqwest::header::IF_RANGE, c);
         }
     }
-    let resp = req
-        .send()
-        .await?
+    let mut resp = req.send().await?;
+    // A browser check (Cloudflare) or a web page where a file was expected
+    // is never the download: refuse it before a single byte is written.
+    if let Some(e) = refuse_web_page(&mut resp, part).await {
+        return Err(e);
+    }
+    let resp = resp
         .error_for_status()
         .map_err(|e| http_status_err(url, e))?;
 
@@ -9667,6 +9978,72 @@ mod tests {
             let _ = s.flush().await;
             return;
         }
+        // Cloudflare browser-check fixtures (P1): the "Just a moment..."
+        // interstitial must fail the download, never be saved as the file.
+        // The route ignores the query string (the captured CHIRP link is
+        // `/download?stream=next`).
+        let route = path.split('?').next().unwrap_or("").to_string();
+        const CF_PAGE: &str = "<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><div id=\"cf-chl-widget\"><h1>Just a moment...</h1><p>Enable JavaScript and cookies to continue</p></div><script src=\"/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js\"></script></body></html>";
+        if route == "/cf-challenge" || route == "/cf-redirect" || route == "/cf-html" {
+            if route == "/cf-redirect" {
+                let r = "HTTP/1.1 302 Found\r\nLocation: /cf-challenge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.flush().await;
+                return;
+            }
+            let (status, extra) = if route == "/cf-html" {
+                // Same interstitial, but served with 200 and without the
+                // `Cf-Mitigated` header: only the body identifies it.
+                ("HTTP/1.1 200 OK", String::new())
+            } else {
+                (
+                    "HTTP/1.1 403 Forbidden",
+                    "Cf-Mitigated: challenge\r\nServer: cloudflare\r\n".to_string(),
+                )
+            };
+            let resp = format!(
+                "{status}\r\nContent-Type: text/html; charset=UTF-8\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                CF_PAGE.len()
+            );
+            let _ = s.write_all(resp.as_bytes()).await;
+            if !is_head {
+                let _ = s.write_all(CF_PAGE.as_bytes()).await;
+            }
+            let _ = s.flush().await;
+            return;
+        }
+        // Extensionless redirect target (the CHIRP shape): the file lives at
+        // `/chirp_next/next-20261023` - no extension, no Content-Disposition.
+        if route == "/extless" {
+            let r = "HTTP/1.1 302 Found\r\nLocation: /chirp_next/next-20261023\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = s.write_all(r.as_bytes()).await;
+            let _ = s.flush().await;
+            return;
+        }
+        if route == "/chirp_next/next-20261023" {
+            let len = body.len() as u64;
+            let (start, end) = range.unwrap_or((0, len.saturating_sub(1)));
+            let end = end.min(len.saturating_sub(1));
+            let window = &body[start as usize..=end as usize];
+            let (status, extra) = if range.is_some() && start < len {
+                (
+                    "HTTP/1.1 206 Partial Content",
+                    format!("Accept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{len}\r\n"),
+                )
+            } else {
+                ("HTTP/1.1 200 OK", "Accept-Ranges: bytes\r\n".to_string())
+            };
+            let resp = format!(
+                "{status}\r\nContent-Type: application/x-msdownload\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                window.len()
+            );
+            let _ = s.write_all(resp.as_bytes()).await;
+            if !is_head {
+                let _ = s.write_all(window).await;
+            }
+            let _ = s.flush().await;
+            return;
+        }
         // Facebook-CDN simulations (clean-but-early closes, like fbcdn):
         // /fbcut honors Range but cuts every connection after 64 KiB while
         // advertising the full window (headers promise, body stops).
@@ -10646,6 +11023,213 @@ mod tests {
         assert_eq!(hls_target_duration("#EXTM3U\n"), 6);
         assert_eq!(host_of("https://www.Example.com:8443/a.m3u8"), "example.com");
         assert_eq!(host_of("not a url"), "");
+    }
+
+    /// A Cloudflare browser check must fail the download with an actionable
+    /// message and leave NO file behind - the "Just a moment..." page is not
+    /// the file. An extensionless redirect target (no disposition, no
+    /// extension) must be named after the URL the redirect landed on.
+    #[tokio::test]
+    async fn cloudflare_challenge_fails_and_extensionless_target_is_named() {
+        use std::sync::atomic::AtomicUsize;
+        const LEN: usize = 64 * 1024;
+        let body: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let body = std::sync::Arc::new(body);
+        let flaky_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let fb_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cf fixture");
+        let addr = listener.local_addr().expect("cf fixture addr");
+        let srv = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((s, _)) => {
+                        let b = body.clone();
+                        let f = flaky_hits.clone();
+                        let h = fb_hits.clone();
+                        tokio::spawn(async move { serve_conn(s, b, f, h).await });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let base = format!("http://{addr}");
+        let dir = std::env::temp_dir().join(format!("dc_cf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. The header-marked challenge (403 + `Cf-Mitigated: challenge`).
+        let dest = dir.join("chirp.bin");
+        let err = download(
+            format!("{base}/cf-challenge"),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect_err("a browser check must fail the download");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("browser check"),
+            "the refusal must name the browser check, got: {msg}"
+        );
+        assert!(
+            msg.contains("browser") && msg.contains("extension"),
+            "the refusal must say what to do, got: {msg}"
+        );
+        assert!(!dest.exists(), "no file may be written for a challenge");
+        assert!(
+            !dest.with_extension("dcpart").exists(),
+            "no partial file may be written for a challenge"
+        );
+
+        // 2. The same challenge behind a redirect (the captured CHIRP shape:
+        //    /download?stream=next -> /chirp_next/next-20261023).
+        let dest = dir.join("chirp2.bin");
+        let err = download(
+            format!("{base}/cf-redirect?stream=next"),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect_err("a challenged redirect must fail the download");
+        assert!(
+            format!("{err:#}").contains("browser check"),
+            "the refusal must name the browser check, got: {err:#}"
+        );
+        assert!(!dest.exists(), "no file may be written for a challenge");
+
+        // 3. The interstitial served with 200 and without the header: only
+        //    the body identifies it.
+        let dest = dir.join("chirp3.bin");
+        let err = download(
+            format!("{base}/cf-html"),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect_err("an interstitial page must fail the download");
+        assert!(
+            format!("{err:#}").contains("browser check"),
+            "the refusal must name the browser check, got: {err:#}"
+        );
+        assert!(!dest.exists(), "no file may be written for a challenge");
+
+        // 4. An extensionless redirect target with no disposition is named
+        //    after the URL the redirect landed on - never after the captured
+        //    one, which names nothing at all.
+        let dest = dir.join("download_1700000000.bin");
+        let shared = Arc::new(SharedState::new());
+        download(
+            format!("{base}/extless"),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            shared.clone(),
+        )
+        .await
+        .expect("extensionless target");
+        let named = dir.join("next-20261023");
+        assert!(
+            named.is_file(),
+            "the final URL's segment must name the file, got: {:?}",
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert!(!dest.exists(), "the fallback name must not be used");
+        assert_eq!(std::fs::read(&named).unwrap().len(), LEN);
+        assert_eq!(
+            mutex_guard(&shared.resolved_name).as_deref(),
+            Some("next-20261023")
+        );
+
+        srv.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The interstitial markers and the refusal rules themselves: an HTML
+    /// response never gets an invented extension, and only a row that wants
+    /// a file refuses a web page.
+    #[test]
+    fn cloudflare_markers_and_naming_rules() {
+        // The header is the reliable signal.
+        let mut h = reqwest::header::HeaderMap::new();
+        assert!(!cloudflare_challenge_header(&h));
+        h.insert(
+            "cf-mitigated",
+            reqwest::header::HeaderValue::from_static("challenge"),
+        );
+        assert!(cloudflare_challenge_header(&h));
+
+        // The body markers of Cloudflare's own templates.
+        for page in [
+            "<html><head><title>Just a moment...</title></head><body>Enable JavaScript and cookies to continue</body></html>",
+            "<h1>Checking your browser before accessing</h1>",
+            "<div id=\"cf-chl-widget\"></div>",
+            "<script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/jsd/v1\"></script>",
+            "<title>Attention Required! | Cloudflare</title>",
+        ] {
+            assert!(
+                cloudflare_challenge_body(page),
+                "must recognize the interstitial: {page}"
+            );
+        }
+        // A normal page is not a challenge.
+        for page in [
+            "<html><body>Hello</body></html>",
+            "MZ binary payload",
+            "<html><head><title>Archive</title></head><body>CHIRP builds</body></html>",
+            // A page that merely mentions the words must not be mistaken for
+            // the interstitial (a video titled "Just a moment", say).
+            "<html><body><h1>Just a moment</h1><p>a talk about pausing</p></body></html>",
+        ] {
+            assert!(
+                !cloudflare_challenge_body(page),
+                "must not mistake a normal body for a challenge: {page}"
+            );
+        }
+
+        // A row that wants a file refuses a web page; a row that wants an
+        // HTML page keeps it.
+        assert!(expects_binary_file(std::path::Path::new("download_1.bin")));
+        assert!(expects_binary_file(std::path::Path::new("next-20261023")));
+        assert!(expects_binary_file(std::path::Path::new("movie.mp4")));
+        assert!(!expects_binary_file(std::path::Path::new("page.html")));
+        assert!(!expects_binary_file(std::path::Path::new("page.htm")));
+
+        // The derived name comes from the final URL, never from an HTML type.
+        assert_eq!(
+            derived_file_name("https://archive.chirpmyradio.com/chirp_next/next-20261023", None),
+            Some("next-20261023".to_string())
+        );
+        assert_eq!(
+            derived_file_name(
+                "https://archive.chirpmyradio.com/chirp_next/next-20261023",
+                Some("application/zip")
+            ),
+            Some("next-20261023.zip".to_string())
+        );
+        assert_eq!(
+            derived_file_name(
+                "https://archive.chirpmyradio.com/chirp_next/next-20261023",
+                Some("text/html")
+            ),
+            Some("next-20261023".to_string()),
+            "an HTML response never gets an invented extension"
+        );
+        // A URL with nothing usable keeps the clearly-fallback name.
+        assert_eq!(
+            derived_file_name("https://archive.chirpmyradio.com/download?stream=next", None),
+            None
+        );
+        assert_eq!(derived_file_name("https://archive.chirpmyradio.com/", None), None);
     }
 
     /// Queue v2: "connections per server" is one process-wide allowance per

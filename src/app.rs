@@ -801,14 +801,17 @@ enum ButtonId {
     ThemeSystem,
     ThemeDark,
     ThemeLight,
-    GrabStart,
-    GrabQueue,
+    GrabStart,    GrabQueue,
     GrabClose,
     GrabPreset,
+    /// Archive extraction panel.
+    ExtractStart,
+    ExtractClose,
     /// Debrid panel (cloud providers).
     DebridProvider,
     DebridValidate,
     DebridSubmit,
+    DebridTorrentFile,
     DebridRefresh,
     DebridSelectAll,
     DebridSelectNone,
@@ -1839,6 +1842,107 @@ enum RowAct {
     CopyUrl,
     Details,
     VerifyChecksum,
+    /// Unpack a finished ZIP / RAR / 7z archive.
+    ExtractArchive,
+}
+
+/// What an extraction reports back to the window.
+enum ExtractUpdate {
+    /// How far it got.
+    Progress { done: u64, total: u64 },
+    /// It is over; this is the message the user reads.
+    Done(String),
+}
+
+/// Where the files of an archive go, according to the settings.
+///
+/// "same" puts them next to the archive, "subfolder" into a folder named
+/// after it and "custom" into the folder the user picked.
+fn extract_destination(archive: &std::path::Path) -> Option<std::path::PathBuf> {
+    match crate::model::ui_pref_str("extract_target", "subfolder").as_str() {
+        "same" => archive.parent().map(|p| p.to_path_buf()),
+        "custom" => {
+            let dir = crate::model::ui_pref_str("extract_custom_dir", "");
+            if dir.trim().is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(dir))
+            }
+        }
+        _ => {
+            let stem = archive.file_stem()?;
+            let parent = archive.parent().unwrap_or_else(|| std::path::Path::new("."));
+            Some(parent.join(stem))
+        }
+    }
+}
+
+/// Unpack an archive on a worker thread and describe what happened.
+///
+/// The password is used here and dropped: it never reaches the queue, the
+/// settings or the log. The archive is only removed after everything landed.
+fn extract_worker(
+    archive: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    password: Option<String>,
+    keep_original: bool,
+    tx: std::sync::mpsc::Sender<ExtractUpdate>,
+) {
+    let opts = crate::archive::ExtractOptions {
+        dest,
+        password,
+        overwrite: false,
+        ..Default::default()
+    };
+    let mut progress = |p: crate::archive::ExtractProgress| {
+        let _ = tx.send(ExtractUpdate::Progress {
+            done: p.done,
+            total: p.total,
+        });
+        true
+    };
+    let message = match crate::archive::extract(&archive, &opts, &mut progress) {
+        Ok(out) => {
+            if out.cancelled {
+                format!("Extraction of {} was cancelled.", archive.display())
+            } else {
+                let name = archive
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mut msg = format!(
+                    "Extracted {} file(s) ({}) from {}.",
+                    out.files,
+                    crate::model::format_bytes(out.bytes),
+                    name
+                );
+                if out.skipped > 0 {
+                    msg.push_str(&format!(" {} file(s) were already there.", out.skipped));
+                }
+                if out.refused > 0 {
+                    msg.push_str(&format!(
+                        " {} entry(ies) were refused for safety.",
+                        out.refused
+                    ));
+                }
+                if !keep_original {
+                    // Only now that everything landed does the archive go.
+                    match std::fs::remove_file(&archive) {
+                        Ok(()) => msg.push_str(" The archive was removed."),
+                        Err(e) => {
+                            msg.push_str(&format!(" The archive could not be removed: {e}"))
+                        }
+                    }
+                }
+                msg
+            }
+        }
+        Err(crate::archive::ExtractError::NeedsPassword) => {
+            "This archive needs a password. Type it below and press Extract again.".into()
+        }
+        Err(e) => format!("Extraction failed: {e}"),
+    };
+    let _ = tx.send(ExtractUpdate::Done(message));
 }
 
 pub struct CraftApp {
@@ -1891,6 +1995,9 @@ pub struct CraftApp {
     show_complete: bool,
     queue_running: bool,
     had_active: bool,
+    /// Bring the window to the front once (a dialog asked for a row to be
+    /// pointed at).
+    raise_once: bool,
     timeout_secs: u64,
     max_retries: u32,
     user_agent: String,
@@ -1918,6 +2025,21 @@ pub struct CraftApp {
     add_checksum: String,
     add_overwrite: bool,
     verify_jobs: Vec<(u64, std::sync::mpsc::Receiver<anyhow::Result<String>>)>,
+    // ---- Archive extraction ----
+    /// The extraction panel is open.
+    show_extract: bool,
+    /// The queue row being unpacked.
+    extract_id: u64,
+    /// The archive that is being unpacked.
+    extract_path: String,
+    /// The password the user typed. It lives in memory for this one
+    /// extraction and is never written anywhere.
+    extract_password: String,
+    /// What the last extraction said.
+    extract_notice: String,
+    /// An extraction is running.
+    extract_busy: bool,
+    extract_rx: Option<std::sync::mpsc::Receiver<ExtractUpdate>>,
     // ---- P3: site grabber ----
     show_grabber: bool,
     grab_url: String,
@@ -1989,6 +2111,8 @@ pub struct CraftApp {
     // process_hits can commit without dialog locals).
     add_referer: String,
     add_cookie: String,
+    /// The browser's own User-Agent from the capture, if it sent one.
+    add_user_agent: String,
     add_user: String,
     add_pass: String,
     /// Preferred quality from the extension menu (used by the size probe so
@@ -2064,6 +2188,7 @@ impl CraftApp {
             show_complete: true,
             queue_running: false,
             had_active: false,
+            raise_once: false,
             timeout_secs: 60,
             max_retries: 5,
             user_agent: crate::platform::default_user_agent().to_string(),
@@ -2089,7 +2214,13 @@ impl CraftApp {
             add_checksum: String::new(),
             add_overwrite: false,
             verify_jobs: Vec::new(),
-            show_grabber: false,
+            show_extract: false,
+            extract_id: 0,
+            extract_path: String::new(),
+            extract_password: String::new(),
+            extract_notice: String::new(),
+            extract_busy: false,
+            extract_rx: None,            show_grabber: false,
             grab_url: String::new(),
             grab_preset: 0,
             grab_exts: crate::grabber::preset_exts("Mixed"),
@@ -2142,6 +2273,7 @@ impl CraftApp {
             slider_cap: None,
             add_referer: String::new(),
             add_cookie: String::new(),
+            add_user_agent: String::new(),
             add_user: String::new(),
             add_pass: String::new(),
             add_quality: String::new(),
@@ -2785,12 +2917,115 @@ impl CraftApp {
                 }
             }
             RowAct::VerifyChecksum => self.verify_checksum(id),
+            RowAct::ExtractArchive => self.open_extract(id),
+        }
+    }
+
+    /// Open the extraction panel for a finished archive.
+    ///
+    /// The panel is also how the user is asked before an automatic
+    /// extraction, and where a password for an encrypted archive is typed.
+    fn open_extract(&mut self, id: u64) {
+        let Some(d) = self.downloads.iter().find(|d| d.id == id) else {
+            return;
+        };
+        let path = d.dest_path();
+        if !path.is_file() {
+            self.push_log(format!(
+                "Extract #{id}: the file is not on disk ({}).",
+                path.display()
+            ));
+            return;
+        }
+        if crate::archive::detect_kind(&path).is_none() {
+            self.push_log(format!(
+                "Extract #{id}: {} is not a ZIP, RAR or 7z archive.",
+                path.display()
+            ));
+            self.show_extract = true;
+            self.extract_id = id;
+            self.extract_path = path.to_string_lossy().into_owned();
+            self.extract_notice = "This file is not an archive.".into();
+            return;
+        }        self.show_extract = true;
+        self.extract_id = id;
+        self.extract_path = path.to_string_lossy().into_owned();
+        self.extract_notice.clear();
+        self.extract_password.clear();
+    }
+
+    /// Start the extraction on a worker thread. The GUI never blocks.
+    fn start_extract(&mut self, id: u64) {
+        let Some(d) = self.downloads.iter().find(|d| d.id == id) else {
+            return;
+        };
+        let archive = d.dest_path();
+        if !archive.is_file() {
+            self.extract_notice = "The archive is not on disk.".into();
+            return;
+        }
+        let Some(kind) = crate::archive::detect_kind(&archive) else {
+            self.extract_notice = "This file is not a ZIP, RAR or 7z archive.".into();
+            return;
+        };
+        let Some(dest) = extract_destination(&archive) else {
+            self.extract_notice =
+                "No destination folder is set. Pick one in Settings → Download Engine → Archives."
+                    .into();
+            return;
+        };
+        let keep = crate::model::ui_pref_bool("extract_keep_original", true);
+        let password = if self.extract_password.trim().is_empty() {
+            None
+        } else {
+            Some(self.extract_password.clone())
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let archive_for_worker = archive.clone();
+        std::thread::spawn(move || {
+            extract_worker(archive_for_worker, dest, password, keep, tx);
+        });
+        self.extract_busy = true;
+        self.extract_rx = Some(rx);
+        self.extract_notice = format!("Extracting the {} archive…", kind.label());
+        self.push_log(format!("Extract #{id}: working…"));
+    }
+
+    /// Collect the result of a running extraction.
+    fn poll_extract(&mut self) {
+        let mut progress: Option<(u64, u64)> = None;
+        let mut done = None;
+        if let Some(rx) = self.extract_rx.as_ref() {
+            while let Ok(update) = rx.try_recv() {
+                match update {
+                    ExtractUpdate::Progress { done: d, total } => progress = Some((d, total)),
+                    ExtractUpdate::Done(msg) => done = Some(msg),
+                }
+            }
+        }
+        if let Some((d, total)) = progress {
+            self.extract_notice = if total > 0 {
+                format!(
+                    "Extracting… {} of {}",
+                    crate::model::format_bytes(d),
+                    crate::model::format_bytes(total)
+                )
+            } else {
+                format!("Extracting… {}", crate::model::format_bytes(d))
+            };
+        }
+        if let Some(msg) = done {
+            self.extract_busy = false;
+            self.extract_rx = None;
+            self.extract_notice = msg.clone();
+            // The password is dropped as soon as the extraction is over.
+            self.extract_password.clear();
+            self.push_log(msg);
         }
     }
 
     /// Row context-menu item definitions: (label, action).
-    fn ctx_items() -> Vec<(String, Option<RowAct>)> {
-        use RowAct::*;
+    fn ctx_items() -> Vec<(String, Option<RowAct>)> {        use RowAct::*;
         vec![
             ("Details".into(), Some(Details)),
             ("".into(), None),
@@ -2798,6 +3033,7 @@ impl CraftApp {
             ("Pause".into(), Some(Pause)),
             ("Redownload".into(), Some(Redownload)),
             ("Verify checksum".into(), Some(VerifyChecksum)),
+            ("Extract archive…".into(), Some(ExtractArchive)),
             ("".into(), None),
             ("Copy URL".into(), Some(CopyUrl)),
             ("Open file location".into(), Some(OpenFolder)),
@@ -3043,10 +3279,7 @@ impl CraftApp {
 
     /// The provider the panel is pointed at.
     fn debrid_provider(&self) -> crate::debrid::Provider {
-        match self.debrid_provider_index {
-            0 => crate::debrid::Provider::RealDebrid,
-            _ => crate::debrid::Provider::TorBox,
-        }
+        crate::debrid::Provider::from_index(self.debrid_provider_index)
     }
 
     /// Build a provider client, or explain why the token cannot be used.
@@ -3117,6 +3350,60 @@ impl CraftApp {
                 crate::debrid::CloudSession::submit_hosting(api, &input, &password).await
             };
             let out = match session {
+                Ok(s) => DebridOutcome::Session(s),
+                Err(e) => DebridOutcome::Failed(debrid_error_text(&e), None),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Hand a `.torrent` file to the provider.
+    ///
+    /// The provider fetches the torrent on our behalf; this app has no
+    /// local torrent engine and never opens a peer connection.
+    fn start_debrid_torrent_file(&mut self) {
+        if self.debrid_busy {
+            return;
+        }
+        if let Some(reason) = self
+            .debrid_provider()
+            .unsupported_reason(crate::debrid::Workflow::TorrentMetadata)
+        {
+            self.debrid_notice = reason.to_string();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Torrent", &["torrent"])
+            .set_title("Choose a .torrent file")
+            .pick_file()
+        else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "torrent".to_string());
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.debrid_notice = format!("Could not read that file: {e}");
+                return;
+            }
+        };
+        let api = match self.debrid_client() {
+            Ok(api) => api,
+            Err(e) => {
+                self.debrid_notice = e;
+                return;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debrid_rx = Some(rx);
+        self.debrid_busy = true;
+        self.debrid_notice.clear();
+        self.rt.spawn(async move {
+            let out = match crate::debrid::CloudSession::submit_torrent_file(api, name, bytes).await
+            {
                 Ok(s) => DebridOutcome::Session(s),
                 Err(e) => DebridOutcome::Failed(debrid_error_text(&e), None),
             };
@@ -3654,7 +3941,11 @@ impl CraftApp {
             speed_limit_bps: self.speed_limit_kbps * 1024,
             timeout_secs: item.eff_timeout(self.timeout_secs),
             max_retries: item.eff_retries(self.max_retries),
-            user_agent: if self.user_agent.trim().is_empty() {
+            user_agent: if !item.user_agent.trim().is_empty() {
+                // The browser that captured the link answers it; the
+                // app's own setting is only the fallback.
+                item.user_agent.clone()
+            } else if self.user_agent.trim().is_empty() {
                 format!("download_craft/{}", crate::model::APP_VERSION)
             } else {
                 self.user_agent.clone()
@@ -4198,6 +4489,18 @@ impl CraftApp {
                     if self.show_complete {
                         Self::spawn_complete(id);
                     }
+                    // Unpack it when the user asked for that. With "ask
+                    // before extracting" on, the panel is opened instead and
+                    // the user decides.
+                    if crate::model::ui_pref_bool("auto_extract", false)
+                        && crate::archive::detect_kind(&path).is_some()
+                    {
+                        if crate::model::ui_pref_bool("extract_ask", false) {
+                            self.open_extract(id);
+                        } else {
+                            self.start_extract(id);
+                        }
+                    }
                 }
                 if let Some(m) = msg {
                     self.push_log(m);
@@ -4404,6 +4707,9 @@ impl CraftApp {
             .or_else(|| item.page_url)
             .unwrap_or_default();
         let cookie = item.cookie.unwrap_or_default();
+        // The browser's own agent travels with the capture: a site that
+        // checks the browser only answers that browser.
+        let user_agent = item.user_agent.unwrap_or_default();
         if self.captured_media.len() >= 200 { self.captured_media.clear(); }
         self.captured_media.insert(url.clone(), (item.dur.unwrap_or(0), item.audio_expected));
         let size = item.size;
@@ -4416,6 +4722,7 @@ impl CraftApp {
             .unwrap_or_else(|| filename_from_url(&url));
         self.add_referer = referer;
         self.add_cookie = cookie;
+        self.add_user_agent = user_agent;
         self.add_checksum.clear();
         self.add_quality = quality.filter(|s| !s.trim().is_empty()).unwrap_or_default();
         // Browser-measured size rides along: show it without a server-side
@@ -4480,8 +4787,10 @@ impl CraftApp {
         }
     }
 
-    /// Consume `%APPDATA%/download_craft/wake.json` (`{"start":[ids]}`):
-    /// start IDs queued by a standalone dialog's "Start Download".
+    /// Consume `%APPDATA%/download_craft/wake.json`:
+    /// `{"start":[ids]}` starts IDs queued by a standalone dialog's "Start
+    /// Download"; `{"focus":[ids]}` points the window at rows that are
+    /// already running (the dialog's "Focus existing").
     fn check_wake(&mut self) {
         let path = match crate::model::config_dir() {
             Some(p) => p.join("wake.json"),
@@ -4494,12 +4803,18 @@ impl CraftApp {
             Err(_) => return,
         };
         let _ = std::fs::remove_file(&path); // claim first: at-most-once
-        let ids: Vec<u64> = serde_json::from_str::<serde_json::Value>(&data)
-            .ok()
+        let value = serde_json::from_str::<serde_json::Value>(&data).ok();
+        let ids: Vec<u64> = value
+            .as_ref()
             .and_then(|v| v.get("start").cloned())
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
-        if ids.is_empty() {
+        let focus: Vec<u64> = value
+            .as_ref()
+            .and_then(|v| v.get("focus").cloned())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        if ids.is_empty() && focus.is_empty() {
             return;
         }
         self.merge_queue_from_disk();
@@ -4511,6 +4826,15 @@ impl CraftApp {
                 self.queue_running = true;
                 self.start(id);
             }
+        }
+        if !focus.is_empty() {
+            // Point the window at the rows the dialog pointed at.
+            for d in self.downloads.iter_mut() {
+                if focus.contains(&d.id) {
+                    d.selected = true;
+                }
+            }
+            self.raise_once = true;
         }
     }
 
@@ -4939,6 +5263,12 @@ impl eframe::App for CraftApp {
         self.poll_verify_jobs();
         self.write_progress_snapshot();
         self.check_scheduler();
+        // A dialog asked for a running row to be pointed at: bring the window
+        // forward once, then leave the user alone.
+        if self.raise_once {
+            self.raise_once = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         if self.last_inbox_check.elapsed().as_secs() >= 2 {
             self.last_inbox_check = Instant::now();
             crate::model::touch_heartbeat();
@@ -6549,6 +6879,66 @@ impl eframe::App for CraftApp {
             self.show_grabber = open && self.show_grabber;
         }
 
+        // ================= archive extraction =================
+        if self.show_extract {
+            self.poll_extract();
+            let mut open = self.show_extract;
+            let w = modal_width(ctx, 520.0);
+            egui::Window::new("Extract archive")
+                .id(egui::Id::new("extract_modal"))
+                .order(egui::Order::Foreground)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(w)
+                .min_width(w.min(320.0))
+                .max_width(w)
+                .frame(modal_frame())
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    ui.monospace(&self.extract_path);
+                    ui.weak(
+                        "Files are only written, never started. Nothing is allowed to leave the \
+                         destination folder, and an archive that expands wildly is refused.",
+                    );
+                    ui.horizontal(|ui| {
+                        let r = mtext(
+                            ui,
+                            "extract_password",
+                            &mut self.extract_password,
+                            "Password (only if the archive asks for one)",
+                            f32::INFINITY,
+                            true,
+                        );
+                        self.hits.push((HitKind::Field("extract_password"), r));
+                    });
+                    if !self.extract_notice.is_empty() {
+                        ui.colored_label(pl().notice, &self.extract_notice);
+                    }
+                    if self.extract_busy {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Extracting…");
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        let r = mbutton(ui, &self.man, "Extract", 120.0, 36.0, true);
+                        self.hits.push((HitKind::Btn(ButtonId::ExtractStart), r));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let r = mbutton(ui, &self.man, "Close", 110.0, 36.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::ExtractClose), r));
+                        });
+                    });
+                });
+            self.show_extract = open && self.show_extract;
+            if !self.show_extract {
+                // The password does not outlive the panel.
+                self.extract_password.clear();
+            }
+        }
+
         // ================= cloud providers (debrid) =================
         if self.show_debrid {
             // Collect the finished provider call without holding borrows
@@ -6643,11 +7033,14 @@ impl eframe::App for CraftApp {
                 .frame(modal_frame())
                 .show(ctx, |ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
+                    // The provider the panel is pointed at. Its own API
+                    // decides what the panel may offer.
+                    let provider = self.debrid_provider();
                     ui.horizontal(|ui| {
                         let r = mbutton(
                             ui,
                             &self.man,
-                            &format!("Provider: {}", self.debrid_provider().label()),
+                            &format!("Provider: {}", provider.label()),
                             200.0,
                             32.0,
                             false,
@@ -6700,6 +7093,25 @@ impl eframe::App for CraftApp {
                         let r = mbutton(ui, &self.man, "Submit", 120.0, 32.0, true);
                         self.hits.push((HitKind::Btn(ButtonId::DebridSubmit), r));
                     });
+                    // A .torrent file is only offered when the provider's
+                    // own API takes one. A provider that does not gets a
+                    // disabled button and the reason.
+                    match provider.unsupported_reason(crate::debrid::Workflow::TorrentMetadata) {
+                        Some(reason) => {
+                            ui.horizontal(|ui| {
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new("Torrent File…")
+                                        .min_size(egui::vec2(140.0, 30.0)),
+                                );
+                                ui.weak(reason);
+                            });
+                        }
+                        None => {
+                            let r = mbutton(ui, &self.man, "Torrent File…", 140.0, 30.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::DebridTorrentFile), r));
+                        }
+                    }
                     if !self.debrid_notice.is_empty() {
                         ui.colored_label(pl().notice, &self.debrid_notice);
                     }
@@ -6714,11 +7126,30 @@ impl eframe::App for CraftApp {
                             "{} file(s) — provider says {status} ({state})",
                             rows.len()
                         ));
-                        ui.weak(format!(
-                            "Provider cache: {} — {}",
-                            cache.label(),
-                            cache_hint(cache)
-                        ));
+                        // The provider's own answer about the torrent, or
+                        // the reason it cannot give one.
+                        match provider.unsupported_reason(crate::debrid::Workflow::CacheQuery) {
+                            Some(reason) => {
+                                ui.weak(format!("Provider cache: {reason}"));
+                            }
+                            None => {
+                                ui.weak(format!(
+                                    "Provider cache: {} — {}",
+                                    cache.label(),
+                                    cache_hint(cache)
+                                ));
+                            }
+                        }
+                        // Some providers fetch every file of a torrent and
+                        // leave the choice to this app; the panel says so
+                        // instead of implying the provider narrowed it.
+                        if let Some(reason) =
+                            provider.unsupported_reason(crate::debrid::Workflow::ProviderFileSelection)
+                        {
+                            ui.weak(format!(
+                                "{reason} The checkboxes still pick which of those files DownloadCraft downloads."
+                            ));
+                        }
                         egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
                             for (id, name, bytes) in &rows {
                                 let checked = selected.contains(id);
@@ -8066,6 +8497,8 @@ impl CraftApp {
         );
         item.referer = self.add_referer.clone();
         item.cookie = self.add_cookie.clone();
+        // The captured browser agent travels with the row.
+        item.user_agent = self.add_user_agent.clone();
         item.username = self.add_user.clone();
         item.password = self.add_pass.clone();
         item.checksum_sha256 = csum;
@@ -8168,8 +8601,15 @@ impl CraftApp {
                 self.show_add = false;
                 self.add_focus_req = false;
             }
-            ButtonId::GrabStart => self.start_grab(),
-            ButtonId::GrabQueue => self.queue_grab_results(),
+            ButtonId::ExtractStart => {
+                let id = self.extract_id;
+                self.start_extract(id);
+            }
+            ButtonId::ExtractClose => {
+                self.show_extract = false;
+                self.extract_password.clear();
+            }
+            ButtonId::GrabStart => self.start_grab(),            ButtonId::GrabQueue => self.queue_grab_results(),
             ButtonId::GrabClose => {
                 self.show_grabber = false;
             }
@@ -8182,13 +8622,15 @@ impl CraftApp {
             ButtonId::DebridProvider => {
                 // Another provider means another account and another task:
                 // what was read for the old one is dropped.
-                self.debrid_provider_index = (self.debrid_provider_index + 1) % 2;
+                self.debrid_provider_index =
+                    (self.debrid_provider_index + 1) % crate::debrid::Provider::ALL.len();
                 self.debrid_account = None;
                 self.debrid_session = None;
                 self.debrid_notice.clear();
             }
             ButtonId::DebridValidate => self.start_debrid_validate(),
             ButtonId::DebridSubmit => self.start_debrid_submit(),
+            ButtonId::DebridTorrentFile => self.start_debrid_torrent_file(),
             ButtonId::DebridRefresh => self.start_debrid_refresh(),
             ButtonId::DebridSelectAll => {
                 if let Some(s) = self.debrid_session.as_mut() {

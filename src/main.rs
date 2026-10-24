@@ -5,13 +5,17 @@
 
 mod aes128;
 mod app;
+mod archive;
 mod basket;
 mod cli;
 mod complete;
 mod confirm;
 mod debrid;
 mod dm;
+mod drive;
+mod dupcheck;
 mod engine;
+mod extension;
 mod fonts;
 mod ftp;
 mod grabber;
@@ -21,6 +25,7 @@ mod native_host;
 mod progress;
 mod settings;
 mod shaped;
+mod window;
 #[cfg(windows)]
 mod tray;
 #[cfg(not(windows))]

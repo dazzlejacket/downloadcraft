@@ -363,6 +363,12 @@
         filename = base + mimeExt(mime);
       }
     }
+    // Google Drive: the app gets the canonical public download form that
+    // carries the file id. The per-session confirm token is never invented
+    // here - the app follows the virus-scan interstitial itself.
+    if (typeof DCRank !== "undefined" && DCRank.normalizeDriveUrl) {
+      sendUrl = DCRank.normalizeDriveUrl(sendUrl);
+    }
     // A player-wrapper page ("/jwplayer/?source=<encoded media>") is HTML;
     // the real stream is in the query. Unwrap it so we send the media, not
     // the shell, and rename from the real URL (the release folder for HLS).
@@ -1114,7 +1120,8 @@
     const fullscreen=document.fullscreenElement;
     const parent=fullscreen || document.documentElement;
     if(host.parentNode!==parent)parent.appendChild(host);
-    const width=Math.max(0,Math.min(240,window.innerWidth-16));
+    // The modern round button is a fixed 36 px circle, the classic bar 240 px.
+    const width=(host && host.__dcStyle==="modern")?36:Math.max(0,Math.min(240,window.innerWidth-16));
     host.style.position="fixed";host.style.width=width+"px";
     host.style.right="auto";host.style.bottom="auto";
     host.style.left=(8+barPosition.x*Math.max(0,window.innerWidth-width-16))+"px";
@@ -1140,12 +1147,23 @@
     panel.style.top=(up?Math.max(8,r.top-height-6):r.bottom+6)+"px";
     const arrow=panel.querySelector('[data-dc-p="arrow"]');if(arrow)arrow.style.display="none";
   }
+  // The saved position is per website (keyed by hostname). An empty
+  // hostname keeps the legacy one-value-for-every-site behaviour.
+  function currentSite() {
+    try { return String(location.hostname || "").trim().toLowerCase(); } catch (e) { return ""; }
+  }
   function rememberBarPosition() {
-    try { chrome.runtime.sendMessage({type:"setVideoBarPosition",position:barPosition},()=>{void chrome.runtime.lastError;}); } catch(e) { /* keep page-local drag usable */ }
+    const site = currentSite();
+    const msg = {type:"setVideoBarPosition",position:barPosition};
+    if (site) msg.site = site;
+    try { chrome.runtime.sendMessage(msg,()=>{void chrome.runtime.lastError;}); } catch(e) { /* keep page-local drag usable */ }
   }
   function loadBarPosition() {
     const revision=positionRevision;
-    try { chrome.runtime.sendMessage({type:"getVideoBarPosition"},res=>{
+    const site = currentSite();
+    const msg = {type:"getVideoBarPosition"};
+    if (site) msg.site = site;
+    try { chrome.runtime.sendMessage(msg,res=>{
       if(chrome.runtime.lastError || !alive() || revision!==positionRevision)return;
       barPosition=validBarPosition(res && res.position) ? res.position : null;
       syncDismissControls();
@@ -1157,12 +1175,14 @@
       if(suppressClick){suppressClick=false;ev.preventDefault();ev.stopImmediatePropagation();}
     },true);
     const update=(left,top)=>{
-      const width=Math.min(240,window.innerWidth-16);
+      const width=(host && host.__dcStyle==="modern")?36:Math.min(240,window.innerWidth-16);
       barPosition={x:Math.max(0,Math.min(1,(left-8)/Math.max(1,window.innerWidth-width-16))),
         y:Math.max(0,Math.min(1,(top-8)/Math.max(1,window.innerHeight-44)))};
       positionRevision++;applySavedBarPosition(host);
+      // A moved overlay is being used: restart the idle fade.
+      try { if (typeof armOverlayIdle === "function") armOverlayIdle(host); } catch (e) {}
     };
-    for(const control of [main,grip]) {
+    for(const control of [main,grip].filter(Boolean)) {
       control.style.touchAction="none";
       control.addEventListener("pointerdown",ev=>{
         if(ev.button!==0 || ev.isPrimary===false)return;
@@ -1195,8 +1215,11 @@
       control.addEventListener("pointercancel",ev=>finish(ev,true));
       control.addEventListener("lostpointercapture",ev=>finish(ev,true));
     }
-    grip.addEventListener("click",ev=>{ev.preventDefault();ev.stopPropagation();});
-    grip.addEventListener("keydown",ev=>{
+    // The modern round button has no grip: the button itself is the handle
+    // and carries the arrow-key nudge.
+    if (grip) grip.addEventListener("click",ev=>{ev.preventDefault();ev.stopPropagation();});
+    const keyTarget = grip || main;
+    if (keyTarget) keyTarget.addEventListener("keydown",ev=>{
       const delta={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]}[ev.key];
       if(!delta)return;
       ev.preventDefault();ev.stopPropagation();hidePanels();
@@ -1385,11 +1408,113 @@
     return svg;
   }
 
-  // One isolated toolbar: the primary action and dismiss button never overlap.
-  // Shadow DOM keeps player/site button and SVG rules out of these controls.
-  function videoDownloadBar(title, kind = "video") {
+  // ---- overlay style: classic bar | modern round mark ----
+  // The desktop app owns the choice; the extension keeps its own copy and
+  // falls back to the classic bar whenever the style is unknown.
+  let overlayStyle = "classic";
+  function setOverlayStyle(style) {
+    overlayStyle = (style === "modern") ? "modern" : "classic";
+  }
+  function currentOverlayStyle() {
+    return overlayStyle === "modern" ? "modern" : "classic";
+  }
+  // Rebuild every overlay when the style changes: the classic bar and the
+  // modern circle are different elements, not a restyled one.
+  function rerenderOverlays() {
+    try {
+      document.querySelectorAll("[data-dc-pill]").forEach(host => {
+        const video = host.__dcVideo;
+        if (video) { video.__dcBtn = null; video.__dcKey = null; }
+        try { if (host.__dcFbPanel) host.__dcFbPanel.remove(); } catch (e) {}
+        try { host.remove(); } catch (e) {}
+      });
+    } catch (e) {}
+    try { ensureUniversalButtons(); } catch (e) {}
+  }
+  function applyOverlayStyle(style) {
+    const next = (style === "modern") ? "modern" : "classic";
+    if (next === overlayStyle) return false;
+    setOverlayStyle(next);
+    rerenderOverlays();
+    return true;
+  }
+  // Ask the worker which style the app selected. An unknown or missing
+  // answer keeps the classic bar.
+  function loadOverlayStyle() {
+    try {
+      chrome.runtime.sendMessage({type:"getOverlayStyle"},res => {
+        if (chrome.runtime.lastError || !alive()) return;
+        applyOverlayStyle(res && res.style);
+      });
+    } catch (e) { /* classic stays */ }
+  }
+  // The modern mark: the DownloadCraft logo (blue ring + blue arrow) drawn
+  // inline. No web_accessible_resources, no page-context icon URL.
+  function modernMarkSvg(size) {
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 64 64");
+    svg.setAttribute("width", String(size));
+    svg.setAttribute("height", String(size));
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    svg.style.cssText = "display:block;flex:0 0 auto;pointer-events:none;";
+    const ring = document.createElementNS(ns, "circle");
+    ring.setAttribute("cx", "32"); ring.setAttribute("cy", "32"); ring.setAttribute("r", "26");
+    ring.setAttribute("fill", "none"); ring.setAttribute("stroke", "#3b82f6");
+    ring.setAttribute("stroke-width", "8");
+    const arrow = document.createElementNS(ns, "path");
+    arrow.setAttribute("d", "M32 16V44M20 33l12 12 12-12");
+    arrow.setAttribute("fill", "none"); arrow.setAttribute("stroke", "#3b82f6");
+    arrow.setAttribute("stroke-width", "8");
+    arrow.setAttribute("stroke-linecap", "round"); arrow.setAttribute("stroke-linejoin", "round");
+    svg.appendChild(ring); svg.appendChild(arrow);
+    return svg;
+  }
+  // Modern overlay: a small round button with the mark, no text label and no
+  // X button. Single click downloads, double click resets the position.
+  function modernDownloadButton(title, kind) {
     const host = document.createElement("div");
     host.title = title;
+    host.__dcStyle = "modern";
+    host.style.cssText = "all:initial;display:block;width:36px;height:36px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
+    const root = host.attachShadow ? host.attachShadow({mode:"open"}) : host;
+    const style = document.createElement("style");
+    style.textContent = `
+      :host { color-scheme:light; }
+      * { box-sizing:border-box; }
+      .mark { all:unset;display:flex;align-items:center;justify-content:center;width:36px;height:36px;
+        border-radius:50%;background:#f8fafc;box-shadow:0 1px 5px #0003;cursor:pointer;touch-action:none; }
+      .mark:hover { background:#e7eff7; }
+      .mark:focus-visible { outline:2px solid #2563eb;outline-offset:-2px; }
+      svg { display:block;width:26px;height:26px;pointer-events:none; }
+    `;
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.className = "mark";
+    const action = "Download this " + kind;
+    btn.setAttribute("aria-label", action);
+    btn.title = title;
+    btn.appendChild(modernMarkSvg(26));
+    root.append(style, btn);
+    installBarDrag(host, btn, null);
+    host.__dcMain = btn;
+    host.__dcClose = null;
+    return host;
+  }
+
+  // One isolated toolbar: the primary action and dismiss button never overlap.
+  // Shadow DOM keeps player/site button and SVG rules out of these controls.
+  function videoDownloadBar(title, kind = "video", opts) {
+    // The style decides how the overlay looks; an explicit "classic" wins
+    // (the quality-menu button keeps its label).
+    const forced = (opts && typeof opts.style === "string") ? opts.style : "";
+    const styleName = forced === "classic" ? "classic"
+      : forced === "modern" ? "modern"
+      : (typeof currentOverlayStyle === "function" ? currentOverlayStyle() : "classic");
+    if (styleName === "modern" && document.createElementNS) return modernDownloadButton(title, kind);
+    const host = document.createElement("div");
+    host.title = title;
+    host.__dcStyle = "classic";
     host.style.cssText = "all:initial;display:block;width:240px;height:28px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
     const root = host.attachShadow({mode:"open"});
     const style = document.createElement("style");
@@ -1937,7 +2062,10 @@
       if(host.parentNode!==parent)parent.appendChild(host);
       const r=video.getBoundingClientRect();
       const vw=window.innerWidth, vh=window.innerHeight;
-      const width=Math.min(240,r.width-16,vw-16);
+      // The modern round button keeps its own 36 px box; the classic bar
+      // spans the player width.
+      const compact=host.__dcStyle==="modern";
+      const width = compact ? 36 : Math.min(240,r.width-16,vw-16);
       const audio=video.tagName === "AUDIO";
       if(audio && !video.controls){host.remove();return;}
       const visible=(!window.getComputedStyle || !["hidden","collapse"].includes(window.getComputedStyle(video).visibility));
@@ -1966,6 +2094,31 @@
       if(panel)panel.remove();
       if(button.__dcFbPanel)button.__dcFbPanel.remove();
     };
+  }
+  // Dismiss every overlay of this page (the modern circle has no X button,
+  // so the popup uses this path).
+  function hideOverlaysNow() {
+    if(dismissedVideos.size>=100)dismissedVideos.clear();
+    try {
+      document.querySelectorAll("video, audio[controls]").forEach(v=>{
+        dismissedVideos.add(dismissalKey(v,null));
+        const btn=v.__dcBtn;
+        if(btn){
+          try { if(btn.__dcFbPanel)btn.__dcFbPanel.remove(); } catch(e){}
+          try { btn.remove(); } catch(e){}
+          v.__dcBtn=null;
+        }
+      });
+    } catch(e) {}
+    try {
+      const yt=document.getElementById && document.getElementById("dc-yt-btn");
+      if(yt){
+        const vid=yt.dataset ? yt.dataset.vid : null;
+        if(vid) dismissedVideos.add(dismissalKey(null,vid));
+        try { if(yt.__dcClose)yt.__dcClose.remove(); } catch(e){}
+        try { yt.remove(); } catch(e){}
+      }
+    } catch(e) {}
   }
   document.addEventListener("scroll",syncDismissControls,true);
   window.addEventListener("resize",syncDismissControls);
@@ -2033,7 +2186,9 @@
       oldBtn.remove();
       if (oldPanel) oldPanel.remove();
     }
-    const btn = videoDownloadBar("Choose video quality in Download Craft");
+    // The quality-menu button is not a download button: it keeps its label
+    // in both overlay styles.
+    const btn = videoDownloadBar("Choose video quality in Download Craft", "video", {style:"classic"});
     btn.id = "dc-yt-btn";
     btn.dataset.vid = info.videoId;
     btn.dataset.gen = String(GEN);
@@ -2265,6 +2420,76 @@
     return "";
   }
 
+  // ---- overlay idle fade ----
+  // The overlay fades to 30 % after 10 s without interaction and returns to
+  // full opacity on any hover/pointer/focus/key event. The opacity lives on
+  // the overlay host (not on its children) and never disables pointer
+  // events: a faded overlay must stay clickable.
+  const OVERLAY_IDLE_MS = 10000;
+  const OVERLAY_FADE_OPACITY = "0.3";
+  function armOverlayIdle(host) {
+    if (!host || !host.style) return;
+    try { host.style.opacity = "1"; } catch (e) {}
+    try { if (host.__dcIdleTimer) clearTimeout(host.__dcIdleTimer); } catch (e) {}
+    if (typeof setTimeout !== "function") return;
+    try {
+      host.__dcIdleTimer = setTimeout(() => {
+        host.__dcIdleTimer = null;
+        try { host.style.opacity = OVERLAY_FADE_OPACITY; } catch (e) {}
+      }, OVERLAY_IDLE_MS);
+    } catch (e) {}
+  }
+  function installOverlayIdleFade(host) {
+    if (!host || !host.style) return;
+    try {
+      host.style.opacity = "1";
+      host.style.transition = "opacity 600ms ease";
+      host.style.pointerEvents = "auto";
+    } catch (e) {}
+    if (typeof host.addEventListener !== "function") return;
+    const wake = () => armOverlayIdle(host);
+    for (const ev of ["mouseenter","mouseover","pointerdown","pointermove","mousedown",
+                      "focusin","focus","keydown","touchstart","wheel"]) {
+      try { host.addEventListener(ev, wake, true); } catch (e) {}
+    }
+    armOverlayIdle(host);
+  }
+
+  // ---- overlay click: single click downloads, double click resets ----
+  // A double click also fires two single clicks, so the download waits a
+  // short moment: a second click inside that window cancels the pending
+  // download and clears the saved position for this website instead.
+  const OVERLAY_DOUBLE_CLICK_MS = 250;
+  function isUserClick(ev) {
+    // A real browser click is an event with type "click"; a direct call
+    // (legacy path) starts the download right away.
+    return !!(ev && ev.type === "click");
+  }
+  function resetOverlayPosition(pill) {
+    // Forget the saved position for this site and go back to the default
+    // placement (the automatic one used by syncDismissControls).
+    const site = currentSite();
+    const msg = {type:"resetVideoBarPosition"};
+    if (site) msg.site = site;
+    try { chrome.runtime.sendMessage(msg,()=>{void chrome.runtime.lastError;}); } catch (e) {}
+    try { barPosition = null; positionRevision++; } catch (e) {}
+    try { syncDismissControls(); } catch (e) {}
+  }
+  function scheduleOverlayClick(pill, action) {
+    if (pill.__dcClickTimer) {
+      // Second click inside the window: no download, reset the position.
+      try { clearTimeout(pill.__dcClickTimer); } catch (e) {}
+      pill.__dcClickTimer = null;
+      resetOverlayPosition(pill);
+      return;
+    }
+    if (typeof setTimeout !== "function") { action(); return; }
+    pill.__dcClickTimer = setTimeout(() => {
+      pill.__dcClickTimer = null;
+      try { action(); } catch (e) {}
+    }, OVERLAY_DOUBLE_CLICK_MS);
+  }
+
   function ensureUniversalButtons() {
     if (!alive()) return;
     syncDismissControls();
@@ -2308,7 +2533,8 @@
         pill.style.right = "8px";
         pill.style.zIndex = "2147483646";
         pill.onclick = (ev) => {
-          ev.stopPropagation(); ev.preventDefault();
+          try { ev.stopPropagation(); ev.preventDefault(); } catch (e) {}
+          const startDownload = () => {
           // Facebook reels: open the IDM-style quality menu (title + HD/SD
           // rows with sizes) instead of firing one mystery download — the
           // player only holds a blob: URL and every reel needs no reload.
@@ -2354,12 +2580,18 @@
               sendDownload(location.href, undefined, null);
             }
           }
+          };
+          // A real click waits for the double-click window: a second click
+          // inside it resets the position instead of downloading.
+          if (!isUserClick(ev)) { startDownload(); return; }
+          scheduleOverlayClick(pill, startDownload);
         };
         try {
           pill.__dcVideo=v;
           document.documentElement.appendChild(pill);
           v.__dcBtn=pill;v.__dcKey=key;
           addDismissControl(pill,()=>dismissalKey(v,null),null);
+          installOverlayIdleFade(pill);
           syncDismissControls();
         } catch (e) { /* overlay is best-effort */ }
       }
@@ -2507,6 +2739,12 @@
         refreshYouTube();ensureUniversalButtons();
         sendResponse({ok:true});return false;
       }
+      if (msg && msg.type === "hideOverlay" && alive()) {
+        // The modern circle has no X button: the popup dismisses the
+        // overlay of the media on this page instead.
+        try { hideOverlaysNow(); } catch (e) {}
+        sendResponse({ok:true});return false;
+      }
       if (msg && msg.type === "mediaFrameInfo") {
         const videos = [...document.querySelectorAll("video")];
         const d = videos.length === 1 ? videos[0].duration : 0;
@@ -2579,6 +2817,14 @@
 
   loadBarPosition();
   window.addEventListener("focus",loadBarPosition);
+  loadOverlayStyle();
+  // The app (or the popup) can change the style while this page is open.
+  try {
+    chrome.storage.onChanged.addListener((changes,area) => {
+      if (!alive() || !changes || area !== "local") return;
+      if (changes.overlayStyle) applyOverlayStyle(changes.overlayStyle.newValue);
+    });
+  } catch (e) { /* storage listener optional */ }
 
   // Initial pass + SPA navigation (YouTube AND Facebook rarely reload).
   // Facebook reels swap /reel/<id> via history API: no reload, same video

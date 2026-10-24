@@ -125,6 +125,12 @@ async function sendToHost(url, filename, extra) {
       return matches;
     };
     url = stripFbSlice(url);
+    // Google Drive: hand the app the canonical public download form that
+    // carries the file id. The per-session confirm token is never invented
+    // here - the app follows the interstitial itself when it needs one.
+    if (typeof DCRank !== "undefined" && DCRank.normalizeDriveUrl) {
+      url = DCRank.normalizeDriveUrl(url);
+    }
     if (typeof DCRank !== "undefined" && DCRank.isVimeoAdaptive(url)) {
       // The captured document is the exact iframe which requested this
       // asset, unlike the popup's top-level page (possibly several videos).
@@ -189,7 +195,13 @@ async function sendToHost(url, filename, extra) {
     }
     let cookie = (extra && extra.cookie) || null;
     if (!cookie && /^https?:\/\//i.test(url)) {
-      cookie = await cookiesFor(url); // best-effort, same-host only
+      // The cookies of the DOWNLOAD host, not of the page: a capture of a
+      // link on chirpmyradio.com that points at archive.chirpmyradio.com
+      // must carry the cookies the browser holds for the archive host
+      // (e.g. `cf_clearance`), or the server answers with its browser
+      // check instead of the file. `cookies.getAll({url})` is scoped to
+      // that host by the browser itself.
+      cookie = await cookiesFor(url);
       // CDN hosts (fbcdn/lookaside) carry no cookies of their own — fall
       // back to the page's session cookies so expiring signed URLs keep
       // working without a page reload.
@@ -211,6 +223,10 @@ async function sendToHost(url, filename, extra) {
         } catch (e) { /* host parse failed: no cookies */ }
       }
     }
+    // The browser's own User-Agent: it is the agent that already passed
+    // whatever check the site applies, so the app must speak with the same
+    // voice. Never logged.
+    const userAgent = (typeof navigator !== "undefined" && navigator.userAgent) || null;
     const res = await api.runtime.sendNativeMessage(HOST, {
       type: "download",
       url,
@@ -218,6 +234,7 @@ async function sendToHost(url, filename, extra) {
       pageUrl: (extra && extra.pageUrl) || null,
       referer: (extra && extra.referer) || (extra && extra.pageUrl) || null,
       cookie,
+      userAgent,
       mime: (extra && extra.mime) || null,
       size: (extra && extra.size) || null,
       pairUrl: (extra && extra.pairUrl) || null,
@@ -474,6 +491,9 @@ async function sendToHostPing() {
   }
   setBadge();
   await syncBrowserDownloadUI();
+  // The app owns the overlay style while the extension does not: pick up
+  // its choice on every ping (startup, install, popup open).
+  await syncOverlayStyleFromApp();
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -650,28 +670,128 @@ try {
 } catch (e) { /* downloads.onCreated remains the fallback */ }
 
 // ---- popup / content-script messages ----
+// Everything below this marker is also loaded by the node tests, which slice
+// the file from here: keep every helper this section uses BELOW the marker
+// (only plain values such as lastPrefsPoll may live above it).
+
+// The desktop app exposes the overlay style ("modern" | "classic"). The
+// extension keeps its own copy; `overlayStyleSource` says who owns it
+// ("app" by default, "extension" once the user picks one here).
+const OVERLAY_STYLES = ["modern", "classic"];
+function normalizeOverlayStyle(v) {
+  return OVERLAY_STYLES.indexOf(v) >= 0 ? v : null;
+}
+// A hostname is the per-site key. Anything that is not a plain hostname is
+// ignored so a stray value can never create a junk storage entry.
+function siteKey(v) {
+  if (typeof v !== "string") return "";
+  const s = v.trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9.\-_]*$/.test(s) ? s : "";
+}
+async function storedOverlayStyle() {
+  try {
+    const s = await api.storage.local.get({ overlayStyle: "classic", overlayStyleSource: "app" });
+    const style = normalizeOverlayStyle(s && s.overlayStyle) || "classic";
+    const source = (s && s.overlayStyleSource === "extension") ? "extension" : "app";
+    return { style, source };
+  } catch (e) {
+    return { style: "classic", source: "app" };
+  }
+}
+// The app owns the value while the source is "app": adopt what the app
+// reports and never push our cached copy back (no ping-pong). A missing or
+// invalid answer means "no change".
+// `var` on purpose: the timestamp is read from the startup ping, which runs
+// before this line - a `let` would still be uninitialized there.
+var lastPrefsPoll = 0;
+async function syncOverlayStyleFromApp(force) {
+  try {
+    const now = Date.now();
+    if (!force && now - lastPrefsPoll < 5000) return;
+    lastPrefsPoll = now;
+    const current = await storedOverlayStyle();
+    if (current.source !== "app") return; // the extension owns the value
+    const res = await api.runtime.sendNativeMessage(HOST, { type: "prefs" });
+    if (!res || res.type !== "prefs") return;
+    const style = normalizeOverlayStyle(res.overlayStyle);
+    if (!style || style === current.style) return;
+    await api.storage.local.set({ overlayStyle: style });
+  } catch (e) {
+    /* no desktop app: keep the cached value */
+  }
+}
+// The legacy global position (one value for every site) plus the one-time
+// session-storage migration. Callers that name a site fall back to it.
+async function legacyVideoBarPosition() {
+  const data = await api.storage.local.get("videoBarPosition");
+  if (validPosition(data.videoBarPosition)) return data.videoBarPosition;
+  // Adopt an existing session preference once; new saves survive a full
+  // browser restart, without website storage or cross-device syncing.
+  const legacy = api.storage.session ? await api.storage.session.get("videoBarPosition") : {};
+  if (validPosition(legacy.videoBarPosition)) {
+    await api.storage.local.set({ videoBarPosition: legacy.videoBarPosition });
+    return legacy.videoBarPosition;
+  }
+  return null;
+}
+function validPosition(p) {
+  return p && Number.isFinite(p.x) && Number.isFinite(p.y)
+    && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     if (!msg || typeof msg !== "object") return { ok: false };
-    const validPosition = p => p && Number.isFinite(p.x) && Number.isFinite(p.y)
-      && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
+    if (msg.type === "getOverlayStyle") {
+      const current = await storedOverlayStyle();
+      // Poll the app in the background: a live page picks the new value up
+      // through the storage change listener.
+      syncOverlayStyleFromApp().catch(() => {});
+      return { ok: true, style: current.style };
+    }
+    if (msg.type === "setOverlayStyle") {
+      const value = normalizeOverlayStyle(msg.value);
+      if (!value) return { ok: false, error: "unknown overlay style" };
+      await api.storage.local.set({ overlayStyle: value, overlayStyleSource: "extension" });
+      // The extension owns the value from now on: push it, never poll it back.
+      try {
+        await api.runtime.sendNativeMessage(HOST, { type: "setOverlayStyle", style: value });
+      } catch (e) { /* the desktop app is optional */ }
+      return { ok: true, style: value };
+    }
     if (msg.type === "getVideoBarPosition") {
-      const data=await api.storage.local.get("videoBarPosition");
-      if (validPosition(data.videoBarPosition)) return {ok:true,position:data.videoBarPosition};
-      // Adopt an existing session preference once; new saves survive a full
-      // browser restart, without website storage or cross-device syncing.
-      const legacy=api.storage.session ? await api.storage.session.get("videoBarPosition") : {};
-      if (validPosition(legacy.videoBarPosition)) {
-        await api.storage.local.set({videoBarPosition:legacy.videoBarPosition});
-        return {ok:true,position:legacy.videoBarPosition};
+      const site = siteKey(msg.site);
+      if (site) {
+        const data = await api.storage.local.get("videoBarPositions");
+        const rec = (data.videoBarPositions || {})[site];
+        // An explicit reset for this site wins over the legacy global.
+        if (rec && rec.auto === true) return { ok: true, position: null };
+        if (validPosition(rec)) return { ok: true, position: { x: rec.x, y: rec.y } };
       }
-      return {ok:true,position:null};
+      return { ok: true, position: await legacyVideoBarPosition() };
     }
     if (msg.type === "setVideoBarPosition") {
-      const p=msg.position;
-      if(!validPosition(p))return {ok:false};
-      await api.storage.local.set({videoBarPosition:{x:p.x,y:p.y}});
-      return {ok:true};
+      const p = msg.position;
+      if (!validPosition(p)) return { ok: false };
+      const site = siteKey(msg.site);
+      if (site) {
+        const data = await api.storage.local.get("videoBarPositions");
+        const all = { ...(data.videoBarPositions && typeof data.videoBarPositions === "object" ? data.videoBarPositions : {}) };
+        all[site] = { x: p.x, y: p.y };
+        await api.storage.local.set({ videoBarPositions: all });
+        return { ok: true };
+      }
+      await api.storage.local.set({ videoBarPosition: { x: p.x, y: p.y } });
+      return { ok: true };
+    }
+    if (msg.type === "resetVideoBarPosition") {
+      const site = siteKey(msg.site);
+      if (!site) return { ok: false, error: "a site is required to reset a position" };
+      const data = await api.storage.local.get("videoBarPositions");
+      const all = { ...(data.videoBarPositions && typeof data.videoBarPositions === "object" ? data.videoBarPositions : {}) };
+      all[site] = { auto: true };
+      await api.storage.local.set({ videoBarPositions: all });
+      return { ok: true };
     }
     if (msg.type === "download" && msg.url) {
       if (!/^https?:\/\//i.test(msg.url) || msg.url.length > 4000) {
@@ -843,7 +963,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await sendToHostPing();
       const cfg = await settings();
       const downloadUI = await syncBrowserDownloadUI();
-      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
+      const overlay = await storedOverlayStyle();
+      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null, overlayStyle: overlay.style };
     }
     if (msg.type === "setAuto" && typeof msg.value === "boolean") {
       await api.storage.local.set({ autoCapture: msg.value });

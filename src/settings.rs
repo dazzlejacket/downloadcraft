@@ -68,6 +68,22 @@ struct Settings {
     ffmpeg_custom_path: String,
     /// Max simultaneous connections per host across all downloads (0 = off).
     per_host_conns: usize,
+    /// Video overlay the browser extension draws over a player: "classic"
+    /// (the floating "Download this video" bar) or "modern" (a small round
+    /// Download Craft button).
+    overlay_style: String,
+    // Archives
+    /// Unpack a finished download when it is an archive (ZIP / RAR / 7z).
+    auto_extract: bool,
+    /// Keep the archive after a successful extraction.
+    extract_keep_original: bool,
+    /// Where the files go: "same" (next to the archive), "subfolder" (a
+    /// folder named after the archive) or "custom".
+    extract_target: String,
+    /// The folder used when `extract_target` is "custom".
+    extract_custom_dir: String,
+    /// Ask before extracting instead of doing it silently.
+    extract_ask: bool,
     // Updates
     update_check_on: bool,
 }
@@ -104,6 +120,12 @@ impl Default for Settings {
             ffmpeg_source: "managed".to_string(),
             ffmpeg_custom_path: String::new(),
             per_host_conns: 0,
+            overlay_style: "classic".to_string(),
+            auto_extract: false,
+            extract_keep_original: true,
+            extract_target: "subfolder".to_string(),
+            extract_custom_dir: String::new(),
+            extract_ask: false,
             update_check_on: true,
         }
     }
@@ -134,6 +156,28 @@ fn load() -> Settings {
     str_in("antivirus_cmd", &mut s.antivirus_cmd);
     str_in("finish_action", &mut s.finish_action);
     str_in("rename_template", &mut s.rename_template);
+    // The overlay style is a closed set: an unknown value keeps the default
+    // rather than leaving the extension without a button.
+    match g("overlay_style").and_then(|x| x.as_str()) {
+        Some(v @ ("modern" | "classic")) => s.overlay_style = v.to_string(),
+        _ => {}
+    }
+    match g("extract_target").and_then(|x| x.as_str()) {
+        Some(v @ ("same" | "subfolder" | "custom")) => s.extract_target = v.to_string(),
+        _ => {}
+    }
+    if let Some(x) = g("extract_custom_dir").and_then(|x| x.as_str()) {
+        s.extract_custom_dir = x.to_string();
+    }
+    if let Some(b) = g("auto_extract").and_then(|x| x.as_bool()) {
+        s.auto_extract = b;
+    }
+    if let Some(b) = g("extract_keep_original").and_then(|x| x.as_bool()) {
+        s.extract_keep_original = b;
+    }
+    if let Some(b) = g("extract_ask").and_then(|x| x.as_bool()) {
+        s.extract_ask = b;
+    }
     if let Some(p) = g("ffmpeg_custom_path").and_then(|v|v.as_str()) { s.ffmpeg_custom_path=p.to_string(); }
     if let Some(b) = g("close_to_tray").and_then(|x| x.as_bool()) {
         s.close_to_tray = cfg!(windows) && b;
@@ -265,6 +309,12 @@ fn save(s: &Settings) -> bool {
     set(obj, "ffmpeg_source", s.ffmpeg_source.clone().into());
     set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "per_host_conns", (s.per_host_conns as u64).into());
+    set(obj, "overlay_style", s.overlay_style.clone().into());
+    set(obj, "auto_extract", s.auto_extract.into());
+    set(obj, "extract_keep_original", s.extract_keep_original.into());
+    set(obj, "extract_target", s.extract_target.clone().into());
+    set(obj, "extract_custom_dir", s.extract_custom_dir.clone().into());
+    set(obj, "extract_ask", s.extract_ask.into());
     set(obj, "update_check_on", s.update_check_on.into());
     set(obj, "folder_rules", serde_json::to_value(&s.folder_rules).unwrap_or_default());
     set(
@@ -284,6 +334,8 @@ struct SettingsApp {
     centered: bool,
     notice: String,
     browser_msg: String,
+    /// What the browser said about the extension when the user asked.
+    ext_info: String,
     /// Last theme actually applied, so picking one in Appearance repaints
     /// this window at once (and "system" keeps tracking the OS).
     theme_applied: String,
@@ -316,6 +368,7 @@ struct SettingsApp {
     open_network: bool,
     open_complete: bool,
     open_windows: bool,
+    open_archives: bool,
     /// Appearance cards (the concept opens both by default).
     open_theme: bool,
     open_window: bool,
@@ -403,6 +456,7 @@ pub fn run() -> eframe::Result<()> {
         centered: false,
         notice: String::new(),
         browser_msg: String::new(),
+        ext_info: String::new(),
         theme_applied: String::new(),
         ytdlp: None,
         ytdlp_msg: String::new(),
@@ -418,6 +472,7 @@ pub fn run() -> eframe::Result<()> {
         open_network: false,
         open_complete: false,
         open_windows: false,
+        open_archives: false,
         open_theme: true,
         open_window: true,
     };
@@ -2400,6 +2455,85 @@ impl SettingsApp {
                 });
             }
         });
+        // ---- Archives ----
+        card(ui, "Archives", None, &mut self.open_archives, |ui| {
+            checkbox(
+                ui,
+                &mut s.auto_extract,
+                "Unpack finished ZIP / RAR / 7z downloads",
+                14.0,
+                11.5,
+                true,
+            );
+            ui.add_space(4.0);
+            hint(
+                ui,
+                "Extracted files are only written, never started. Nothing is allowed to leave the folder the files go to, and an archive that expands wildly is refused.",
+            );
+            ui.add_space(10.0);
+            checkbox(
+                ui,
+                &mut s.extract_ask,
+                "Ask before extracting",
+                14.0,
+                11.5,
+                true,
+            );
+            ui.add_space(8.0);
+            let mut c = field_row(ui, "extract_to", "Extract into", None, None);
+            segmented(
+                &mut c,
+                "extract_to",
+                &["same", "subfolder", "custom"],
+                &mut s.extract_target,
+            );
+            ui.add_space(6.0);
+            hint(
+                ui,
+                match s.extract_target.as_str() {
+                    "same" => "Next to the archive, in the same folder.",
+                    "custom" => "Into the folder you pick below.",
+                    _ => "Into a new folder named after the archive.",
+                },
+            );
+            if s.extract_target == "custom" {
+                ui.add_space(8.0);
+                let mut c = field_row(ui, "extract_dir", "Extract folder", None, None);
+                let iw = (c.available_width() - 34.0).max(60.0);
+                input_box(
+                    &mut c,
+                    "extract_dir",
+                    &mut s.extract_custom_dir,
+                    iw,
+                    true,
+                    false,
+                    "choose a folder",
+                );
+                c.add_space(6.0);
+                if icon_sq(&mut c, "\u{e2c7}", 28.0, 6.0)
+                    .on_hover_text("Browse…")
+                    .clicked()
+                {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        s.extract_custom_dir = p.to_string_lossy().to_string();
+                    }
+                }
+            }
+            ui.add_space(10.0);
+            checkbox(
+                ui,
+                &mut s.extract_keep_original,
+                "Keep the archive after extracting",
+                14.0,
+                11.5,
+                true,
+            );
+            ui.add_space(4.0);
+            hint(
+                ui,
+                "With this off the archive is removed only after the extraction finished without errors.",
+            );
+        });
     }
 
     // ---------- Plugins (helpers, one card each) ----------
@@ -2994,19 +3128,126 @@ impl SettingsApp {
         h2(ui, "Browser Integration");
         para(
             ui,
-            "Chrome/Brave: load browser-extension. Firefox: load browser-extension-firefox. Launch the app once from its permanent location.",
+            "The extension hands downloads to this app. It is loaded from disk — nothing is published to a web store.",
         );
-        ui.add_space(6.0);
-        para(
+        ui.add_space(10.0);
+
+        // ---- Video overlay ----
+        h2(ui, "Video overlay");
+        hint(
             ui,
-            "One-time setup: host auto-repairs on every launch — buttons below are manual repair only.",
+            "How the extension draws its button over a video or audio player.",
+        );
+        ui.add_space(8.0);
+        let mut c = field_row(ui, "overlay_style", "Overlay style", None, None);
+        segmented(
+            &mut c,
+            "overlay_style",
+            &["modern", "classic"],
+            &mut self.s.overlay_style,
         );
         ui.add_space(6.0);
+        hint(
+            ui,
+            match self.s.overlay_style.as_str() {
+                "modern" => "Modern: a small round Download Craft button. Drag it, click it to download, double-click it to put it back.",
+                _ => "Classic: the floating \"Download this video\" bar with a close button.",
+            },
+        );
+        ui.add_space(4.0);
+        hint(
+            ui,
+            "Both styles remember their place per website, fade out when idle and come back when you move over them.",
+        );
+        ui.add_space(16.0);
+
+        // ---- Set up the extension ----
+        h2(ui, "Set up the extension");
+        hint(
+            ui,
+            "One-time setup: load the extension folder in your browser. The host is repaired on every launch.",
+        );
+        ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             for (firefox,label) in [(false,"Open Chrome/Brave extension folder"),(true,"Open Firefox extension folder")] {
                 if button(ui,label,false).clicked(){match crate::platform::extension_directory(firefox){Ok(dir)=>crate::app::open_path(&dir,false),Err(e)=>self.browser_msg=e}}
             }
         });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if button(ui, "Create Chrome package (.zip)", false).clicked() {
+                self.browser_msg = match crate::extension::package(false) {
+                    Ok(p) => format!(
+                        "Chrome package written to {}. Unpack it and load the folder with \"Load unpacked\".",
+                        p.display()
+                    ),
+                    Err(e) => format!("The package could not be created: {e}"),
+                };
+            }
+            if button(ui, "Create Firefox package (.xpi)", false).clicked() {
+                self.browser_msg = match crate::extension::package(true) {
+                    Ok(p) => format!(
+                        "Firefox package written to {}. Load it with \"Load Temporary Add-on…\".",
+                        p.display()
+                    ),
+                    Err(e) => format!("The package could not be created: {e}"),
+                };
+            }
+        });
+        ui.add_space(6.0);
+        if button(ui, "Test desktop ↔ extension connection", false).clicked() {
+            let registered: Vec<&str> = ["chrome", "edge", "firefox", "brave", "opera"]
+                .into_iter()
+                .filter(|b| crate::extension::native_host_registered(b))
+                .collect();
+            self.browser_msg = match crate::extension::test_native_host() {
+                Ok(reply) => {
+                    let where_ = if registered.is_empty() {
+                        "No browser has the native host registered yet — use the Install buttons below."
+                            .to_string()
+                    } else {
+                        format!("The host is registered for: {}.", registered.join(", "))
+                    };
+                    format!("The native host answered ({reply}). {where_}")
+                }
+                Err(e) => format!("The connection test failed: {e}"),
+            };
+        }
+        ui.add_space(10.0);
+        if button(ui, "Check whether the browser has the extension", false).clicked() {
+            self.ext_info = match crate::extension::prepare(false) {
+                Ok(status) => match status.installed {
+                    Some(true) => format!(
+                        "Installed and enabled — {} (version {})",
+                        status.profile_note, status.version
+                    ),
+                    Some(false) => format!(
+                        "Found but not enabled — {} (version {})",
+                        status.profile_note, status.version
+                    ),
+                    None => format!(
+                        "No Chrome, Edge, Brave or Vivaldi profile with this extension was found. The folder is {}.",
+                        status.dir.display()
+                    ),
+                },
+                Err(e) => format!("The extension folder could not be prepared: {e}"),
+            };
+        }
+        if !self.ext_info.is_empty() {
+            ui.add_space(4.0);
+            wrapped(ui, self.ext_info.as_str(), reg(10.0), t.muted);
+        }
+        ui.add_space(12.0);
+        para(ui, "Loading it in Chrome:");
+        ui.add_space(4.0);
+        for (i, step) in crate::extension::install_steps(false, std::path::Path::new("the folder above"))
+            .iter()
+            .enumerate()
+        {
+            para(ui, &format!("{}. {}", i + 1, step));
+            ui.add_space(2.0);
+        }
+        ui.add_space(12.0);
         para(ui, &format!("Chrome/Brave extension ID: {}", crate::app::EXTENSION_ID));
         ui.add_space(16.0);
         ui.horizontal_wrapped(|ui| {

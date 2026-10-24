@@ -24,6 +24,65 @@
     } catch (e) { return false; }
   }
 
+  // ---- Google Drive ----
+  // A public Drive file is served through
+  //   https://drive.google.com/uc?export=download&id=<FILE_ID>
+  // Files big enough for the virus scan answer that URL with an HTML
+  // interstitial; the real bytes then live at
+  //   https://drive.usercontent.google.com/download?id=<ID>&export=download&confirm=<TOKEN>
+  // The confirm token is per-session and can only be obtained by loading the
+  // interstitial, so it is never invented here. The file id is the only
+  // stable identity.
+  const DRIVE_HOSTS = ["drive.google.com", "drive.usercontent.google.com", "docs.google.com"];
+  function isDriveUrl(u) {
+    try {
+      const h = new URL(String(u || "")).hostname.toLowerCase();
+      return DRIVE_HOSTS.indexOf(h) >= 0;
+    } catch (e) { return false; }
+  }
+  // The stable file id (never the per-session confirm/uuid token).
+  function driveFileId(u) {
+    try {
+      const x = new URL(String(u || ""));
+      if (DRIVE_HOSTS.indexOf(x.hostname.toLowerCase()) < 0) return null;
+      const id = x.searchParams.get("id");
+      if (id) return id;
+      const m = x.pathname.match(/\/(?:file|document|d|u)\/d\/([^/]+)/) || x.pathname.match(/\/d\/([^/]+)/);
+      return (m && m[1]) ? m[1] : null;
+    } catch (e) { return null; }
+  }
+  // id + the session uuid a page may carry next to it. The uuid is NOT a
+  // file identity: it changes per download session.
+  function driveIdentity(u) {
+    try {
+      const x = new URL(String(u || ""));
+      if (DRIVE_HOSTS.indexOf(x.hostname.toLowerCase()) < 0) return null;
+      return { id: driveFileId(u), uuid: x.searchParams.get("uuid") || null };
+    } catch (e) { return null; }
+  }
+  // Canonical public download form. Never adds a confirm token.
+  function normalizeDriveUrl(u) {
+    const raw = String(u || "");
+    if (!isDriveUrl(raw)) return raw;
+    try {
+      const x = new URL(raw);
+      const host = x.hostname.toLowerCase();
+      const id = driveFileId(raw);
+      const isUc = host === "drive.google.com" && /^\/uc\/?$/.test(x.pathname);
+      const isFile = host === "drive.google.com" && /^\/file\/d\/[^/]+/.test(x.pathname);
+      if (!isUc && !isFile) return raw; // usercontent bytes keep their signed form
+      const out = new URLSearchParams();
+      out.set("export", "download");
+      if (id) out.set("id", id);
+      // Keep everything else (resourcekey, uuid, ...): dropping them would
+      // break access to files that need them.
+      for (const [k, v] of x.searchParams) {
+        if (k !== "export" && k !== "id") out.append(k, v);
+      }
+      return "https://drive.google.com/uc?" + out.toString();
+    } catch (e) { return raw; }
+  }
+
   // Response evidence, not a URL substring or an arbitrary binary payload.
   // This observer never cancels requests; takeover has its own controller.
   function mediaResponse(details, minSizeKB = 100) {
@@ -36,6 +95,10 @@
       [String(h.name || "").toLowerCase(), String(h.value || "")]));
     const mime = (headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
     const manifestMime = /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/(?:x-)?mpegurl)$/i.test(mime);
+    // Drive's download endpoint answers with the virus-scan interstitial
+    // (HTML) until the browser confirms the file. That page is not a media
+    // response and must never be offered as a downloadable stream.
+    if (isDriveUrl(details.url) && /text\/html/i.test(mime)) return null;
     const playlist = isPlaylistUrl(details.url) || manifestMime;
     let parsed;
     try { parsed = new URL(details.url); } catch (e) { return null; }
@@ -275,6 +338,11 @@
     try {
       const u = new URL(String(href || ""));
       if (!/^https?:$/.test(u.protocol)) return false;
+      // Drive's download endpoint answers with an HTML virus-scan
+      // interstitial, not with the file. Classifying it as a direct
+      // download would hand an HTML page to the app, so the browser keeps
+      // that flow (it resolves the token with the user's own session).
+      if (isDriveUrl(u.toString())) return false;
       return !!downloadAttribute || /\.(?:zip|7z|rar|tar|tgz|gz|bz2|xz|exe|msi|dmg|pkg|deb|rpm|appimage|iso)(?:$)/i.test(u.pathname);
     } catch (e) { return false; }
   }
@@ -284,6 +352,12 @@
   function canonicalUrl(u) {
     try {
       const x = new URL(String(u || ""));
+      // Drive: the file id IS the file. The same id behind uc? and
+      // usercontent? is one resource; two different ids never collapse.
+      if (isDriveUrl(x.toString())) {
+        const id = driveFileId(x.toString());
+        if (id) return "drive:" + id;
+      }
       x.searchParams.delete("bytestart");
       x.searchParams.delete("byteend");
       x.hash = "";
@@ -464,7 +538,7 @@
     } catch (e) {}
   }
 
-  const DCRank = { mediaResponse, attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, manifestUrl, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  const DCRank = { mediaResponse, attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, manifestUrl, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel, isDriveUrl, driveFileId, driveIdentity, normalizeDriveUrl };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

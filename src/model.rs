@@ -125,6 +125,13 @@ pub struct DownloadItem {
     pub referer: String,
     #[serde(default)]
     pub cookie: String,
+    /// The browser's own User-Agent, when the capture carried one.
+    ///
+    /// A site that checks the browser (a Cloudflare browser check, for
+    /// one) only answers the browser that solved it, so the captured
+    /// agent travels with the row. Empty = use the app's own setting.
+    #[serde(default)]
+    pub user_agent: String,
     #[serde(default)]
     pub username: String,
     #[serde(default)]
@@ -204,6 +211,7 @@ impl DownloadItem {
             selected: false,
             referer: String::new(),
             cookie: String::new(),
+            user_agent: String::new(),
             username: String::new(),
             password: String::new(),
             resumable: false,
@@ -626,6 +634,59 @@ pub fn ui_pref_set_str(key: &str, value: &str) {
         return;
     };
     obj.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    if let Ok(json) = serde_json::to_string_pretty(&v) {
+        let _ = atomic_write(&p, json.as_bytes());
+    }
+}
+
+/// The video overlay the browser extension draws: "modern" (a small round
+/// button) or "classic" (the floating bar). An unknown value keeps the
+/// classic bar, which is what the app has always shown.
+pub fn overlay_style() -> String {
+    match ui_pref_str("overlay_style", "classic").as_str() {
+        "modern" => "modern".to_string(),
+        _ => "classic".to_string(),
+    }
+}
+
+/// Who owns the overlay style: "app" (the desktop setting wins) or
+/// "extension" (the choice made in the browser popup wins).
+pub fn overlay_style_source() -> String {
+    match ui_pref_str("overlay_style_source", "app").as_str() {
+        "extension" => "extension".to_string(),
+        _ => "app".to_string(),
+    }
+}
+
+/// Record the overlay style and who chose it. The source decides which side
+/// wins the next time the two talk, so a choice made in the browser is not
+/// silently overwritten by the app (and the other way round).
+pub fn set_overlay_style(value: &str, source: &str) {
+    let value = if value == "modern" { "modern" } else { "classic" };
+    let source = if source == "extension" {
+        "extension"
+    } else {
+        "app"
+    };
+    let _guard = fs_lock("ui-settings");
+    if !_guard.owned() {
+        return;
+    }
+    let Some(p) = config_dir().map(|d| d.join("ui.json")) else {
+        return;
+    };
+    let mut v: serde_json::Value = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    obj.insert("overlay_style".into(), serde_json::Value::String(value.into()));
+    obj.insert(
+        "overlay_style_source".into(),
+        serde_json::Value::String(source.into()),
+    );
     if let Ok(json) = serde_json::to_string_pretty(&v) {
         let _ = atomic_write(&p, json.as_bytes());
     }
@@ -1144,6 +1205,31 @@ mod tests {
         assert!(!start_at_due("23:30", at(10, 0)));
         // Garbage never blocks a download forever.
         assert!(start_at_due("later", at(10, 0)));
+    }
+
+    /// The browser's own agent travels with the row: a site that checks
+    /// the browser only answers that browser, so the capture's agent has
+    /// to survive the queue. An older queue file without the field still
+    /// loads, with an empty agent.
+    #[test]
+    fn a_captured_user_agent_survives_the_queue() {
+        let mut item = DownloadItem::new(
+            7,
+            "https://archive.chirpmyradio.com/download?stream=next".into(),
+            "next-20261023.bin".into(),
+            "C:/tmp".into(),
+            4,
+        );
+        item.user_agent = "Mozilla/5.0 (Windows NT 10.0) Chrome/131.0.0.0".into();
+        let text = serde_json::to_string(&item).unwrap();
+        let back: DownloadItem = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.user_agent, item.user_agent);
+        // A queue file written before the field existed still loads: the
+        // missing field falls back to empty.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("user_agent");
+        let old: DownloadItem = serde_json::from_value(value).unwrap();
+        assert!(old.user_agent.is_empty());
     }
 
     #[test]

@@ -21,14 +21,29 @@ pub enum Provider {
     #[default]
     RealDebrid,
     TorBox,
+    AllDebrid,
+    Premiumize,
+    DebridLink,
 }
 
 impl Provider {
+    /// Every provider the panel can talk to, in menu order.
+    pub const ALL: [Provider; 5] = [
+        Provider::RealDebrid,
+        Provider::TorBox,
+        Provider::AllDebrid,
+        Provider::Premiumize,
+        Provider::DebridLink,
+    ];
+
     /// Human-readable provider name.
     pub fn label(self) -> &'static str {
         match self {
             Self::RealDebrid => "Real-Debrid",
             Self::TorBox => "TorBox",
+            Self::AllDebrid => "AllDebrid",
+            Self::Premiumize => "Premiumize",
+            Self::DebridLink => "Debrid-Link",
         }
     }
 
@@ -37,8 +52,197 @@ impl Provider {
         match self {
             Self::RealDebrid => 0,
             Self::TorBox => 1,
+            Self::AllDebrid => 2,
+            Self::Premiumize => 3,
+            Self::DebridLink => 4,
         }
     }
+
+    /// The provider at `index`, wrapping around.
+    pub fn from_index(index: usize) -> Provider {
+        Provider::ALL[index % Provider::ALL.len()]
+    }
+
+    /// Whether the provider holds a torrent back until its files are
+    /// named.
+    ///
+    /// Debrid-Link's seedbox takes a torrent in a waiting state and
+    /// starts it when the files it must not fetch are named.
+    pub fn waits_for_file_selection(self) -> bool {
+        matches!(self, Provider::DebridLink)
+    }
+
+    /// What this provider's own API documents that it can do.
+    ///
+    /// Every flag is read from the provider's published API surface. A
+    /// workflow an API does not offer is reported as missing so the panel
+    /// can say why, instead of pretending the provider did the work.
+    pub fn capabilities(self) -> Capabilities {
+        match self {
+            // Real-Debrid: instant availability, per-file selection, .torrent
+            // upload, and a hosting link that resolves to a direct download.
+            Self::RealDebrid => Capabilities {
+                cache_query: true,
+                provider_file_selection: true,
+                torrent_metadata: true,
+                direct_hosting: true,
+                hosting_password: true,
+                stated_link_lifetime: true,
+            },
+            // TorBox: a cache query and .torrent upload, but a hosting link
+            // becomes a task and every file of a torrent is fetched.
+            Self::TorBox => Capabilities {
+                cache_query: true,
+                provider_file_selection: false,
+                torrent_metadata: true,
+                direct_hosting: false,
+                hosting_password: true,
+                stated_link_lifetime: false,
+            },
+            // AllDebrid: a hosting link resolves straight away and a .torrent
+            // can be uploaded, but there is no instant-availability query and
+            // no per-file selection.
+            Self::AllDebrid => Capabilities {
+                cache_query: false,
+                provider_file_selection: false,
+                torrent_metadata: true,
+                direct_hosting: true,
+                hosting_password: true,
+                stated_link_lifetime: false,
+            },
+            // Premiumize: a hosting link can be resolved into a direct link
+            // and a magnet can be queued, but there is no .torrent upload and
+            // no hash cache query.
+            Self::Premiumize => Capabilities {
+                cache_query: false,
+                provider_file_selection: false,
+                torrent_metadata: false,
+                direct_hosting: true,
+                hosting_password: true,
+                stated_link_lifetime: false,
+            },
+            // Debrid-Link: a seedbox with per-file selection and .torrent
+            // upload, but a host link becomes a tracked record.
+            Self::DebridLink => Capabilities {
+                cache_query: false,
+                provider_file_selection: true,
+                torrent_metadata: true,
+                direct_hosting: false,
+                hosting_password: true,
+                stated_link_lifetime: false,
+            },
+        }
+    }
+
+    /// Why a workflow is not available for this provider, when it is not.
+    ///
+    /// `None` means the provider's API supports it.
+    pub fn unsupported_reason(self, workflow: Workflow) -> Option<&'static str> {
+        let caps = self.capabilities();
+        let supported = match workflow {
+            Workflow::CacheQuery => caps.cache_query,
+            Workflow::ProviderFileSelection => caps.provider_file_selection,
+            Workflow::TorrentMetadata => caps.torrent_metadata,
+            Workflow::DirectHosting => caps.direct_hosting,
+            Workflow::HostingPassword => caps.hosting_password,
+            Workflow::StatedLinkLifetime => caps.stated_link_lifetime,
+        };
+        if supported {
+            return None;
+        }
+        Some(match (self, workflow) {
+            (
+                Provider::AllDebrid,
+                Workflow::CacheQuery,
+            ) => "AllDebrid has no instant-availability query. It says whether a torrent is already available when the torrent is submitted.",
+            (
+                Provider::Premiumize,
+                Workflow::CacheQuery,
+            ) => "Premiumize's cache query takes download links, not torrent hashes, so it cannot say whether a magnet is already held.",
+            (
+                Provider::DebridLink,
+                Workflow::CacheQuery,
+            ) => "Debrid-Link removed its cached-torrent query endpoint, so DownloadCraft cannot say whether a magnet is already held.",
+            (
+                Provider::TorBox,
+                Workflow::ProviderFileSelection,
+            ) => "TorBox downloads every file of a torrent; the provider offers no per-file selection.",
+            (
+                Provider::AllDebrid,
+                Workflow::ProviderFileSelection,
+            ) => "AllDebrid fetches every file of a torrent; the provider offers no per-file selection.",
+            (
+                Provider::Premiumize,
+                Workflow::ProviderFileSelection,
+            ) => "Premiumize fetches every file of a transfer; the provider offers no per-file selection.",
+            (
+                Provider::Premiumize,
+                Workflow::TorrentMetadata,
+            ) => "Premiumize's API takes magnet links and host URLs, not uploaded .torrent metadata.",
+            (
+                Provider::TorBox,
+                Workflow::DirectHosting,
+            ) => "TorBox turns a hosting link into a task that is polled like a torrent, so there is no instant direct link.",
+            (
+                Provider::DebridLink,
+                Workflow::DirectHosting,
+            ) => "Debrid-Link keeps a downloader record for every host link, so the link is tracked and can expire.",
+            (
+                Provider::TorBox,
+                Workflow::StatedLinkLifetime,
+            ) => "TorBox does not state how long a link stays valid; the app assumes one day.",
+            (
+                Provider::AllDebrid,
+                Workflow::StatedLinkLifetime,
+            ) => "AllDebrid does not state how long a link stays valid; the app assumes one day.",
+            (
+                Provider::Premiumize,
+                Workflow::StatedLinkLifetime,
+            ) => "Premiumize does not state how long a link stays valid; the app assumes one day.",
+            (
+                Provider::DebridLink,
+                Workflow::StatedLinkLifetime,
+            ) => "Debrid-Link only says whether a link has expired, not when it will; the app assumes one day.",
+            _ => "This provider's API does not offer that.",
+        })
+    }
+}
+
+/// What a provider's own API documents that it can do.
+///
+/// A missing flag means the workflow is switched off in the panel and
+/// the reason is shown, rather than the workflow being simulated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capabilities {
+    /// A query that says whether the provider already holds a torrent.
+    pub cache_query: bool,
+    /// The provider can be told which files of a torrent to fetch.
+    pub provider_file_selection: bool,
+    /// The provider accepts uploaded `.torrent` metadata.
+    pub torrent_metadata: bool,
+    /// A hosting link resolves to a direct download without a cloud task.
+    pub direct_hosting: bool,
+    /// A hosting link may carry a password.
+    pub hosting_password: bool,
+    /// A generated link comes with a stated lifetime.
+    pub stated_link_lifetime: bool,
+}
+
+/// A workflow the panel can offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Workflow {
+    /// Asking whether the provider already holds a torrent.
+    CacheQuery,
+    /// Telling the provider which files of a torrent to fetch.
+    ProviderFileSelection,
+    /// Uploading `.torrent` metadata.
+    TorrentMetadata,
+    /// A hosting link that resolves without a cloud task.
+    DirectHosting,
+    /// A password on a hosting link.
+    HostingPassword,
+    /// A stated lifetime for a generated link.
+    StatedLinkLifetime,
 }
 
 /// What the provider was asked to do.
@@ -56,6 +260,15 @@ pub struct CloudJob {
     pub id: String,
     #[serde(default)]
     pub kind: Kind,
+    /// The source the provider was given, when it needs it again.
+    ///
+    /// Premiumize resolves a transfer's files from its source, so the
+    /// magnet or host URL has to travel with the task.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Whether the provider said the torrent was already available.
+    #[serde(default)]
+    pub cached: Option<bool>,
 }
 
 /// One file inside a cloud task.
@@ -67,6 +280,8 @@ pub struct CloudFile {
     /// The provider's own "this file is picked" flag.
     pub selected: bool,
     pub link: String,
+    /// The provider says this file's address has run out.
+    pub expired: bool,
 }
 
 /// The files of a cloud task plus its provider status.
@@ -206,7 +421,8 @@ pub struct ProviderError {
     pub provider: Provider,
     /// The HTTP status, when the failure was a status.
     pub status: Option<u16>,
-    /// The provider's code: a number for Real-Debrid, a word for TorBox.
+    /// The provider's code: a number for Real-Debrid, a word for TorBox,
+    /// AllDebrid, Premiumize and Debrid-Link.
     pub code: Option<String>,
     /// The provider's own message, when it sent one.
     pub message: String,
@@ -220,8 +436,12 @@ impl std::fmt::Display for ProviderError {
         }
         if let Some(code) = &self.code {
             write!(f, " — {code}")?;
-            if let Some(text) = realdebrid_error_text(code) {
-                write!(f, " ({text})")?;
+            // The documented meanings belong to Real-Debrid's own codes;
+            // another provider's code is never read through that table.
+            if self.provider == Provider::RealDebrid {
+                if let Some(text) = realdebrid_error_text(code) {
+                    write!(f, " ({text})")?;
+                }
             }
         }
         if !self.message.is_empty() {
@@ -343,6 +563,11 @@ const TORBOX_LINK_LIFETIME_S: u64 = 3 * 60 * 60;
 /// link is refreshed, and refreshing is always safe.
 const REALDEBRID_LINK_LIFETIME_S: u64 = 7 * 24 * 60 * 60;
 
+/// AllDebrid, Premiumize and Debrid-Link state no lifetime for a
+/// generated link either, so the app assumes a day. The value only
+/// decides when a link is refreshed, and refreshing is always safe.
+const DEFAULT_LINK_LIFETIME_S: u64 = 24 * 60 * 60;
+
 /// Bounded retries for a rate-limited request.
 const RATE_RETRIES: u32 = 3;
 /// First backoff step; every retry doubles it.
@@ -388,18 +613,28 @@ impl Api {
 
     /// The provider endpoint for `path`.
     fn url(&self, path: &str) -> String {
+        self.url_at(self.base_url(), path)
+    }
+
+    /// The provider endpoint for `path` on another documented API
+    /// version of the same provider.
+    fn url_at(&self, base: &str, path: &str) -> String {
         #[cfg(test)]
         if let Some(base) = &self.test_base {
             return format!("{base}/{path}");
         }
-        format!(
-            "{}{}",
-            match self.provider {
-                Provider::RealDebrid => "https://api.real-debrid.com/rest/1.0/",
-                Provider::TorBox => "https://api.torbox.app/v1/api/",
-            },
-            path
-        )
+        format!("{base}{path}")
+    }
+
+    /// The API root the provider documents.
+    fn base_url(&self) -> &'static str {
+        match self.provider {
+            Provider::RealDebrid => "https://api.real-debrid.com/rest/1.0/",
+            Provider::TorBox => "https://api.torbox.app/v1/api/",
+            Provider::AllDebrid => "https://api.alldebrid.com/v4/",
+            Provider::Premiumize => "https://www.premiumize.me/api/",
+            Provider::DebridLink => "https://debrid-link.com/api/v2/",
+        }
     }
 
     /// Send a request and decode the JSON answer.
@@ -436,12 +671,33 @@ impl Api {
             let bytes = read_body(&mut response, RESPONSE_LIMIT).await?;
             let value: Value =
                 serde_json::from_slice(&bytes).map_err(|_| anyhow!("Invalid provider response"))?;
-            if value.get("success").and_then(Value::as_bool) == Some(false)
-                || value.get("error_code").is_some()
-            {
+            if self.envelope_failed(&value) {
                 return Err(anyhow::Error::new(self.provider_error(status, Some(&value))));
             }
             return Ok(value);
+        }
+    }
+
+    /// Whether the provider's own answer says the request failed.
+    ///
+    /// Every provider wraps its answer in its own envelope: Real-Debrid
+    /// and TorBox use `success`/`error_code`, AllDebrid and Premiumize
+    /// use `status`, and Debrid-Link uses `success` with an `error`
+    /// object. A provider that answers `200 OK` with a refusal in the
+    /// body is a refusal, not a success.
+    fn envelope_failed(&self, value: &Value) -> bool {
+        match self.provider {
+            Provider::RealDebrid | Provider::TorBox => {
+                value.get("success").and_then(Value::as_bool) == Some(false)
+                    || value.get("error_code").is_some()
+            }
+            Provider::AllDebrid | Provider::Premiumize => {
+                value.get("status").and_then(Value::as_str) == Some("error")
+            }
+            Provider::DebridLink => {
+                value.get("success").and_then(Value::as_bool) == Some(false)
+                    || value.get("error").is_some()
+            }
         }
     }
 
@@ -466,17 +722,68 @@ impl Api {
 
     /// Build the error for a provider refusal, keeping its own code.
     fn provider_error(&self, status: reqwest::StatusCode, value: Option<&Value>) -> ProviderError {
-        let code = value.and_then(|v| {
-            v.get("error_code")
-                .and_then(Value::as_i64)
-                .map(|n| n.to_string())
-                .or_else(|| v.get("error").and_then(Value::as_str).map(str::to_string))
-        });
-        let message = value
-            .and_then(|v| v.get("detail").and_then(Value::as_str))
-            .or_else(|| value.and_then(|v| v.get("error").and_then(Value::as_str)))
-            .unwrap_or("")
-            .to_string();
+        let (code, message) = match self.provider {
+            // Real-Debrid and TorBox: a numeric code and a word.
+            Provider::RealDebrid | Provider::TorBox => {
+                let code = value
+                    .and_then(|v| v.get("error_code"))
+                    .and_then(Value::as_i64)
+                    .map(|n| n.to_string())
+                    .or_else(|| {
+                        value
+                            .and_then(|v| v.get("error"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                let message = value
+                    .and_then(|v| v.get("detail").and_then(Value::as_str))
+                    .or_else(|| value.and_then(|v| v.get("error").and_then(Value::as_str)))
+                    .unwrap_or("")
+                    .to_string();
+                (code, message)
+            }
+            // AllDebrid: the code and the sentence sit in `error`.
+            Provider::AllDebrid => {
+                let error = value.and_then(|v| v.get("error"));
+                let code = error
+                    .and_then(|e| e.get("code"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let message = error
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                (code, message)
+            }
+            // Premiumize: a code and a message at the top level.
+            Provider::Premiumize => {
+                let code = value
+                    .and_then(|v| v.get("code"))
+                    .map(|c| match c {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    });
+                let message = value
+                    .and_then(|v| v.get("message").and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_string();
+                (code, message)
+            }
+            // Debrid-Link: the error name and its explanation.
+            Provider::DebridLink => {
+                let code = value
+                    .and_then(|v| v.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let message = value
+                    .and_then(|v| v.get("error_description").and_then(Value::as_str))
+                    .or_else(|| value.and_then(|v| v.get("error").and_then(Value::as_str)))
+                    .unwrap_or("")
+                    .to_string();
+                (code, message)
+            }
+        };
         ProviderError {
             provider: self.provider,
             status: Some(status.as_u16()),
@@ -502,42 +809,89 @@ impl Api {
         {
             return Err(anyhow!("Enter a magnet link"));
         }
-        let value = match self.provider {
+        let (value, cached) = match self.provider {
             Provider::RealDebrid => {
-                self.json(|| {
-                    self.auth(self.client.post(self.url("torrents/addMagnet")))
-                        .form(&[("magnet", magnet)])
-                })
-                .await?
+                let value = self
+                    .json(|| {
+                        self.auth(self.client.post(self.url("torrents/addMagnet")))
+                            .form(&[("magnet", magnet)])
+                    })
+                    .await?;
+                (value, None)
             }
             Provider::TorBox => {
-                self.json(|| {
-                    self.auth(self.client.post(self.url("torrents/createtorrent")))
-                        .multipart(
-                            reqwest::multipart::Form::new()
-                                .text("magnet", magnet.to_string())
-                                .text("seed", "1"),
-                        )
-                })
-                .await?
+                let value = self
+                    .json(|| {
+                        self.auth(self.client.post(self.url("torrents/createtorrent")))
+                            .multipart(
+                                reqwest::multipart::Form::new()
+                                    .text("magnet", magnet.to_string())
+                                    .text("seed", "1"),
+                            )
+                    })
+                    .await?;
+                (value, None)
+            }
+            // AllDebrid takes the magnet in `magnets[]` and answers with
+            // the magnet it stored. Its `ready` flag says whether the
+            // torrent is already available: that is this provider's cache
+            // answer, and it comes with the submission.
+            Provider::AllDebrid => {
+                let value = self
+                    .json(|| {
+                        self.auth(self.client.post(self.url("magnet/upload")))
+                            .form(&[("magnets[]", magnet)])
+                    })
+                    .await?;
+                let ready = value
+                    .pointer("/data/magnets/0/ready")
+                    .and_then(Value::as_bool);
+                (value, ready)
+            }
+            // Premiumize queues the magnet as a transfer in its cloud.
+            Provider::Premiumize => {
+                let value = self
+                    .json(|| {
+                        self.auth(self.client.post(self.url("transfer/create")))
+                            .form(&[("src", magnet)])
+                    })
+                    .await?;
+                (value, None)
+            }
+            // Debrid-Link's seedbox only takes a torrent it already holds.
+            // `wait` holds the torrent back so its file list can be
+            // narrowed before the copy starts.
+            Provider::DebridLink => {
+                let value = self
+                    .json(|| {
+                        self.auth(self.client.post(self.url("seedbox/add")))
+                            .form(&[("url", magnet), ("wait", "true")])
+                    })
+                    .await?;
+                (value, None)
             }
         };
         let id = match self.provider {
             Provider::RealDebrid => value.get("id"),
             Provider::TorBox => value.pointer("/data/torrent_id"),
+            Provider::AllDebrid => value.pointer("/data/magnets/0/id"),
+            Provider::Premiumize => value.get("id"),
+            Provider::DebridLink => value.pointer("/value/id"),
         }
         .ok_or_else(|| anyhow!("Provider did not return a cloud task ID"))?;
         let id = id
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| id.to_string());
-        if !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if !safe_id(&id) {
             return Err(anyhow!("Invalid cloud task ID"));
         }
         Ok(CloudJob {
             provider: self.provider,
             id,
             kind: Kind::Torrent,
+            source: Some(magnet.to_string()),
+            cached,
         })
     }
 
@@ -576,23 +930,69 @@ impl Api {
                 })
                 .await?
             }
+            // AllDebrid takes the metadata as a multipart file.
+            Provider::AllDebrid => {
+                self.json(|| {
+                    self.auth(self.client.post(self.url("magnet/upload/file")))
+                        .multipart(
+                            reqwest::multipart::Form::new().part(
+                                "files",
+                                reqwest::multipart::Part::bytes(bytes.clone())
+                                    .file_name(name.clone())
+                                    .mime_str("application/x-bittorrent")
+                                    .expect("constant MIME type"),
+                            ),
+                        )
+                })
+                .await?
+            }
+            // Debrid-Link takes the metadata as a multipart file too.
+            Provider::DebridLink => {
+                self.json(|| {
+                    self.auth(self.client.post(self.url("seedbox/add")))
+                        .multipart(reqwest::multipart::Form::new().part(
+                            "file",
+                            reqwest::multipart::Part::bytes(bytes.clone())
+                                .file_name(name.clone())
+                                .mime_str("application/x-bittorrent")
+                                .expect("constant MIME type"),
+                        ))
+                })
+                .await?
+            }
+            // Premiumize's API documents magnet links and host URLs, not
+            // uploaded torrent metadata. The panel says so instead of
+            // pretending it worked.
+            Provider::Premiumize => {
+                return Err(anyhow!(
+                    "{}",
+                    Provider::Premiumize
+                        .unsupported_reason(Workflow::TorrentMetadata)
+                        .unwrap_or("This provider does not accept .torrent metadata")
+                ));
+            }
         };
         let id = match self.provider {
             Provider::RealDebrid => value.get("id"),
             Provider::TorBox => value.pointer("/data/torrent_id"),
+            Provider::AllDebrid => value.pointer("/data/files/0/id"),
+            Provider::Premiumize => value.get("id"),
+            Provider::DebridLink => value.pointer("/value/id"),
         }
         .ok_or_else(|| anyhow!("Provider did not return a torrent task ID"))?;
         let id = id
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| id.to_string());
-        if !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if !safe_id(&id) {
             return Err(anyhow!("Invalid torrent task ID"));
         }
         Ok(CloudJob {
             provider: self.provider,
             id,
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         })
     }
 
@@ -667,29 +1067,230 @@ impl Api {
                         provider: self.provider,
                         id,
                         kind: Kind::Hosting,
+                        source: Some(link.to_string()),
+                        cached: None,
+                    }),
+                    Vec::new(),
+                ))
+            }
+            // AllDebrid unlocks a supported host straight away and hands
+            // back the file itself.
+            Provider::AllDebrid => {
+                let value = self
+                    .json(|| {
+                        self.auth(self.client.post(self.url("link/unlock")))
+                            .form(&[("link", link), ("password", password)])
+                    })
+                    .await?;
+                let data = value.get("data").unwrap_or(&value);
+                if data.get("delayed").and_then(Value::as_bool) == Some(true) {
+                    return Err(anyhow!(
+                        "AllDebrid is still preparing that link — try again in a moment"
+                    ));
+                }
+                let text = data
+                    .get("link")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("Host did not provide a downloadable file"))?;
+                self.checked_link(text)?;
+                Ok((
+                    None,
+                    vec![HostedFile {
+                        url: text.into(),
+                        name: data
+                            .get("filename")
+                            .and_then(Value::as_str)
+                            .unwrap_or("download")
+                            .into(),
+                        connections: None,
+                    }],
+                ))
+            }
+            // Premiumize resolves a supported host into a direct link. A
+            // host that is not an instant one is queued as a transfer
+            // instead, which is what its service list documents.
+            Provider::Premiumize => {
+                // The instant call takes no password, so a password on the
+                // link goes straight to the queued call that does.
+                let direct = if password.trim().is_empty() {
+                    self.json(|| {
+                        self.auth(self.client.post(self.url("transfer/directdl")))
+                            .form(&[("src", link)])
+                    })
+                    .await
+                } else {
+                    Err(anyhow!("a password needs the queued call"))
+                };
+                let direct = match direct {
+                    Ok(value) => {
+                        let content = value
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        if content.is_empty() {
+                            None
+                        } else {
+                            let mut found = Vec::new();
+                            for item in &content {
+                                let text = item
+                                    .get("link")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| {
+                                        anyhow!("Host did not provide a downloadable file")
+                                    })?;
+                                self.checked_link(text)?;
+                                found.push(HostedFile {
+                                    url: text.into(),
+                                    name: file_name_of(item.get("path").and_then(Value::as_str)),
+                                    connections: None,
+                                });
+                            }
+                            Some(found)
+                        }
+                    }
+                    Err(_) => None,
+                };
+                if let Some(found) = direct {
+                    return Ok((None, found));
+                }
+                // The host cannot be resolved at once: queue it instead.
+                let value = self
+                    .json(|| {
+                        self.auth(self.client.post(self.url("transfer/create")))
+                            .form(&[("src", link), ("password", password)])
+                    })
+                    .await?;
+                let id = value
+                    .get("id")
+                    .ok_or_else(|| anyhow!("Provider did not return a hosting task ID"))?;
+                let id = id
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| id.to_string());
+                if !safe_id(&id) {
+                    return Err(anyhow!("Invalid hosting task ID"));
+                }
+                Ok((
+                    Some(CloudJob {
+                        provider: self.provider,
+                        id,
+                        kind: Kind::Hosting,
+                        source: Some(link.to_string()),
+                        cached: None,
+                    }),
+                    Vec::new(),
+                ))
+            }
+            // Debrid-Link keeps a downloader record for the host link, so
+            // the link is polled and can expire.
+            Provider::DebridLink => {
+                let value = self
+                    .json(|| {
+                        self.auth(self.client.post(self.url("downloader/add")))
+                            .form(&[("url", link), ("password", password)])
+                    })
+                    .await?;
+                let value = value.get("value").cloned().unwrap_or(value);
+                let records = if let Some(rows) = value.as_array() {
+                    rows.clone()
+                } else {
+                    vec![value]
+                };
+                // A folder link comes back as one record per file. Those
+                // are handed out as direct links, so none of them is lost;
+                // a single link becomes a record that can be polled and
+                // removed.
+                if records.len() > 1 {
+                    let mut found = Vec::new();
+                    for record in &records {
+                        let text = record
+                            .get("downloadUrl")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow!("Host did not provide a downloadable file"))?;
+                        self.checked_link(text)?;
+                        found.push(HostedFile {
+                            url: text.into(),
+                            name: record["name"].as_str().unwrap_or("download").into(),
+                            connections: None,
+                        });
+                    }
+                    return Ok((None, found));
+                }
+                let first = records
+                    .first()
+                    .ok_or_else(|| anyhow!("Provider did not return a hosting task ID"))?;
+                let id = first
+                    .get("id")
+                    .and_then(|v| v.as_str().map(str::to_string).or_else(|| {
+                        v.as_i64().map(|n| n.to_string())
+                    }))
+                    .ok_or_else(|| anyhow!("Provider did not return a hosting task ID"))?;
+                if !safe_id(&id) {
+                    return Err(anyhow!("Invalid hosting task ID"));
+                }
+                Ok((
+                    Some(CloudJob {
+                        provider: self.provider,
+                        id,
+                        kind: Kind::Hosting,
+                        source: Some(link.to_string()),
+                        cached: None,
                     }),
                     Vec::new(),
                 ))
             }
         }
     }
-
     /// The provider's current list of supported hosts.
     pub async fn hosters(&self) -> Result<String> {
-        let path = if self.provider == Provider::RealDebrid {
-            "hosts/domains"
-        } else {
-            "webdl/hosters"
+        // Premiumize lists services by name, not hosts, and splits them by
+        // what can be done with them.
+        if self.provider == Provider::Premiumize {
+            let value = self
+                .json(|| self.auth(self.client.get(self.url("services/list"))))
+                .await?;
+            let mut lines = Vec::new();
+            for (label, key) in [
+                ("Instant direct links", "directdl"),
+                ("Queued into the cloud", "queue"),
+                ("Already cached", "cache"),
+            ] {
+                let names = value
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                if !names.is_empty() {
+                    lines.push(format!("{label}: {names}"));
+                }
+            }
+            if lines.is_empty() {
+                return Err(anyhow!("Provider returned an unknown host list format"));
+            }
+            return Ok(lines.join("\n\n"));
+        }
+        let path = match self.provider {
+            Provider::RealDebrid => "hosts/domains",
+            Provider::TorBox => "webdl/hosters",
+            Provider::AllDebrid => "hosts",
+            Provider::DebridLink => "downloader/hosts",
+            Provider::Premiumize => "services/list",
         };
         let value = self
             .json(|| self.auth(self.client.get(self.url(path))))
             .await?;
-        let value = if self.provider == Provider::TorBox {
-            value.get("data").unwrap_or(&value)
-        } else {
-            &value
+        let body = match self.provider {
+            Provider::TorBox | Provider::AllDebrid => value.get("data").unwrap_or(&value),
+            Provider::DebridLink => value.get("value").unwrap_or(&value),
+            Provider::RealDebrid | Provider::Premiumize => &value,
         };
-        let rows = value
+        let rows = body
             .as_array()
             .ok_or_else(|| anyhow!("Provider returned an unknown host list format"))?;
         let mut lines = Vec::new();
@@ -699,7 +1300,13 @@ impl Api {
                 continue;
             }
             let name = row["name"].as_str().unwrap_or("Host");
-            let status = if row["status"].as_bool() == Some(true) {
+            // AllDebrid reports a boolean, Debrid-Link a number that counts
+            // up while the host is online.
+            let status = match row["status"].as_bool() {
+                Some(flag) => flag,
+                None => row["status"].as_i64().map(|n| n >= 1).unwrap_or(false),
+            };
+            let status = if status {
                 "available"
             } else {
                 "unavailable"
@@ -773,15 +1380,17 @@ impl Api {
     }
 
     async fn list_with(&self, job: &CloudJob, fresh: bool) -> Result<Listing> {
-        let value = match self.provider {
+        match self.provider {
             Provider::RealDebrid => {
-                self.json(|| {
-                    self.auth(
-                        self.client
-                            .get(self.url(&format!("torrents/info/{}", job.id))),
-                    )
-                })
-                .await?
+                let value = self
+                    .json(|| {
+                        self.auth(
+                            self.client
+                                .get(self.url(&format!("torrents/info/{}", job.id))),
+                        )
+                    })
+                    .await?;
+                parse_listing(self.provider, &value)
             }
             Provider::TorBox => {
                 let path = if job.kind == Kind::Hosting {
@@ -789,19 +1398,220 @@ impl Api {
                 } else {
                     "torrents/mylist"
                 };
-                self.json(|| {
-                    let mut request = self
-                        .auth(self.client.get(self.url(path)))
-                        .query(&[("id", job.id.as_str())]);
-                    if fresh {
-                        request = request.query(&[("bypass_cache", "true")]);
+                let value = self
+                    .json(|| {
+                        let mut request = self
+                            .auth(self.client.get(self.url(path)))
+                            .query(&[("id", job.id.as_str())]);
+                        if fresh {
+                            request = request.query(&[("bypass_cache", "true")]);
+                        }
+                        request
+                    })
+                    .await?;
+                parse_listing(self.provider, &value)
+            }
+            Provider::AllDebrid => self.list_alldebrid(job).await,
+            Provider::Premiumize => self.list_premiumize(job).await,
+            Provider::DebridLink => self.list_debridlink(job).await,
+        }
+    }
+
+    /// AllDebrid's own status and file list for a magnet.
+    ///
+    /// The status comes from `POST /v4.1/magnet/status` and the direct
+    /// links from `POST /v4/magnet/files`: the status answer carries the
+    /// file tree, the files answer carries the tree with the links on it.
+    async fn list_alldebrid(&self, job: &CloudJob) -> Result<Listing> {
+        let status = self
+            .json(|| {
+                self.auth(self.client.post(self.url_at(
+                    "https://api.alldebrid.com/v4.1/",
+                    "magnet/status",
+                )))
+                .form(&[("id", job.id.as_str())])
+            })
+            .await?;
+        let magnet = status
+            .pointer("/data/magnets/0")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let word = match magnet.get("statusCode").and_then(Value::as_i64) {
+            // AllDebrid's status code is the documented answer; its plain
+            // English word is only used when no code came with it.
+            Some(code) => alldebrid_status_word(code),
+            None => magnet
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("Waiting for cloud files")
+                .to_string(),
+        };
+        let mut files = Vec::new();
+        // The links live in their own endpoint. A provider that cannot
+        // hand them out yet still has a status to show.
+        if let Ok(answer) = self
+            .json(|| {
+                self.auth(self.client.post(self.url("magnet/files")))
+                    .form(&[("id[]", job.id.as_str())])
+            })
+            .await
+        {
+            if let Some(nodes) = answer.pointer("/data/magnets/0/files").and_then(Value::as_array) {
+                let mut next = 0u64;
+                flatten_tree(nodes, "", &mut files, &mut next);
+            }
+        }
+        Ok(Listing {
+            state: normalize_status(self.provider, &word),
+            status: word,
+            files,
+        })
+    }
+
+    /// Premiumize's own transfer status and file list.
+    ///
+    /// The status comes from `GET /transfer/list` and the files from
+    /// `POST /transfer/directdl`, which resolves the transfer's source
+    /// into one entry per file. The links are only asked for once the
+    /// transfer is finished, so a queued transfer is not paid for twice.
+    async fn list_premiumize(&self, job: &CloudJob) -> Result<Listing> {
+        let list = self
+            .json(|| self.auth(self.client.get(self.url("transfer/list"))))
+            .await?;
+        let entry = list
+            .get("transfers")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|t| t["id"].as_str() == Some(job.id.as_str()))
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
+        let word = entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("Waiting for cloud files")
+            .to_string();
+        let mut files = Vec::new();
+        let finished = matches!(word.as_str(), "finished" | "seeding");
+        if finished {
+            if let Some(source) = job.source.as_deref() {
+                if let Ok(answer) = self
+                    .json(|| {
+                        self.auth(self.client.post(self.url("transfer/directdl")))
+                            .form(&[("src", source)])
+                    })
+                    .await
+                {
+                    if let Some(content) = answer.get("content").and_then(Value::as_array) {
+                        for (n, item) in content.iter().enumerate() {
+                            files.push(CloudFile {
+                                id: n as u64 + 1,
+                                name: file_name_of(item.get("path").and_then(Value::as_str)),
+                                bytes: item.get("size").and_then(Value::as_u64).unwrap_or(0),
+                                selected: false,
+                                expired: false,
+                                link: item
+                                    .get("link")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                            });
+                        }
                     }
-                    request
-                })
-                .await?
+                }
+            }
+        }
+        Ok(Listing {
+            state: normalize_status(self.provider, &word),
+            status: word,
+            files,
+        })
+    }
+
+    /// Debrid-Link's own torrent or downloader record.
+    ///
+    /// A torrent is read from `GET /seedbox/list?ids=…` and a host link
+    /// from `GET /downloader/list`. Debrid-Link reports a status number
+    /// rather than a word, so the number is turned into the word the
+    /// provider's documentation uses.
+    async fn list_debridlink(&self, job: &CloudJob) -> Result<Listing> {
+        let (value, entry) = match job.kind {
+            Kind::Torrent => {
+                let value = self
+                    .json(|| {
+                        self.auth(self.client.get(self.url(&format!(
+                            "seedbox/list?ids={}",
+                            job.id
+                        ))))
+                    })
+                    .await?;
+                let entry = value
+                    .pointer("/value/0")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                (value, entry)
+            }
+            Kind::Hosting => {
+                let value = self
+                    .json(|| self.auth(self.client.get(self.url("downloader/list"))))
+                    .await?;
+                let entry = value
+                    .pointer("/value")
+                    .and_then(Value::as_array)
+                    .and_then(|rows| {
+                        rows.iter()
+                            .find(|r| r["id"].as_str() == Some(job.id.as_str()))
+                    })
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                (value, entry)
             }
         };
-        parse_listing(self.provider, &value)
+        let _ = value;
+        let word = match job.kind {
+            Kind::Torrent => debridlink_torrent_status(entry.get("status").and_then(Value::as_i64)),
+            Kind::Hosting => {
+                if entry.get("isProcessing").and_then(Value::as_bool) == Some(true) {
+                    "processing".to_string()
+                } else {
+                    "ready".to_string()
+                }
+            }
+        };
+        let mut files = Vec::new();
+        match job.kind {
+            Kind::Torrent => {
+                if let Some(rows) = entry.get("files").and_then(Value::as_array) {
+                    for row in rows {
+                        let id = row["id"].as_u64().unwrap_or(0);
+                        files.push(CloudFile {
+                            id,
+                            name: row["name"].as_str().unwrap_or("file").to_string(),
+                            bytes: row["size"].as_u64().unwrap_or(0),
+                            selected: false,
+                            expired: false,
+                            link: row["downloadUrl"].as_str().unwrap_or("").to_string(),
+                        });
+                    }
+                }
+            }
+            Kind::Hosting => {
+                files.push(CloudFile {
+                    id: 1,
+                    name: entry["name"].as_str().unwrap_or("download").to_string(),
+                    bytes: entry["size"].as_u64().unwrap_or(0),
+                    selected: false,
+                    expired: entry["expired"].as_bool().unwrap_or(false),
+                    link: entry["downloadUrl"].as_str().unwrap_or("").to_string(),
+                });
+            }
+        }
+        Ok(Listing {
+            state: normalize_status(self.provider, &word),
+            status: word,
+            files,
+        })
     }
 
     /// The direct download address of one cloud file.
@@ -851,10 +1661,35 @@ impl Api {
                 })
                 .await?
             }
+            // AllDebrid, Premiumize and Debrid-Link hand the download
+            // address out with the file itself, so there is nothing left
+            // to ask for.
+            Provider::AllDebrid | Provider::Premiumize | Provider::DebridLink => {
+                if file.expired {
+                    return Err(anyhow!(
+                        "the provider's link for this file has expired — submit it again"
+                    ));
+                }
+                if file.link.is_empty() {
+                    return Err(anyhow!("Cloud file is not ready for download"));
+                }
+                let url = self.checked_link(file.link.as_str())?;
+                let now = now_seconds();
+                return Ok(DirectLink {
+                    url,
+                    connections: None,
+                    expires_at: None,
+                    generated_at: now,
+                    lifetime_s: self.link_lifetime(),
+                });
+            }
         };
         let text = match self.provider {
             Provider::RealDebrid => value.get("download"),
             Provider::TorBox => value.get("data"),
+            Provider::AllDebrid | Provider::Premiumize | Provider::DebridLink => {
+                value.get("link")
+            }
         }
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Cloud file is not ready for download"))?;
@@ -925,6 +1760,31 @@ impl Api {
                     }
                 }
             }
+            // AllDebrid removes the magnet from its list.
+            Provider::AllDebrid => {
+                self.json(|| {
+                    self.auth(self.client.post(self.url("magnet/delete")))
+                        .form(&[("id", job.id.as_str())])
+                })
+                .await?;
+            }
+            // Premiumize deletes the transfer record.
+            Provider::Premiumize => {
+                self.json(|| {
+                    self.auth(self.client.post(self.url("transfer/delete")))
+                        .form(&[("id", job.id.as_str())])
+                })
+                .await?;
+            }
+            // Debrid-Link removes the torrent or the downloader record.
+            Provider::DebridLink => {
+                let path = match job.kind {
+                    Kind::Torrent => format!("seedbox/{}/remove", job.id),
+                    Kind::Hosting => format!("downloader/{}/remove", job.id),
+                };
+                self.json(|| self.auth(self.client.delete(self.url(&path))))
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -964,6 +1824,18 @@ impl Api {
                 })
                 .await?
             }
+            // The other three have no instant-availability query:
+            // AllDebrid answers it when the torrent is submitted,
+            // Premiumize's cache query takes links rather than hashes,
+            // and Debrid-Link removed the endpoint.
+            Provider::AllDebrid | Provider::Premiumize | Provider::DebridLink => {
+                return Err(anyhow!(
+                    "{}",
+                    self.provider
+                        .unsupported_reason(Workflow::CacheQuery)
+                        .unwrap_or("This provider cannot say whether it holds the torrent")
+                ));
+            }
         };
         Ok(parse_cache(self.provider, hash, &value, expected_files))
     }
@@ -973,21 +1845,34 @@ impl Api {
         match self.provider {
             Provider::RealDebrid => REALDEBRID_LINK_LIFETIME_S,
             Provider::TorBox => TORBOX_LINK_LIFETIME_S,
+            Provider::AllDebrid | Provider::Premiumize | Provider::DebridLink => {
+                DEFAULT_LINK_LIFETIME_S
+            }
         }
     }
 
     /// Read the account behind the token.
     ///
-    /// Real-Debrid answers `GET /user`, TorBox answers `GET /user/me`.
+    /// Real-Debrid answers `GET /user`, TorBox answers `GET /user/me`,
+    /// AllDebrid answers `GET /user`, Premiumize answers
+    /// `GET /account/info` and Debrid-Link answers `GET /account/infos`.
     /// A wrong token is refused here, before any torrent is submitted.
     pub async fn account(&self) -> Result<Account> {
         let value = match self.provider {
-            Provider::RealDebrid => {
+            Provider::RealDebrid | Provider::AllDebrid => {
                 self.json(|| self.auth(self.client.get(self.url("user"))))
                     .await?
             }
             Provider::TorBox => {
                 self.json(|| self.auth(self.client.get(self.url("user/me"))))
+                    .await?
+            }
+            Provider::Premiumize => {
+                self.json(|| self.auth(self.client.get(self.url("account/info"))))
+                    .await?
+            }
+            Provider::DebridLink => {
+                self.json(|| self.auth(self.client.get(self.url("account/infos"))))
                     .await?
             }
         };
@@ -1016,6 +1901,55 @@ impl Api {
                         .as_str()
                         .and_then(iso_seconds),
                 )
+            }
+            // AllDebrid reports the premium state and the moment it ends
+            // as a Unix timestamp.
+            Provider::AllDebrid => {
+                let user = value.pointer("/data/user").unwrap_or(&value);
+                let premium = user["isPremium"].as_bool().unwrap_or(false);
+                let until = user["premiumUntil"].as_u64().unwrap_or(0);
+                (
+                    user["username"].as_str().unwrap_or("").to_string(),
+                    if premium { "premium" } else { "free" }.to_string(),
+                    premium,
+                    if until > 0 { Some(until) } else { None },
+                )
+            }
+            // Premiumize names the account by its customer id and states
+            // the premium moment as a Unix timestamp.
+            Provider::Premiumize => {
+                let until = value["premium_until"].as_u64();
+                let premium = until.map(|t| t > now_seconds()).unwrap_or(false);
+                (
+                    value["customer_id"].as_str().unwrap_or("").to_string(),
+                    if premium { "premium" } else { "free" }.to_string(),
+                    premium,
+                    until,
+                )
+            }
+            // Debrid-Link states the account kind and the seconds of
+            // premium that are left.
+            Provider::DebridLink => {
+                let data = value.get("value").unwrap_or(&value);
+                let kind = data["accountType"].as_i64().unwrap_or(0);
+                let left = data["premiumLeft"].as_u64().unwrap_or(0);
+                let name = data["username"]
+                    .as_str()
+                    .or_else(|| data["email"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let plan = match kind {
+                    0 => "free",
+                    1 => "premium",
+                    2 => "lifetime premium",
+                    _ => "unknown",
+                };
+                let expires = if kind == 1 && left > 0 {
+                    Some(now_seconds().saturating_add(left))
+                } else {
+                    None
+                };
+                (name, plan.to_string(), kind >= 1, expires)
             }
         };
         if username.is_empty() && plan.is_empty() {
@@ -1065,7 +1999,45 @@ impl Api {
             Provider::TorBox => Err(anyhow!(
                 "TorBox downloads every file of a torrent; the provider offers no per-file selection"
             )),
+            // AllDebrid and Premiumize fetch every file of a torrent too.
+            Provider::AllDebrid | Provider::Premiumize => Err(anyhow!(
+                "{}",
+                self.provider
+                    .unsupported_reason(Workflow::ProviderFileSelection)
+                    .unwrap_or("This provider offers no per-file selection")
+            )),
+            // Debrid-Link selects by exclusion: it is told which files it
+            // must not fetch.
+            Provider::DebridLink => self.exclude_files(job, ids).await,
         }
+    }
+
+    /// Name the files the provider must not fetch.
+    ///
+    /// Debrid-Link's seedbox narrows a waiting torrent by exclusion: the
+    /// provider is handed the ids it should skip. An empty list means
+    /// every file is wanted.
+    pub async fn exclude_files(&self, job: &CloudJob, unwanted: &[u64]) -> Result<()> {
+        if self.provider != Provider::DebridLink {
+            return Err(anyhow!("This provider does not select files by exclusion"));
+        }
+        if job.kind != Kind::Torrent {
+            return Err(anyhow!("Only torrent jobs have selectable files"));
+        }
+        let list = unwanted
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.json(|| {
+            self.auth(self.client.post(self.url(&format!(
+                "seedbox/{}/config",
+                job.id
+            ))))
+            .form(&[("files-unwanted", list.as_str())])
+        })
+        .await?;
+        Ok(())
     }
 }
 
@@ -1145,6 +2117,23 @@ impl CloudSession {
             _ => None,
         };
         let job = api.add(magnet).await?;
+        // A provider that cannot be asked before the submission may still
+        // answer with it: AllDebrid's `ready` flag says whether the
+        // torrent is already available.
+        let cache = match (cache, job.cached) {
+            (Some(cache), _) => Some(cache),
+            (None, Some(ready)) => Some(CacheStatus {
+                hash: magnet_hash(magnet).unwrap_or_default(),
+                state: if ready {
+                    CacheState::Cached
+                } else {
+                    CacheState::Uncached
+                },
+                files: Vec::new(),
+                bytes: 0,
+            }),
+            (None, None) => None,
+        };
         let mut session = Self {
             api,
             job: Some(job),
@@ -1154,6 +2143,26 @@ impl CloudSession {
             state: CloudStatus::Queued,
             selected: Vec::new(),
             cache,
+        };
+        session.refresh().await?;
+        Ok(session)
+    }
+
+    /// Submit `.torrent` metadata and read the task's first state.
+    ///
+    /// The provider fetches the torrent on our behalf; this app has no
+    /// local torrent engine.
+    pub async fn submit_torrent_file(api: Api, name: String, bytes: Vec<u8>) -> Result<Self> {
+        let job = api.torrent_file(name, bytes).await?;
+        let mut session = Self {
+            api,
+            job: Some(job),
+            files: Vec::new(),
+            hosted: Vec::new(),
+            status: "Submitted".into(),
+            state: CloudStatus::Queued,
+            selected: Vec::new(),
+            cache: None,
         };
         session.refresh().await?;
         Ok(session)
@@ -1200,7 +2209,13 @@ impl CloudSession {
         // A file that vanished must not stay selected.
         self.selected
             .retain(|id| self.files.iter().any(|f| f.id == *id));
-        if self.selected.is_empty() && self.state == CloudStatus::Ready {
+        // A ready task selects its files on its own. A provider that
+        // holds a torrent back until the files are named does the same,
+        // so the user starts with every file picked.
+        if self.selected.is_empty()
+            && (self.state == CloudStatus::Ready
+                || self.api.provider.waits_for_file_selection())
+        {
             self.select_all();
         }
         Ok(())
@@ -1288,8 +2303,22 @@ impl CloudSession {
             }
             // Real-Debrid needs to know which files to fetch in the cloud
             // before it can hand out links.
-            if self.api.provider == Provider::RealDebrid {
-                self.api.select_files(job, &self.selected).await?;
+            match self.api.provider {
+                Provider::RealDebrid => {
+                    self.api.select_files(job, &self.selected).await?;
+                }
+                // Debrid-Link selects by exclusion: it is told which files
+                // it must not fetch.
+                Provider::DebridLink if job.kind == Kind::Torrent => {
+                    let unwanted: Vec<u64> = self
+                        .files
+                        .iter()
+                        .map(|f| f.id)
+                        .filter(|id| !self.selected.contains(id))
+                        .collect();
+                    self.api.exclude_files(job, &unwanted).await?;
+                }
+                _ => {}
             }
             for file in &self.files {
                 if !self.selected.contains(&file.id) {
@@ -1444,6 +2473,7 @@ fn parse_listing(provider: Provider, value: &Value) -> Result<Listing> {
                         .as_u64()
                         .unwrap_or(0),
                         selected: false,
+                        expired: false,
                         link,
                     })
                 })
@@ -1480,7 +2510,104 @@ fn normalize_status(provider: Provider, raw: &str) -> CloudStatus {
             CloudStatus::Queued
         }
         (Provider::TorBox, "failed" | "timed_out") => CloudStatus::Failed,
+        // AllDebrid reports a status code; the word comes from its own
+        // table of codes.
+        (Provider::AllDebrid, "ready") => CloudStatus::Ready,
+        (Provider::AllDebrid, "downloading" | "compressing" | "uploading") => {
+            CloudStatus::Downloading
+        }
+        (Provider::AllDebrid, "queued" | "processing") => CloudStatus::Queued,
+        (Provider::AllDebrid, "error") => CloudStatus::Failed,
+        // Premiumize names the states of a transfer.
+        (Provider::Premiumize, "finished" | "seeding") => CloudStatus::Ready,
+        (Provider::Premiumize, "running") => CloudStatus::Downloading,
+        (Provider::Premiumize, "queued") => CloudStatus::Queued,
+        (Provider::Premiumize, "error") => CloudStatus::Failed,
+        // Debrid-Link reports a status number; the word comes from its own
+        // table of numbers.
+        (Provider::DebridLink, "finished" | "seeding" | "ready") => CloudStatus::Ready,
+        (
+            Provider::DebridLink,
+            "downloading" | "verifying" | "processing",
+        ) => CloudStatus::Downloading,
+        (Provider::DebridLink, "queued" | "paused") => CloudStatus::Queued,
         _ => CloudStatus::Unknown,
+    }
+}
+
+/// AllDebrid's own status code as the word its documentation uses.
+fn alldebrid_status_word(code: i64) -> String {
+    match code {
+        0 => "Queued",
+        1 => "Downloading",
+        2 => "Compressing",
+        3 => "Uploading",
+        4 => "Ready",
+        _ => "Error",
+    }
+    .to_string()
+}
+
+/// Debrid-Link's own torrent status number as its documented word.
+fn debridlink_torrent_status(code: Option<i64>) -> String {
+    match code {
+        Some(0) => "Paused".to_string(),
+        Some(1) => "Queued".to_string(),
+        Some(2) => "Verifying".to_string(),
+        Some(4) => "Downloading".to_string(),
+        Some(8) => "Seeding".to_string(),
+        Some(100) => "Finished".to_string(),
+        Some(other) => format!("Status {other}"),
+        None => "Waiting for cloud files".to_string(),
+    }
+}
+
+/// A task ID that can never change the request path.
+fn safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The file name a provider path ends with.
+fn file_name_of(path: Option<&str>) -> String {
+    let path = path.unwrap_or("").trim();
+    let name = path.rsplit('/').next().unwrap_or("").trim();
+    if name.is_empty() {
+        "download".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Flatten a provider's file tree into a flat file list.
+///
+/// The tree nodes carry a name, a size and — when the provider gives
+/// them — the direct link of the file. A node with children is a folder:
+/// its own name becomes part of the path of the files below it.
+fn flatten_tree(nodes: &[Value], prefix: &str, out: &mut Vec<CloudFile>, next_id: &mut u64) {
+    for node in nodes {
+        let name = node["n"].as_str().unwrap_or("file").to_string();
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if let Some(children) = node["e"].as_array() {
+            flatten_tree(children, &path, out, next_id);
+            continue;
+        }
+        *next_id += 1;
+        out.push(CloudFile {
+            id: *next_id,
+            name: path,
+            bytes: node["s"].as_u64().unwrap_or(0),
+            selected: false,
+            link: node["l"].as_str().unwrap_or("").to_string(),
+            expired: false,
+        });
     }
 }
 
@@ -1557,6 +2684,12 @@ fn parse_cache(
                 (files, Some(cached))
             }
         }
+        // These providers have no instant-availability query, so there is
+        // no answer to read: the state stays unknown, which is not the
+        // same as "not cached".
+        Provider::AllDebrid | Provider::Premiumize | Provider::DebridLink => {
+            (Vec::new(), None)
+        }
     };
     let bytes = files.iter().map(|f| f.bytes).sum();
     let state = match verdict {
@@ -1600,7 +2733,7 @@ mod tests {
         "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
 
     /// The canned provider answer for a request line.
-    fn mock_payload(path: &str) -> String {
+    fn mock_payload(provider: Provider, path: &str) -> String {
         // Real-Debrid keys its availability answer by the hash, so the
         // answer has to carry the hash that was asked for.
         if let Some(rest) = path.strip_prefix("GET /torrents/instantAvailability/") {
@@ -1609,36 +2742,95 @@ mod tests {
                 r#"{{"{hash}":{{"rd":[{{"1":{{"filename":"file.bin","filesize":123}}}}]}}}}"#
             );
         }
-        mock_static_payload(path).to_string()
+        mock_static_payload(provider, path).to_string()
     }
 
     /// The canned answers that do not depend on the request.
-    fn mock_static_payload(path: &str) -> &'static str {
-        if path.contains("unrestrict/link") {
-            r#"{"download":"https://cdn.example.test/file.bin","filename":"file.bin"}"#
-        } else if path.contains("user/me") {
-            r#"{"success":true,"data":{"email":"tester@example.test","plan":2,"premium_expires_at":"2051-02-18T04:08:43Z"}}"#
-        } else if path.contains("/user") {
-            r#"{"username":"tester","type":"premium","expiration":"2032-06-06T04:42:42.000Z"}"#
-        } else if path.contains("createwebdownload") {
-            r#"{"success":true,"data":{"webdownload_id":42}}"#
-        } else if path.contains("checkcached") {
-            r#"{"success":true,"data":{"cached":true,"files":[{"id":3,"name":"file.bin","size":123}]}}"#
-        } else if path.contains("torrents/info/") {
-            r#"{"status":"downloaded","links":["https://real-debrid.com/d/ABC"],"files":[{"id":1,"path":"file.bin","bytes":123,"selected":1}]}"#
-        } else if path.contains("webdl/mylist") {
-            r#"{"success":true,"data":{"download_state":"cached","files":[{"id":3,"name":"file.bin","size":123}]}}"#
-        } else if path.contains("torrents/mylist") {
-            // TorBox answers the torrent list with an array of torrents.
-            r#"{"success":true,"data":[{"id":71,"download_state":"cached","files":[{"id":3,"name":"file.bin","size":123}]}]}"#
-        } else if path.contains("requestdl") {
-            r#"{"success":true,"data":"https://cdn.example.test/file.bin"}"#
-        } else if path.contains("addMagnet") || path.contains("addTorrent") {
-            r#"{"id":"rd123"}"#
-        } else if path.contains("createtorrent") {
-            r#"{"success":true,"data":{"torrent_id":71}}"#
-        } else {
-            r#"{"success":true}"#
+    ///
+    /// Every provider answers in its own envelope, so the fixture answers
+    /// in the envelope of the provider it serves.
+    fn mock_static_payload(provider: Provider, path: &str) -> &'static str {
+        match provider {
+            Provider::RealDebrid => {
+                if path.contains("unrestrict/link") {
+                    r#"{"download":"https://cdn.example.test/file.bin","filename":"file.bin"}"#
+                } else if path.contains("/user") {
+                    r#"{"username":"tester","type":"premium","expiration":"2032-06-06T04:42:42.000Z"}"#
+                } else if path.contains("torrents/info/") {
+                    r#"{"status":"downloaded","links":["https://real-debrid.com/d/ABC"],"files":[{"id":1,"path":"file.bin","bytes":123,"selected":1}]}"#
+                } else if path.contains("addMagnet") || path.contains("addTorrent") {
+                    r#"{"id":"rd123"}"#
+                } else {
+                    r#"{"success":true}"#
+                }
+            }
+            Provider::TorBox => {
+                if path.contains("user/me") {
+                    r#"{"success":true,"data":{"email":"tester@example.test","plan":2,"premium_expires_at":"2051-02-18T04:08:43Z"}}"#
+                } else if path.contains("createwebdownload") {
+                    r#"{"success":true,"data":{"webdownload_id":42}}"#
+                } else if path.contains("checkcached") {
+                    r#"{"success":true,"data":{"cached":true,"files":[{"id":3,"name":"file.bin","size":123}]}}"#
+                } else if path.contains("webdl/mylist") {
+                    r#"{"success":true,"data":{"download_state":"cached","files":[{"id":3,"name":"file.bin","size":123}]}}"#
+                } else if path.contains("torrents/mylist") {
+                    // TorBox answers the torrent list with an array of torrents.
+                    r#"{"success":true,"data":[{"id":71,"download_state":"cached","files":[{"id":3,"name":"file.bin","size":123}]}]}"#
+                } else if path.contains("requestdl") {
+                    r#"{"success":true,"data":"https://cdn.example.test/file.bin"}"#
+                } else if path.contains("createtorrent") {
+                    r#"{"success":true,"data":{"torrent_id":71}}"#
+                } else {
+                    r#"{"success":true}"#
+                }
+            }
+            Provider::AllDebrid => {
+                if path.contains("link/unlock") {
+                    r#"{"status":"success","data":{"link":"https://cdn.example.test/file.bin","filename":"file.bin","filesize":123,"host":"example.test"}}"#
+                } else if path.contains("magnet/upload/file") {
+                    r#"{"status":"success","data":{"files":[{"id":124,"name":"file.bin","size":123,"ready":true}]}}"#
+                } else if path.contains("magnet/upload") {
+                    r#"{"status":"success","data":{"magnets":[{"id":123,"name":"file.bin","hash":"abc","size":123,"ready":true}]}}"#
+                } else if path.contains("magnet/status") {
+                    r#"{"status":"success","data":{"magnets":[{"id":123,"filename":"file.bin","size":123,"status":"Ready","statusCode":4,"files":[{"n":"file.bin","s":123}]}]}}"#
+                } else if path.contains("magnet/files") {
+                    r#"{"status":"success","data":{"magnets":[{"id":123,"files":[{"n":"file.bin","s":123,"l":"https://cdn.example.test/file.bin"}]}]}}"#
+                } else if path.contains("/user") {
+                    r#"{"status":"success","data":{"user":{"username":"tester","email":"tester@example.test","isPremium":true,"premiumUntil":1893456000}}}"#
+                } else {
+                    r#"{"status":"success"}"#
+                }
+            }
+            Provider::Premiumize => {
+                if path.contains("transfer/directdl") {
+                    r#"{"status":"success","content":[{"path":"Folder/file.bin","size":123,"link":"https://cdn.example.test/file.bin"}]}"#
+                } else if path.contains("transfer/list") {
+                    r#"{"status":"success","transfers":[{"id":"pm123","name":"file.bin","status":"finished","progress":1.0,"message":""}]}"#
+                } else if path.contains("transfer/create") {
+                    r#"{"status":"success","id":"pm123","name":"file.bin"}"#
+                } else if path.contains("account/info") {
+                    r#"{"status":"success","customer_id":"1234567","premium_until":1893456000,"limit_used":0.42}"#
+                } else if path.contains("services/list") {
+                    r#"{"status":"success","cache":["examplecache"],"directdl":["exampledirect"],"queue":["examplequeue"],"fairusefactor":{},"aliases":{},"regexpatterns":{}}"#
+                } else {
+                    r#"{"status":"success"}"#
+                }
+            }
+            Provider::DebridLink => {
+                if path.contains("seedbox/list") {
+                    r#"{"success":true,"value":[{"id":"dl123","name":"file.bin","hashString":"abc","status":100,"files":[{"id":5,"name":"a.bin","size":123,"downloadUrl":"https://cdn.example.test/a.bin","downloadPercent":100},{"id":6,"name":"b.bin","size":124,"downloadUrl":"https://cdn.example.test/b.bin","downloadPercent":100}]}]}"#
+                } else if path.contains("seedbox/add") {
+                    r#"{"success":true,"value":{"id":"dl123","name":"file.bin","hashString":"abc","status":0}}"#
+                } else if path.contains("downloader/list") {
+                    r#"{"success":true,"value":[{"id":"dl9","name":"file.bin","size":123,"downloadUrl":"https://cdn.example.test/file.bin","expired":false}]}"#
+                } else if path.contains("downloader/add") {
+                    r#"{"success":true,"value":{"id":"dl9","name":"file.bin","size":123,"downloadUrl":"https://cdn.example.test/file.bin","expired":false}}"#
+                } else if path.contains("account/infos") {
+                    r#"{"success":true,"value":{"email":"tester@example.test","username":"tester","accountType":1,"premiumLeft":86400}}"#
+                } else {
+                    r#"{"success":true,"value":{}}"#
+                }
+            }
         }
     }
 
@@ -1709,6 +2901,9 @@ mod tests {
         let limits = std::sync::Arc::new(std::sync::Mutex::new(limits));
         let overrides = std::sync::Arc::new(overrides);
         let task = tokio::spawn(async move {
+            // The provider is copied into the fixture so every answer
+            // comes in that provider's own envelope.
+            let provider = provider;
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
@@ -1777,7 +2972,7 @@ mod tests {
                         let _ = socket.write_all(reply.as_bytes()).await;
                         return;
                     }
-                    let payload = mock_payload(path);
+                    let payload = mock_payload(provider, path);
                     let reply=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",payload.len(),payload);
                     let _ = socket.write_all(reply.as_bytes()).await;
                 });
@@ -1990,6 +3185,10 @@ mod tests {
                     assert!(request.contains("hash=0123456789abcdef"));
                     assert!(request.contains("list_files=true"));
                 }
+                // The other providers have no such query at all.
+                Provider::AllDebrid | Provider::Premiumize | Provider::DebridLink => {
+                    unreachable!("this provider has no cache query");
+                }
             }
             task.abort();
         }
@@ -2014,6 +3213,8 @@ mod tests {
             provider: Provider::RealDebrid,
             id: "rd123".into(),
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         };
         api.delete_job(&job).await.unwrap();
         let request = requests.lock().unwrap()[0].clone();
@@ -2027,6 +3228,8 @@ mod tests {
             provider: Provider::TorBox,
             id: "71".into(),
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         };
         api.delete_job(&job).await.unwrap();
         let request = requests.lock().unwrap()[0].clone();
@@ -2046,6 +3249,8 @@ mod tests {
             provider: Provider::TorBox,
             id: "42".into(),
             kind: Kind::Hosting,
+            source: None,
+            cached: None,
         };
         api.delete_job(&job).await.unwrap();
         let request = requests.lock().unwrap()[0].clone();
@@ -2061,6 +3266,8 @@ mod tests {
             provider: Provider::RealDebrid,
             id: "rd123".into(),
             kind: Kind::Hosting,
+            source: None,
+            cached: None,
         };
         assert!(api.delete_job(&job).await.is_err());
         task.abort();
@@ -2074,6 +3281,8 @@ mod tests {
             provider: Provider::RealDebrid,
             id: "rd123".into(),
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         };
         // Two rate-limited answers, then the real one: the call succeeds.
         api.list(&job).await.expect("the request must be retried");
@@ -2090,6 +3299,8 @@ mod tests {
             provider: Provider::RealDebrid,
             id: "rd123".into(),
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         };
         let err = api.list(&job).await.expect_err("the retries must be bounded");
         assert!(err.to_string().contains("429"));
@@ -2175,6 +3386,8 @@ mod tests {
             provider: Provider::RealDebrid,
             id: "rd123".into(),
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         };
         let err = api.list(&job).await.expect_err("the refusal must surface");
         assert_eq!(provider_code(&err), Some("8"));
@@ -2226,6 +3439,8 @@ mod tests {
             provider: Provider::TorBox,
             id: "71".into(),
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         };
         api.list(&job).await.unwrap();
         api.list_fresh(&job).await.unwrap();
@@ -2243,6 +3458,8 @@ mod tests {
             provider: Provider::TorBox,
             id: "71".into(),
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         };
         let file = CloudFile {
             id: 3,
@@ -2250,6 +3467,7 @@ mod tests {
             bytes: 123,
             selected: true,
             link: String::new(),
+            expired: false,
         };
         let link = api.link_info(&job, &file).await.unwrap();
         assert_eq!(link.url, "https://cdn.example.test/file.bin");
@@ -2324,6 +3542,8 @@ mod tests {
             provider: Provider::RealDebrid,
             id: "rd123".into(),
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         };
         api.select_files(&job, &[1, 3]).await.unwrap();
         let request = requests.lock().unwrap()[0].clone();
@@ -2339,6 +3559,8 @@ mod tests {
             provider: Provider::TorBox,
             id: "71".into(),
             kind: Kind::Torrent,
+            source: None,
+            cached: None,
         };
         let err = api
             .select_files(&job, &[1])
@@ -2610,5 +3832,551 @@ mod tests {
         let status = api.cache_status(hash, None).await.unwrap();
         assert_eq!(status.state, CacheState::Partial);
         task.abort();
+    }
+
+    // ---- The extra providers -------------------------------------------
+
+    /// Every provider hands a magnet to its own documented endpoint.
+    #[tokio::test]
+    async fn each_provider_submits_a_magnet_to_its_own_endpoint() {
+        let (api, requests, task) = mock(Provider::AllDebrid).await;
+        let job = api.add(MAGNET).await.unwrap();
+        assert!(job.kind == Kind::Torrent);
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /magnet/upload "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("magnets%5B%5D=magnet%3A"));
+        assert!(request.contains("authorization: Bearer private-api-token"));
+        task.abort();
+
+        let (api, requests, task) = mock(Provider::Premiumize).await;
+        api.add(MAGNET).await.unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /transfer/create "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("src=magnet%3A"));
+        task.abort();
+
+        let (api, requests, task) = mock(Provider::DebridLink).await;
+        api.add(MAGNET).await.unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /seedbox/add "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("url=magnet%3A"));
+        task.abort();
+    }
+
+    /// Each provider validates the account at its own endpoint.
+    #[tokio::test]
+    async fn accounts_are_read_from_each_providers_own_endpoint() {
+        let (api, requests, task) = mock(Provider::AllDebrid).await;
+        let account = api.account().await.unwrap();
+        assert_eq!(account.username, "tester");
+        assert_eq!(account.plan, "premium");
+        assert!(account.premium);
+        assert!(account.expires_at.is_some());
+        assert!(requests.lock().unwrap()[0].starts_with("GET /user "));
+        task.abort();
+
+        let (api, requests, task) = mock(Provider::Premiumize).await;
+        let account = api.account().await.unwrap();
+        assert_eq!(account.username, "1234567");
+        assert!(account.premium);
+        assert!(requests.lock().unwrap()[0].starts_with("GET /account/info "));
+        task.abort();
+
+        let (api, requests, task) = mock(Provider::DebridLink).await;
+        let account = api.account().await.unwrap();
+        assert_eq!(account.username, "tester");
+        assert_eq!(account.plan, "premium");
+        assert!(account.premium);
+        assert!(requests.lock().unwrap()[0].starts_with("GET /account/infos "));
+        task.abort();
+    }
+
+    /// A hosting link is resolved where the provider resolves it, and
+    /// becomes a task where it does not.
+    #[tokio::test]
+    async fn hosting_links_follow_each_providers_own_flow() {
+        let (api, requests, task) = mock(Provider::AllDebrid).await;
+        let (job, files) = api.hosting("https://mega.nz/file/abc#key", "pw").await.unwrap();
+        assert!(job.is_none());
+        assert_eq!(files[0].url, "https://cdn.example.test/file.bin");
+        assert_eq!(files[0].name, "file.bin");
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /link/unlock "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("password=pw"));
+        task.abort();
+
+        let (api, requests, task) = mock(Provider::Premiumize).await;
+        let (job, files) = api.hosting("https://mega.nz/file/abc#key", "").await.unwrap();
+        assert!(job.is_none());
+        assert_eq!(files[0].url, "https://cdn.example.test/file.bin");
+        assert_eq!(files[0].name, "file.bin");
+        assert!(
+            requests.lock().unwrap()[0].starts_with("POST /transfer/directdl "),
+            "wrong endpoint"
+        );
+        task.abort();
+
+        let (api, requests, task) = mock(Provider::DebridLink).await;
+        let (job, files) = api.hosting("https://mega.nz/file/abc#key", "pw").await.unwrap();
+        assert!(files.is_empty());
+        let job = job.expect("Debrid-Link keeps a record for the host link");
+        assert!(job.kind == Kind::Hosting);
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /downloader/add "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("password=pw"));
+        task.abort();
+    }
+
+    /// A `.torrent` file is uploaded only where the API takes one.
+    #[tokio::test]
+    async fn torrent_metadata_is_uploaded_only_where_the_api_takes_it() {
+        let (api, requests, task) = mock(Provider::AllDebrid).await;
+        let job = api
+            .torrent_file("example.torrent".into(), b"d4:infodee".to_vec())
+            .await
+            .unwrap();
+        assert!(job.kind == Kind::Torrent);
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /magnet/upload/file "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("d4:infodee"));
+        task.abort();
+
+        let (api, requests, task) = mock(Provider::DebridLink).await;
+        api.torrent_file("example.torrent".into(), b"d4:infodee".to_vec())
+            .await
+            .unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /seedbox/add "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("name=\"file\""));
+        assert!(request.contains("d4:infodee"));
+        task.abort();
+
+        // Premiumize's API takes magnet links and host URLs only.
+        let (api, _requests, task) = mock(Provider::Premiumize).await;
+        let err = api
+            .torrent_file("example.torrent".into(), b"d4:infodee".to_vec())
+            .await
+            .expect_err("Premiumize takes no .torrent metadata");
+        assert!(err.to_string().contains("magnet links"));
+        task.abort();
+    }
+
+    /// A provider that cannot answer the cache question says why, and is
+    /// not asked at all.
+    #[tokio::test]
+    async fn providers_without_a_cache_query_say_why() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        for (provider, needle) in [
+            (Provider::AllDebrid, "instant-availability"),
+            (Provider::Premiumize, "download links"),
+            (Provider::DebridLink, "removed"),
+        ] {
+            let (api, requests, task) = mock(provider).await;
+            let err = api
+                .cache_status(hash, None)
+                .await
+                .expect_err("this provider has no cache query");
+            assert!(err.to_string().contains(needle), "wrong reason: {err}");
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "the provider must not be asked at all"
+            );
+            task.abort();
+        }
+    }
+
+    /// AllDebrid answers the cache question with the submission.
+    #[tokio::test]
+    async fn alldebrid_says_with_the_submission_whether_the_torrent_is_ready() {
+        let (api, requests, task) = mock(Provider::AllDebrid).await;
+        let session = CloudSession::submit_torrent(api, MAGNET).await.unwrap();
+        assert_eq!(session.cache_state(), CacheState::Cached);
+        assert_eq!(session.state(), CloudStatus::Ready);
+        assert_eq!(session.files().len(), 1);
+        assert_eq!(session.files()[0].name, "file.bin");
+        assert_eq!(session.files()[0].bytes, 123);
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url, "https://cdn.example.test/file.bin");
+        assert!(!targets[0].url.contains("private-api-token"));
+        let requests = requests.lock().unwrap();
+        // The status and the links come from the provider's own two
+        // endpoints.
+        assert!(requests.iter().any(|r| r.contains("magnet/status")));
+        assert!(requests.iter().any(|r| r.contains("magnet/files")));
+        task.abort();
+    }
+
+    /// Premiumize resolves a transfer's files from its source.
+    #[tokio::test]
+    async fn premiumize_reads_its_transfer_and_its_files() {
+        let (api, requests, task) = mock(Provider::Premiumize).await;
+        let session = CloudSession::submit_torrent(api, MAGNET).await.unwrap();
+        assert_eq!(session.state(), CloudStatus::Ready);
+        assert_eq!(session.files().len(), 1);
+        assert_eq!(session.files()[0].name, "file.bin");
+        assert_eq!(session.files()[0].bytes, 123);
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url, "https://cdn.example.test/file.bin");
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().any(|r| r.starts_with("POST /transfer/create ")));
+        assert!(requests.iter().any(|r| r.starts_with("GET /transfer/list ")));
+        assert!(requests
+            .iter()
+            .any(|r| r.starts_with("POST /transfer/directdl ")));
+        task.abort();
+    }
+
+    /// Debrid-Link holds a torrent back until its files are named, and is
+    /// told which files it must skip.
+    #[tokio::test]
+    async fn a_debridlink_session_tells_the_provider_what_to_skip() {
+        let (api, requests, task) = mock(Provider::DebridLink).await;
+        let mut session = CloudSession::submit_torrent(api, MAGNET).await.unwrap();
+        assert_eq!(session.files().len(), 2);
+        // The torrent waits, so every file starts picked.
+        assert_eq!(session.selected(), &[5, 6]);
+        // The user keeps one file: the provider is told to skip the other.
+        session.toggle(6);
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].filename, "a.bin");
+        assert_eq!(targets[0].url, "https://cdn.example.test/a.bin");
+        let requests = requests.lock().unwrap();
+        let config = requests
+            .iter()
+            .find(|r| r.contains("/config"))
+            .expect("the provider must be told which files to skip");
+        assert!(config.contains("files-unwanted=6"), "wrong: {config}");
+        task.abort();
+    }
+
+    /// A Debrid-Link host link is polled like a task and can be removed.
+    #[tokio::test]
+    async fn a_debridlink_host_link_is_polled_and_can_be_deleted() {
+        let (api, requests, task) = mock(Provider::DebridLink).await;
+        let session = CloudSession::submit_hosting(api, "https://mega.nz/file/abc#key", "pw")
+            .await
+            .unwrap();
+        assert_eq!(session.state(), CloudStatus::Ready);
+        assert_eq!(session.files().len(), 1);
+        assert_eq!(session.files()[0].name, "file.bin");
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url, "https://cdn.example.test/file.bin");
+        session.cancel().await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(requests
+            .iter()
+            .any(|r| r.starts_with("DELETE /downloader/dl9/remove ")));
+        task.abort();
+    }
+
+    /// A provider's task is removed at the provider in its own way.
+    #[tokio::test]
+    async fn the_extra_providers_delete_their_own_tasks() {
+        let (api, requests, task) = mock(Provider::AllDebrid).await;
+        let job = CloudJob {
+            provider: Provider::AllDebrid,
+            id: "123".into(),
+            kind: Kind::Torrent,
+            source: None,
+            cached: None,
+        };
+        api.delete_job(&job).await.unwrap();
+        assert!(
+            requests.lock().unwrap()[0].starts_with("POST /magnet/delete "),
+            "wrong endpoint"
+        );
+        task.abort();
+
+        let (api, requests, task) = mock(Provider::Premiumize).await;
+        let job = CloudJob {
+            provider: Provider::Premiumize,
+            id: "pm123".into(),
+            kind: Kind::Torrent,
+            source: None,
+            cached: None,
+        };
+        api.delete_job(&job).await.unwrap();
+        assert!(
+            requests.lock().unwrap()[0].starts_with("POST /transfer/delete "),
+            "wrong endpoint"
+        );
+        task.abort();
+
+        let (api, requests, task) = mock(Provider::DebridLink).await;
+        let job = CloudJob {
+            provider: Provider::DebridLink,
+            id: "dl123".into(),
+            kind: Kind::Torrent,
+            source: None,
+            cached: None,
+        };
+        api.delete_job(&job).await.unwrap();
+        assert!(
+            requests.lock().unwrap()[0].starts_with("DELETE /seedbox/dl123/remove "),
+            "wrong endpoint"
+        );
+        task.abort();
+    }
+
+    /// The panel may only offer what a provider's API documents.
+    #[test]
+    fn capabilities_state_what_each_provider_can_do() {
+        // The cache query exists only where the provider has one.
+        for provider in [Provider::RealDebrid, Provider::TorBox] {
+            assert!(provider
+                .unsupported_reason(Workflow::CacheQuery)
+                .is_none());
+        }
+        for provider in [
+            Provider::AllDebrid,
+            Provider::Premiumize,
+            Provider::DebridLink,
+        ] {
+            let reason = provider
+                .unsupported_reason(Workflow::CacheQuery)
+                .expect("this provider has no cache query");
+            assert!(reason.contains(provider.label()), "wrong reason: {reason}");
+        }
+        // A provider that fetches every file says so instead of pretending
+        // it can narrow them.
+        assert!(Provider::RealDebrid
+            .unsupported_reason(Workflow::ProviderFileSelection)
+            .is_none());
+        for provider in [
+            Provider::TorBox,
+            Provider::AllDebrid,
+            Provider::Premiumize,
+        ] {
+            assert!(provider
+                .unsupported_reason(Workflow::ProviderFileSelection)
+                .is_some());
+        }
+        // Premiumize takes no .torrent metadata; the others do.
+        assert!(Provider::Premiumize
+            .unsupported_reason(Workflow::TorrentMetadata)
+            .is_some());
+        for provider in [
+            Provider::RealDebrid,
+            Provider::TorBox,
+            Provider::AllDebrid,
+            Provider::DebridLink,
+        ] {
+            assert!(provider
+                .unsupported_reason(Workflow::TorrentMetadata)
+                .is_none());
+        }
+        // Every provider takes a host password.
+        for provider in Provider::ALL {
+            assert!(provider
+                .unsupported_reason(Workflow::HostingPassword)
+                .is_none());
+        }
+    }
+
+    /// A folder link that comes back as several records keeps every file.
+    #[tokio::test]
+    async fn a_debridlink_folder_link_keeps_every_file() {
+        let body = r#"{"success":true,"value":[{"id":"dl9","name":"a.bin","downloadUrl":"https://cdn.example.test/a.bin"},{"id":"dl10","name":"b.bin","downloadUrl":"https://cdn.example.test/b.bin"}]}"#;
+        let (api, _requests, task) =
+            mock_refusing(Provider::DebridLink, "downloader/add", "200 OK", body).await;
+        let (job, files) = api.hosting("https://mega.nz/file/abc", "").await.unwrap();
+        assert!(job.is_none());
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "a.bin");
+        assert_eq!(files[1].url, "https://cdn.example.test/b.bin");
+        task.abort();
+    }
+
+    /// A host link with a password goes to the queued call, because the
+    /// instant call takes no password.
+    #[tokio::test]
+    async fn a_premiumize_host_link_with_a_password_is_queued() {
+        let (api, requests, task) = mock(Provider::Premiumize).await;
+        let (job, files) = api.hosting("https://mega.nz/file/abc#key", "pw").await.unwrap();
+        assert!(files.is_empty());
+        let job = job.expect("the link is queued as a transfer");
+        assert!(job.kind == Kind::Hosting);
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("POST /transfer/create "),
+            "wrong endpoint: {request}"
+        );
+        assert!(request.contains("password=pw"));
+        task.abort();
+    }
+
+    /// A provider's file tree becomes a flat list with its links.
+    #[test]
+    fn a_file_tree_is_flattened_into_the_files_it_holds() {        let tree = serde_json::json!([
+            {"n": "Folder", "e": [
+                {"n": "a.mkv", "s": 10, "l": "https://cdn.example.test/a.mkv"},
+                {"n": "b.mkv", "s": 20, "l": "https://cdn.example.test/b.mkv"}
+            ]},
+            {"n": "c.mkv", "s": 30, "l": "https://cdn.example.test/c.mkv"}
+        ]);
+        let mut files = Vec::new();
+        let mut next = 0;
+        flatten_tree(tree.as_array().unwrap(), "", &mut files, &mut next);
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].name, "Folder/a.mkv");
+        assert_eq!(files[0].bytes, 10);
+        assert_eq!(files[1].id, 2);
+        assert_eq!(files[2].name, "c.mkv");
+        assert_eq!(files[2].link, "https://cdn.example.test/c.mkv");
+    }
+
+    /// The extra providers' states are normalized the same way.
+    #[test]
+    fn the_extra_providers_statuses_are_normalized() {
+        assert_eq!(
+            normalize_status(Provider::AllDebrid, "Ready"),
+            CloudStatus::Ready
+        );
+        assert_eq!(
+            normalize_status(Provider::AllDebrid, "Downloading"),
+            CloudStatus::Downloading
+        );
+        assert_eq!(
+            normalize_status(Provider::AllDebrid, "Error"),
+            CloudStatus::Failed
+        );
+        assert_eq!(
+            normalize_status(Provider::Premiumize, "finished"),
+            CloudStatus::Ready
+        );
+        assert_eq!(
+            normalize_status(Provider::Premiumize, "running"),
+            CloudStatus::Downloading
+        );
+        assert_eq!(
+            normalize_status(Provider::Premiumize, "error"),
+            CloudStatus::Failed
+        );
+        assert_eq!(
+            normalize_status(Provider::DebridLink, "Finished"),
+            CloudStatus::Ready
+        );
+        assert_eq!(
+            normalize_status(Provider::DebridLink, "Seeding"),
+            CloudStatus::Ready
+        );
+        assert_eq!(
+            normalize_status(Provider::DebridLink, "Downloading"),
+            CloudStatus::Downloading
+        );
+        assert_eq!(
+            normalize_status(Provider::DebridLink, "Paused"),
+            CloudStatus::Queued
+        );
+        // The status codes of AllDebrid and Debrid-Link become their words.
+        assert_eq!(alldebrid_status_word(4), "Ready");
+        assert_eq!(alldebrid_status_word(1), "Downloading");
+        assert_eq!(alldebrid_status_word(9), "Error");
+        assert_eq!(debridlink_torrent_status(Some(100)), "Finished");
+        assert_eq!(debridlink_torrent_status(Some(4)), "Downloading");
+    }
+
+    /// A refusal keeps the provider's own code and sentence.
+    #[test]
+    fn the_extra_providers_errors_keep_their_own_code() {
+        let api = Api::new(Provider::AllDebrid, "private-api-token".into()).unwrap();
+        let answer = serde_json::json!({
+            "status": "error",
+            "error": {"code": "MAGNET_INVALID_URI", "message": "Magnet is not valid."}
+        });
+        let err = api.provider_error(reqwest::StatusCode::BAD_REQUEST, Some(&answer));
+        assert_eq!(err.code.as_deref(), Some("MAGNET_INVALID_URI"));
+        assert!(err.to_string().contains("Magnet is not valid."));
+
+        let api = Api::new(Provider::Premiumize, "private-api-token".into()).unwrap();
+        let answer = serde_json::json!({
+            "status": "error",
+            "code": "rate_limit_reached",
+            "message": "Too many requests."
+        });
+        let err = api.provider_error(reqwest::StatusCode::TOO_MANY_REQUESTS, Some(&answer));
+        assert_eq!(err.code.as_deref(), Some("rate_limit_reached"));
+        assert!(err.to_string().contains("Too many requests."));
+
+        let api = Api::new(Provider::DebridLink, "private-api-token".into()).unwrap();
+        let answer = serde_json::json!({
+            "success": false,
+            "error": "unknowR",
+            "error_description": "Unknown API endpoint."
+        });
+        let err = api.provider_error(reqwest::StatusCode::NOT_FOUND, Some(&answer));
+        assert_eq!(err.code.as_deref(), Some("unknowR"));
+        assert!(err.to_string().contains("Unknown API endpoint."));
+    }
+
+    /// A provider that answers `200 OK` with a refusal is a refusal.
+    #[test]
+    fn a_provider_that_answers_with_an_error_body_is_a_refusal() {
+        let api = Api::new(Provider::Premiumize, "private-api-token".into()).unwrap();
+        let answer = serde_json::json!({
+            "status": "error",
+            "code": "authentication_failed",
+            "message": "Invalid token."
+        });
+        assert!(api.envelope_failed(&answer));
+        let answer = serde_json::json!({"status": "success", "id": "pm1"});
+        assert!(!api.envelope_failed(&answer));
+
+        let api = Api::new(Provider::DebridLink, "private-api-token".into()).unwrap();
+        assert!(api.envelope_failed(&serde_json::json!({
+            "success": false,
+            "error": "unknowR"
+        })));
+        assert!(!api.envelope_failed(&serde_json::json!({
+            "success": true,
+            "value": {}
+        })));
+
+        let api = Api::new(Provider::AllDebrid, "private-api-token".into()).unwrap();
+        assert!(api.envelope_failed(&serde_json::json!({
+            "status": "error",
+            "error": {"code": "X", "message": "y"}
+        })));
+        assert!(!api.envelope_failed(&serde_json::json!({
+            "status": "success",
+            "data": {}
+        })));
+    }
+
+    /// A task id can never change the request path.
+    #[test]
+    fn a_task_id_can_never_change_the_request_path() {
+        assert!(safe_id("rd123"));
+        assert!(safe_id("pm-123_4"));
+        assert!(!safe_id(""));
+        assert!(!safe_id("../delete"));
+        assert!(!safe_id("a/b"));
+        assert!(!safe_id("a?b"));
+        assert!(!safe_id("a#b"));
     }
 }

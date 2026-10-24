@@ -15,6 +15,7 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
   $("hideUI").disabled = !(res.downloadUI && res.downloadUI.supported);
   if (res.minSizeKB !== undefined) $("minSize").value = String(res.minSizeKB);
   if (typeof res.blockHosts === "string") $("block").value = res.blockHosts;
+  if (res.overlayStyle) $("overlayStyle").value = res.overlayStyle;
   if (res.fallbackError) {
     $("status").textContent = "Browser re-download failed: " + res.fallbackError;
   } else if (!res.hostOk) {
@@ -30,6 +31,18 @@ $("auto").onchange = () => {
 $("hideUI").onchange = () => {
   chrome.runtime.sendMessage({type:"setBrowserUI",value:$("hideUI").checked}, res => {
     $("status").textContent = res && res.ok ? "Browser download UI preference saved" : "This browser could not change its download UI.";
+  });
+};
+
+// Overlay style: the desktop app owns this setting, the popup writes the
+// extension's copy and pushes it to the app.
+$("overlayStyle").onchange = () => {
+  chrome.runtime.sendMessage({type:"setOverlayStyle", value:$("overlayStyle").value}, res => {
+    if (chrome.runtime.lastError || !res) {
+      $("status").textContent = "Extension background unreachable.";
+      return;
+    }
+    $("status").textContent = res.ok ? "Overlay style saved ✓" : ("Could not save the overlay style. " + (res.error || ""));
   });
 };
 
@@ -372,5 +385,15 @@ $("restoreVideoButtons").onclick = async () => {
     // Omit frameId so embedded Vimeo and other players receive it too.
     await api.tabs.sendMessage(tab.id,{type:"restoreVideoButtons"});
     $("status").textContent="Video download buttons restored.";
+  } catch(e) { $("status").textContent="Reload this page, then try again."; }
+};
+
+// The modern round overlay has no X button: dismiss it from here.
+$("hideOverlay").onclick = async () => {
+  try {
+    const [tab]=await api.tabs.query({active:true,currentWindow:true});
+    if(!tab || tab.id===undefined)throw new Error("No active page");
+    const res=await api.tabs.sendMessage(tab.id,{type:"hideOverlay"});
+    $("status").textContent=(res && res.ok)?"Overlay hidden on this page.":"Nothing to hide on this page.";
   } catch(e) { $("status").textContent="Reload this page, then try again."; }
 };
