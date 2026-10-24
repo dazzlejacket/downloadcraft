@@ -320,6 +320,10 @@ pub fn extension_directory(firefox: bool) -> Result<PathBuf, String> {
             for entry in std::fs::read_dir(from)? {
                 let entry = entry?;
                 let kind = entry.file_type()?;
+                let name = entry.file_name();
+                if !is_extension_build_file(&name.to_string_lossy()) {
+                    continue;
+                }
                 if kind.is_dir() {
                     copy_tree(&entry.path(), &to.join(entry.file_name()))?;
                 } else if kind.is_file() {
@@ -339,6 +343,20 @@ pub fn extension_directory(firefox: bool) -> Result<PathBuf, String> {
     } else {
         Err("Extension files were not included with this build; use the browser-extension folders from the download package".into())
     }
+}
+
+/// Is this name a file that belongs in the extension?
+///
+/// The tests, their fixtures, the docs and the Firefox build script are not
+/// part of the extension. `scripts/package_extensions.py` excludes exactly
+/// the same set, so the package the app writes and the package the script
+/// writes hold the same files and nothing else.
+pub fn is_extension_build_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".test.js") || lower.ends_with(".md") || lower.ends_with(".ps1") {
+        return false;
+    }
+    !matches!(lower.as_str(), "testdata" | "fixtures")
 }
 
 #[cfg(all(test, unix))]

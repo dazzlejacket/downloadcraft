@@ -209,6 +209,12 @@ fn add_tree(
         let name = path
             .strip_prefix(root)
             .map_err(|e| zip::result::ZipError::InvalidArchive(e.to_string().into()))?;
+        // The same exclusion set the staging copy and
+        // `scripts/package_extensions.py` use: a file left over from an
+        // earlier staging never reaches the package.
+        if !crate::platform::is_extension_build_file(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         if path.is_dir() {
             zip.add_directory(name.to_string_lossy().replace('\\', "/"), options)?;
             add_tree(zip, root, &path, options)?;

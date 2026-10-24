@@ -1,0 +1,44 @@
+{
+  "save_dir": "SENTINEL_SAVE_DIR",
+  "proxy_url": "SENTINEL_PROXY",
+  "user_agent": "SENTINEL_UA",
+  "theme": "light",
+  "max_concurrent": 3,
+  "connections_default": 8,
+  "max_retries": 5,
+  "timeout_secs": 60,
+  "speed_limit_kbps": 0,
+  "finish_action": "nothing",
+  "close_to_tray": true,
+  "show_complete": true,
+  "update_check_on": false,
+  "category_folders": true,
+  "rename_template": "{name}",
+  "folder_rules": [
+    {
+      "exts": "mp4,mkv,webm,mov,avi",
+      "folder": "Video"
+    },
+    {
+      "exts": "mp3,m4a,flac,ogg,wav",
+      "folder": "Music"
+    },
+    {
+      "exts": "png,jpg,jpeg,gif,webp,svg",
+      "folder": "Image"
+    },
+    {
+      "exts": "pdf,doc,docx,txt,epub",
+      "folder": "Document"
+    },
+    {
+      "exts": "zip,rar,7z,tar,gz",
+      "folder": "Compressed"
+    },
+    {
+      "exts": "exe,msi",
+      "folder": "Apps"
+    }
+  ],
+  "antivirus_cmd": "SENTINEL_AV_CMD"
+}
