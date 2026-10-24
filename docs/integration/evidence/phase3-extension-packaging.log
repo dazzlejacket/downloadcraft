@@ -1,0 +1,3 @@
+PASS: Chromium/Firefox exact script bytes, browser-specific manifests and fixture exclusion
+Version: 0.9.7.3
+Firefox XPI SHA-256: 5c75ed3382105676f17385d157043fc0284a98174efd67322ffaed011b5f02c8

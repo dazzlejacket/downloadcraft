@@ -1,0 +1,62 @@
+{
+  "browser": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "output": "C:\\Users\\grego\\Documents\\Codex Projects\\DownloadCraft\\upstream-baseline\\dist\\phase3-edge-smoke-1792712360438985900",
+  "sampleProbe": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_type": "video"
+      },
+      {
+        "codec_type": "audio"
+      }
+    ]
+  },
+  "scope": "isolated native extension detection; native messaging disabled",
+  "observation": {
+    "items": [],
+    "frames": [
+      {
+        "frameId": 0,
+        "labels": [
+          "Download this video",
+          "Download this audio"
+        ]
+      },
+      {
+        "frameId": 8,
+        "labels": [
+          "Download this video"
+        ]
+      }
+    ]
+  },
+  "checks": {
+    "directVideo": false,
+    "audio": false,
+    "embeddedVideo": false,
+    "hls": false,
+    "dash": false,
+    "falsePositivesExcluded": false,
+    "audioControl": true,
+    "videoControl": true
+  },
+  "passed": false,
+  "fixtureRequests": [
+    "/index.html",
+    "/frame.html",
+    "/requests.js",
+    "/sample.mp4",
+    "/sample.wav",
+    "/sample.m3u8?token=exact",
+    "/sample.mp4?frame=embedded",
+    "/sample.mpd",
+    "/binary",
+    "/fake.mp4",
+    "/denied.mp4",
+    "/sample.m3u8?token=exact",
+    "/sample.mpd",
+    "/favicon.ico"
+  ]
+}

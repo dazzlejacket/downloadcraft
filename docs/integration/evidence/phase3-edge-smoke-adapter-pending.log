@@ -1,0 +1,21 @@
+{
+  "browser": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "output": "C:\\Users\\grego\\Documents\\Codex Projects\\DownloadCraft\\upstream-baseline\\dist\\phase3-edge-smoke-1792712233807477200",
+  "sampleProbe": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_type": "video"
+      },
+      {
+        "codec_type": "audio"
+      }
+    ]
+  },
+  "scope": "isolated native extension detection; native messaging disabled",
+  "passed": false,
+  "error": "Command '['C:\\\\Users\\\\grego\\\\.cache\\\\codex-runtimes\\\\codex-primary-runtime\\\\dependencies\\\\node\\\\bin\\\\node.EXE', 'C:\\\\Users\\\\grego\\\\Documents\\\\Codex Projects\\\\DownloadCraft\\\\upstream-baseline\\\\scripts\\\\media_detection_cdp.js', '57695', 'pgdhmfgefjnfijmlheboncdmfhcnoikk']' returned non-zero exit status 1.",
+  "diagnostic": "Error: {\"exceptionId\":1,\"text\":\"Uncaught (in promise) Error: Extension smoke page remained pending: {\\\"ready\\\":\\\"complete\\\",\\\"resources\\\":[]}\",\"lineNumber\":0,\"columnNumber\":0,\"exception\":{\"type\":\"object\",\"subtype\":\"error\",\"className\":\"Error\",\"description\":\"Error: Extension smoke page remained pending: {\\\"ready\\\":\\\"complete\\\",\\\"resources\\\":[]}\\n    at tick (<anonymous>:6:51)\",\"objectId\":\"-682318872126304425.1.1\"}}\n",
+  "fixtureRequests": []
+}
