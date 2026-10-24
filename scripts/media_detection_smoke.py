@@ -142,7 +142,9 @@ document.body.dataset.step="complete";
             "hls":any("sample.m3u8?token=exact" in u for u in urls),
             "dash":any("sample.mpd" in u for u in urls),
             "falsePositivesExcluded":bool(items) and not any(bad in u for u in urls for bad in ["/binary", "/fake.mp4", "/denied.mp4"]),
-            "audioControl":"Download this audio" in labels,
+            # The audio control says what it does: it downloads the audio
+            # of the page, not one named element.
+            "audioControl":"Download audio from this page" in labels,
             "videoControl":"Download this video" in labels,
             "dynamicAudioControl":"revision=2" in observation.get("dynamicKey", ""),
         }
