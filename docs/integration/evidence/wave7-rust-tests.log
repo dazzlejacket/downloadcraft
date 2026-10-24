@@ -1,0 +1,1376 @@
+﻿cargo : warning: download_craft@0.9.8: windows resources not embedded: windres.exe not found (set the WINDRES env var)
+At line:8 char:1
++ cargo test --locked --release *>&1 | Out-File -FilePath 'C:\Users\gre ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: downlo...INDRES env var):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+   Compiling download_craft v0.9.8 (C:\Users\grego\Documents\Codex Projects\DownloadCraft\integration-098)
+warning: irrefutable `if let` pattern
+    --> src\engine.rs:8530:24
+     |
+8530 |                     if let (t, _, _, _) = probe(client, opts, url).await {
+     |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+     = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\app.rs:783:27
+    |
+783 |         egui::Stroke::new(1.2, if hov || checked { pl().txt } else { pl().dim }),
+    |                           ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\app.rs:790:31
+    |
+790 |             egui::Stroke::new(1.8, egui::Color32::WHITE),
+    |                               ^^^ help: explicitly specify the type as `f32`: `1.8_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\app.rs:794:31
+    |
+794 |             egui::Stroke::new(1.8, egui::Color32::WHITE),
+    |                               ^^^ help: explicitly specify the type as `f32`: `1.8_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\app.rs:992:31
+    |
+992 |             egui::Stroke::new(1.0, pl().modal_bd),
+    |                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:1053:31
+     |
+1053 |             egui::Stroke::new(1.0, mix(pal.modal_bg, pal.modal_bd, 0.6)),
+     |                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:1248:27
+     |
+1248 |         egui::Stroke::new(1.0, pl().modal_bd),
+     |                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:1273:31
+     |
+1273 |             egui::Stroke::new(1.0, pl().modal_bd),
+     |                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:1313:17
+     |
+1313 |                 1.0,
+     |                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:1320:61
+     |
+1320 |             v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, pl().primary);
+     |                                                             ^^^ help: explicitly specify the type as `f32`: 
+`1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:1321:60
+     |
+1321 |             v.widgets.active.bg_stroke = egui::Stroke::new(1.0, pl().primary);
+     |                                                            ^^^ help: explicitly specify the type as `f32`: 
+`1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:1346:31
+     |
+1346 |             egui::Stroke::new(1.0, pl().modal_bd),
+     |                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:1372:27
+     |
+1372 |         egui::Stroke::new(1.0, color),
+     |                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:6287:71
+     |
+6287 |                 p.vline(x, (cy - 9.0)..=(cy + 9.0), egui::Stroke::new(1.0, pl().card_bd));
+     |                                                                       ^^^ help: explicitly specify the type as 
+`f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:6431:43
+     |
+6431 |                         egui::Stroke::new(3.0, wash(pl().primary, 34)),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `3.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:6440:25
+     |
+6440 |                         1.0,
+     |                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:7337:43
+     |
+7337 |                         egui::Stroke::new(1.0, pl().dm_line),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:7354:43
+     |
+7354 |                         egui::Stroke::new(1.0, pl().dm_line),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:7575:51
+     |
+7575 | ...                   egui::Stroke::new(1.0, pl().dm_box_bd),
+     |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:7682:63
+     |
+7682 | ...                   .stroke(egui::Stroke::new(1.0, pl().dm_line))
+     |                                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:8108:47
+     |
+8108 | ...                   egui::Stroke::new(1.0, pl().modal_bd),
+     |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:8234:51
+     |
+8234 | ...                   egui::Stroke::new(1.0, pl().modal_bd),
+     |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:8320:63
+     |
+8320 | ...                   egui::Stroke::new(1.0, soft),
+     |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:8334:71
+     |
+8334 | ...                   egui::Stroke::new(1.0, soft),
+     |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:8679:51
+     |
+8679 | ...                   egui::Stroke::new(1.0, pl().modal_bd),
+     |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:8955:43
+     |
+8955 |                         egui::Stroke::new(1.0, p.modal_bd),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:8961:43
+     |
+8961 |                         egui::Stroke::new(1.0, wash(accent, 110)),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:8969:43
+     |
+8969 |                         egui::Stroke::new(1.0, soft),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:9006:43
+     |
+9006 |                         egui::Stroke::new(1.0, wash(accent, 72)),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:9033:43
+     |
+9033 |                         egui::Stroke::new(1.0, wash(green, 64)),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:9044:76
+     |
+9044 |                     pf.hline(bx..=card.right() - pad, y, egui::Stroke::new(1.0, soft));
+     |                                                                            ^^^ help: explicitly specify the 
+type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:9058:43
+     |
+9058 |                         egui::Stroke::new(1.0, soft),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\app.rs:9118:43
+     |
+9118 |                         egui::Stroke::new(1.0, soft),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\complete.rs:121:31
+    |
+121 |             egui::Stroke::new(1.0, pl().cg_bd),
+    |                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\complete.rs:222:35
+    |
+222 |                 egui::Stroke::new(1.0, pl().cg_btn_bd),
+    |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\complete.rs:250:51
+    |
+250 |         p.circle_stroke(c, 5.5, egui::Stroke::new(1.3, DM_ACC));
+    |                                                   ^^^ help: explicitly specify the type as `f32`: `1.3_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\complete.rs:325:27
+    |
+325 |         egui::Stroke::new(1.0, pl().cg_box_bd),
+    |                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\complete.rs:346:27
+    |
+346 |         egui::Stroke::new(1.0, if hov { pl().cg_ctl } else { pl().cg_btn_bd }),
+    |                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\confirm.rs:287:32
+    |
+287 |     let st = egui::Stroke::new(2.0, egui::Color32::WHITE);
+    |                                ^^^ help: explicitly specify the type as `f32`: `2.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\confirm.rs:1078:35
+     |
+1078 |                 egui::Stroke::new(1.0, pl().dm_line),
+     |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\confirm.rs:1095:35
+     |
+1095 |                 egui::Stroke::new(1.0, pl().dm_line),
+     |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+  --> src\dm.rs:62:27
+   |
+62 |         egui::Stroke::new(1.0, pl().dm_box_bd),
+   |                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+   |
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+   = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\dm.rs:446:27
+    |
+446 |         egui::Stroke::new(1.0, pl().dm_box_bd),
+    |                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\dm.rs:477:27
+    |
+477 |         egui::Stroke::new(1.0, pl().dm_box_bd),
+    |                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\dm.rs:608:31
+    |
+608 |             egui::Stroke::new(1.0, pl().dm_box_bd),
+    |                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for 
+consistency
+    --> src\engine.rs:1046:7
+     |
+1046 |     a.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(n)))
+     |       ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1046 -     a.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(n)))
+1046 +     a.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(n)))
+     |
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\progress.rs:659:31
+    |
+659 |             egui::Stroke::new(1.0, pl().dm_line),
+    |                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\progress.rs:1263:31
+     |
+1263 |             egui::Stroke::new(1.0, pl().dm_line),
+     |                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\progress.rs:1474:31
+     |
+1474 |             egui::Stroke::new(1.0, pl().dm_line),
+     |                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\progress.rs:1552:39
+     |
+1552 |                     egui::Stroke::new(1.0, pl().dm_trough),
+     |                                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\settings.rs:659:67
+    |
+659 |                 p.vline(rail.right(), rail.y_range(), Stroke::new(1.0, t.border));
+    |                                                                   ^^^ help: explicitly specify the type as 
+`f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\settings.rs:660:65
+    |
+660 |                 p.hline(full.x_range(), foot.top(), Stroke::new(1.0, t.border));
+    |                                                                 ^^^ help: explicitly specify the type as `f32`: 
+`1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\settings.rs:885:21
+    |
+885 |         Stroke::new(1.0, bd),
+    |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\settings.rs:902:21
+    |
+902 |         Stroke::new(1.0, t.btn_bd),
+    |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\settings.rs:938:25
+    |
+938 |             Stroke::new(1.0, t.btn_bd),
+    |                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\settings.rs:960:29
+    |
+960 |         .stroke(Stroke::new(1.0, t.border))
+    |                             ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> src\settings.rs:980:25
+    |
+980 |             Stroke::new(1.0, t.accent),
+    |                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1029:21
+     |
+1029 |         Stroke::new(1.5, border),
+     |                     ^^^ help: explicitly specify the type as `f32`: `1.5_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1035:32
+     |
+1035 |         let tick = Stroke::new(1.8, Color32::WHITE);
+     |                                ^^^ help: explicitly specify the type as `f32`: `1.8_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1237:13
+     |
+1237 |             1.0,
+     |             ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1249:46
+     |
+1249 |         p.rect_stroke(rect, 8.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+     |                                              ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1269:42
+     |
+1269 |     p.rect_stroke(prev, 5.0, Stroke::new(1.0, t.border), StrokeKind::Inside);
+     |                                          ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1273:29
+     |
+1273 |         let s = Stroke::new(1.6, Color32::WHITE);
+     |                             ^^^ help: explicitly specify the type as `f32`: `1.6_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1364:29
+     |
+1364 |         .stroke(Stroke::new(1.0, t.border))
+     |                             ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1407:33
+     |
+1407 |                     Stroke::new(1.0, t.border),
+     |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1427:33
+     |
+1427 |                     Stroke::new(1.0, soft_line(&t)),
+     |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1484:25
+     |
+1484 |             Stroke::new(1.0, t.border),
+     |                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1527:29
+     |
+1527 |         .stroke(Stroke::new(1.0, t.border))
+     |                             ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1553:25
+     |
+1553 |             Stroke::new(1.0, t.accent),
+     |                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1610:44
+     |
+1610 |     p.circle_stroke(knob, 7.0, Stroke::new(2.0, t.card));
+     |                                            ^^^ help: explicitly specify the type as `f32`: `2.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1653:21
+     |
+1653 |         Stroke::new(1.0, t.border),
+     |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1716:21
+     |
+1716 |         Stroke::new(1.0, if hov { t.accent } else { t.btn_bd }),
+     |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1864:55
+     |
+1864 |                 dashed_rect(p, tile, 8.0, Stroke::new(1.0, t.btn_bd));
+     |                                                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:1976:36
+     |
+1976 |             let tick = Stroke::new(1.4, green);
+     |                                    ^^^ help: explicitly specify the type as `f32`: `1.4_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:2029:21
+     |
+2029 |         Stroke::new(1.0, t.border),
+     |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:2060:39
+     |
+2060 |     p.rect(rect, 6.0, bg, Stroke::new(1.0, bd), StrokeKind::Inside);
+     |                                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:2091:21
+     |
+2091 |         Stroke::new(1.0, t.btn_bd),
+     |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:2147:21
+     |
+2147 |         Stroke::new(1.0, t.border),
+     |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:2188:29
+     |
+2188 |         .stroke(Stroke::new(1.0, if selected { t.accent } else { t.border }))
+     |                             ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:2207:33
+     |
+2207 |                     Stroke::new(1.4, if selected { t.accent } else { t.btn_bd }),
+     |                                 ^^^ help: explicitly specify the type as `f32`: `1.4_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:2704:33
+     |
+2704 |             .stroke(Stroke::new(1.0, edge))
+     |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:2732:33
+     |
+2732 |                     Stroke::new(1.0, blend(t.card, t.border, 0.6)),
+     |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:3019:33
+     |
+3019 |             .stroke(Stroke::new(1.0, edge))
+     |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\settings.rs:3046:33
+     |
+3046 |                     Stroke::new(1.0, blend(t.card, t.border, 0.6)),
+     |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: value assigned to `last_segmented` is never read
+    --> src\engine.rs:4708:30
+     |
+4708 |     let mut last_segmented = false;
+     |                              ^^^^^ this value is reassigned later and never used
+...
+4720 |         last_segmented = use_segmented;
+     |         ------------------------------ `last_segmented` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src\engine.rs:4853:9
+     |
+4853 |     let mut paths: Vec<_> = std::env::var_os("PATH").map(|v| 
+std::env::split_paths(&v).collect()).unwrap_or_default();
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\grabber.rs:105:9
+    |
+105 |     let mut push = |url: String, out: &mut Vec<GrabLink>, seen: &mut std::collections::HashSet<String>| {
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused variable: `action`
+   --> src\platform.rs:109:14
+    |
+109 | pub fn power(action: &str) -> Result<(), String> {
+    |              ^^^^^^ help: if this is intentional, prefix it with an underscore: `_action`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `header_bg`, `secondary`, and `bar_bd` are never read
+  --> src\app.rs:40:9
+   |
+32 | pub struct Palette {
+   |            ------- fields in this struct
+...
+40 |     pub header_bg: egui::Color32,
+   |         ^^^^^^^^^
+...
+46 |     pub secondary: egui::Color32,
+   |         ^^^^^^^^^
+...
+66 |     pub bar_bd: egui::Color32,
+   |         ^^^^^^
+   |
+   = note: `Palette` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code 
+analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `rule_ext_key` is never used
+   --> src\app.rs:581:4
+    |
+581 | fn rule_ext_key(i: usize) -> &'static str {
+    |    ^^^^^^^^^^^^
+
+warning: function `rule_dir_key` is never used
+   --> src\app.rs:588:4
+    |
+588 | fn rule_dir_key(i: usize) -> &'static str {
+    |    ^^^^^^^^^^^^
+
+warning: function `win_start_key` is never used
+   --> src\app.rs:595:4
+    |
+595 | fn win_start_key(i: usize) -> &'static str {
+    |    ^^^^^^^^^^^^^
+
+warning: function `win_end_key` is never used
+   --> src\app.rs:602:4
+    |
+602 | fn win_end_key(i: usize) -> &'static str {
+    |    ^^^^^^^^^^^
+
+warning: function `win_lim_key` is never used
+   --> src\app.rs:609:4
+    |
+609 | fn win_lim_key(i: usize) -> &'static str {
+    |    ^^^^^^^^^^^
+
+warning: function `icon_btn` is never used
+   --> src\app.rs:728:4
+    |
+728 | fn icon_btn(ui: &mut egui::Ui, glyph: &str, tip: &str) -> egui::Response {
+    |    ^^^^^^^^
+
+warning: multiple variants are never constructed
+   --> src\app.rs:813:5
+    |
+801 | enum ButtonId {
+    |      -------- variants in this enum
+...
+813 |     SFolder,
+    |     ^^^^^^^
+814 |     SChrome,
+    |     ^^^^^^^
+815 |     SEdge,
+    |     ^^^^^
+816 |     SFirefox,
+    |     ^^^^^^^^
+817 |     SBrave,
+    |     ^^^^^^
+818 |     SOpera,
+    |     ^^^^^^
+819 |     SClose,
+    |     ^^^^^^
+...
+828 |     ThemeSystem,
+    |     ^^^^^^^^^^^
+829 |     ThemeDark,
+    |     ^^^^^^^^^
+830 |     ThemeLight,
+    |     ^^^^^^^^^^
+...
+850 |     RuleAdd,
+    |     ^^^^^^^
+851 |     RuleDel(usize),
+    |     ^^^^^^^
+852 |     RuleUp(usize),
+    |     ^^^^^^
+853 |     RuleDown(usize),
+    |     ^^^^^^^^
+854 |     RuleReset,
+    |     ^^^^^^^^^
+855 |     WinAdd,
+    |     ^^^^^^
+856 |     WinDel(usize),
+    |     ^^^^^^
+    |
+    = note: `ButtonId` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored 
+during dead code analysis
+
+warning: variants `CatFold`, `Tray`, `Unlimited`, `WinOn`, and `UpdOn` are never constructed
+   --> src\app.rs:918:5
+    |
+917 | enum CheckId {
+    |      ------- variants in this enum
+918 |     CatFold,
+    |     ^^^^^^^
+919 |     Tray,
+    |     ^^^^
+920 |     Unlimited,
+    |     ^^^^^^^^^
+...
+924 |     WinOn,
+    |     ^^^^^
+925 |     UpdOn,
+    |     ^^^^^
+    |
+    = note: `CheckId` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during 
+dead code analysis
+
+warning: variants `LimitKB`, `Timeout`, `Retries`, and `DefConns` are never constructed
+   --> src\app.rs:953:5
+    |
+951 | enum SliderId {
+    |      -------- variants in this enum
+952 |     AddConns,
+953 |     LimitKB,
+    |     ^^^^^^^
+954 |     Timeout,
+    |     ^^^^^^^
+955 |     Retries,
+    |     ^^^^^^^
+956 |     DefConns,
+    |     ^^^^^^^^
+    |
+    = note: `SliderId` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored 
+during dead code analysis
+
+warning: fields `id`, `min`, `max`, `log`, `x0`, and `tw` are never read
+   --> src\app.rs:962:5
+    |
+961 | struct SliderCap {
+    |        --------- fields in this struct
+962 |     id: SliderId,
+    |     ^^
+963 |     min: f64,
+    |     ^^^
+964 |     max: f64,
+    |     ^^^
+965 |     log: bool,
+    |     ^^^
+966 |     x0: f32,
+    |     ^^
+967 |     tw: f32,
+    |     ^^
+
+warning: function `micon` is never used
+    --> src\app.rs:1435:4
+     |
+1435 | fn micon(ui: &mut egui::Ui, man: &ManState, glyph: &str) -> egui::Rect {
+     |    ^^^^^
+
+warning: function `status_bar_w` is never used
+    --> src\app.rs:1782:4
+     |
+1782 | fn status_bar_w(ui: &mut egui::Ui, w: f32, frac: f32, c0: egui::Color32, c1: egui::Color32) {
+     |    ^^^^^^^^^^^^
+
+warning: fields `diag_lines`, `diag_last`, `diag_std_hover`, and `diag_std_click` are never read
+    --> src\app.rs:2222:5
+     |
+2058 | pub struct CraftApp {
+     |            -------- fields in this struct
+...
+2222 |     diag_lines: Vec<String>,
+     |     ^^^^^^^^^^
+2223 |     diag_last: Instant,
+     |     ^^^^^^^^^
+2224 |     diag_acts: u64,
+2225 |     diag_std_hover: u64,
+     |     ^^^^^^^^^^^^^^
+2226 |     diag_std_click: u64,
+     |     ^^^^^^^^^^^^^^
+
+warning: method `speed_window_status` is never used
+    --> src\app.rs:4194:8
+     |
+2274 | impl CraftApp {
+     | ------------- method in this implementation
+...
+4194 |     fn speed_window_status(&self) -> String {
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: field `custom_ok` is never read
+    --> src\engine.rs:5479:9
+     |
+5464 | pub struct YtdlpInfo {
+     |            --------- field in this struct
+...
+5479 |     pub custom_ok: bool,
+     |         ^^^^^^^^^
+     |
+     = note: `YtdlpInfo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored 
+during dead code analysis
+
+warning: function `open` is never used
+  --> src\platform.rs:85:8
+   |
+85 | pub fn open(path: &Path, reveal: bool) {
+   |        ^^^^
+
+warning: function `power` is never used
+   --> src\platform.rs:109:8
+    |
+109 | pub fn power(action: &str) -> Result<(), String> {
+    |        ^^^^^
+
+warning: function `native_host_directory` is never used
+   --> src\platform.rs:149:8
+    |
+149 | pub fn native_host_directory(browser: &str) -> Result<PathBuf, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `install_native_host` is never used
+   --> src\platform.rs:205:8
+    |
+205 | pub fn install_native_host(browser: &str) -> Result<String, String> {
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `managed_ffmpeg_path` is never used
+ --> src\helpers.rs:6:8
+  |
+6 | pub fn managed_ffmpeg_path() -> Option<PathBuf> {
+  |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `managed_pair_path` is never used
+ --> src\helpers.rs:9:4
+  |
+9 | fn managed_pair_path(base: &Path) -> PathBuf {
+  |    ^^^^^^^^^^^^^^^^^
+
+warning: `download_craft` (bin "download_craft" test) generated 110 warnings (run `cargo fix --bin "download_craft" -p 
+download_craft --tests` to apply 86 suggestions)
+    Finished `release` profile [optimized] target(s) in 16.99s
+     Running unittests src\main.rs (target\release\deps\download_craft-1a8233328be4bd18.exe)
+
+running 228 tests
+test aes128::tests::zero_vector ... ok
+test aes128::tests::fips197_appendix_b ... ok
+test app::audit_completion_tests::column_dividers_follow_the_pointer ... ok
+test app::cloud_queue_tests::the_table_keeps_its_name_column ... ok
+test app::audit_completion_tests::validation_failure_never_becomes_completed_from_full_byte_count ... ok
+test app::cloud_queue_tests::a_cloud_row_keeps_the_provider_connection_limit ... ok
+test app::cloud_queue_tests::a_column_can_be_hidden_and_shown_again ... ok
+test aes128::tests::nist_sp800_38a_f21_cbc ... ok
+test archive::tests::a_joined_path_can_never_leave_the_destination ... ok
+test archive::tests::a_traversing_name_is_refused ... ok
+test archive::tests::an_ordinary_name_is_accepted ... ok
+test archive::tests::archive_names_are_recognised ... ok
+test archive::tests::multipart_names_are_recognised_by_their_base_name ... ok
+test archive::tests::safe_relative_refuses_windows_device_names ... ok
+test debrid::tests::a_file_tree_is_flattened_into_the_files_it_holds ... ok
+test debrid::tests::a_limits_summary_follows_the_capability_flags ... ok
+test debrid::tests::a_provider_key_is_a_closed_set ... ok
+test debrid::tests::a_provider_stated_expiry_wins_over_the_default_lifetime ... ok
+test debrid::tests::a_task_id_can_never_change_the_request_path ... ok
+test debrid::tests::a_token_is_never_read_under_another_provider ... ok
+test archive::tests::a_single_entry_that_is_too_big_is_refused ... ok
+test debrid::tests::a_premiumize_host_link_with_a_password_is_queued ... ok
+test debrid::tests::a_debridlink_folder_link_keeps_every_file ... ok
+test debrid::tests::a_status_refresh_bypasses_the_provider_cache ... ok
+test archive::tests::a_windows_device_name_is_refused ... ok
+test debrid::tests::a_debridlink_host_link_is_polled_and_can_be_deleted ... ok
+test debrid::tests::a_debridlink_session_tells_the_provider_what_to_skip ... ok
+test debrid::tests::a_cloud_session_can_be_cancelled_at_the_provider ... ok
+test debrid::tests::a_torbox_torrent_session_reads_its_own_list ... ok
+test debrid::tests::a_torrent_session_runs_from_magnet_to_queue_targets ... ok
+test debrid::tests::a_link_carries_its_expiry_to_the_queue ... ok
+test debrid::tests::cloud_status_is_normalized_across_providers ... ok
+test debrid::tests::every_missing_capability_carries_a_reason ... ok
+test archive::tests::too_many_entries_are_refused ... ok
+test archive::tests::a_zip_that_tries_to_escape_is_refused ... ok
+test archive::tests::a_rar5_fixture_is_unpacked ... ok
+test debrid::tests::a_hosting_session_resolves_without_a_provider_task ... ok
+test archive::tests::a_seven_zip_fixture_is_unpacked ... ok
+test debrid::tests::a_provider_that_answers_with_an_error_body_is_a_refusal ... ok
+test archive::tests::a_rar4_fixture_is_unpacked ... ok
+test archive::tests::the_concat_reader_reads_several_files_as_one_stream ... ok
+test debrid::tests::a_refused_submission_names_the_provider_code ... ok
+test debrid::tests::capabilities_state_what_each_provider_can_do ... ok
+test debrid::tests::cache_states_cover_cached_uncached_partial_and_unknown ... ok
+test debrid::tests::links_follow_selected_files_only ... ok
+test archive::tests::an_extraction_can_be_stopped ... ok
+test debrid::tests::file_selection_follows_what_the_provider_offers ... ok
+test debrid::tests::cloud_magnets_are_submitted_to_each_provider_without_local_swarm_code ... ok
+test debrid::tests::cache_checks_refuse_a_hash_that_is_not_hex ... ok
+test debrid::tests::switching_back_finds_the_token_where_it_was_left ... ok
+test archive::tests::a_zip_fixture_is_unpacked ... ok
+test debrid::tests::provider_errors_carry_their_own_code ... ok
+test debrid::tests::submitted_magnets_and_hosting_links_are_trimmed ... ok
+test debrid::tests::generated_downloads_reject_token_leaks_and_plaintext_links ... ok
+test debrid::tests::premiumize_reads_its_transfer_and_its_files ... ok
+test debrid::tests::the_extra_providers_statuses_are_normalized ... ok
+test debrid::tests::the_token_store_has_no_written_form ... ok
+test debrid::tests::submitted_values_reach_the_provider_without_whitespace ... ok
+test debrid::tests::torbox_list_can_be_an_object_or_array ... ok
+test debrid::tests::each_provider_submits_a_magnet_to_its_own_endpoint ... ok
+test drive::tests::a_relative_action_is_resolved ... ok
+test debrid::tests::an_account_is_validated_before_anything_is_submitted ... ok
+test drive::tests::an_interstitial_is_told_apart_from_a_real_page ... ok
+test drive::tests::drive_hosts_are_recognised ... ok
+test drive::tests::the_download_url_carries_the_id ... ok
+test drive::tests::the_file_id_is_read_from_the_url ... ok
+test drive::tests::the_token_is_read_from_the_page_and_never_invented ... ok
+test drive::tests::the_interstitial_form_is_read ... ok
+test archive::tests::a_file_that_is_already_there_is_kept ... ok
+test drive::tests::two_different_ids_stay_two_different_files ... ok
+test debrid::tests::jobs_can_be_deleted_at_the_provider ... ok
+test debrid::tests::provider_failures_report_the_provider_code ... ok
+test dupcheck::tests::a_stable_query_parameter_survives_and_keeps_two_ids_apart ... ok
+test dupcheck::tests::identical_urls_are_the_same_resource ... ok
+test dupcheck::tests::rotating_signature_parameters_do_not_hide_the_same_file ... ok
+test archive::tests::an_encrypted_archive_asks_for_its_password ... ok
+test confirm::audit_inbox_tests::claiming_a_capture_returns_private_cookies_and_preserves_other_entries ... ok
+test debrid::tests::cache_checks_use_the_documented_provider_endpoints ... ok
+test dupcheck::tests::the_exact_url_wins_over_a_weaker_match ... ok
+test dupcheck::tests::unrelated_files_in_the_same_folder_do_not_match ... ok
+test dupcheck::tests::the_same_object_signed_differently_matches_by_destination ... ok
+test engine::platform_helper_tests::helper_status_and_download_selection_use_the_same_precedence ... ok
+test engine::platform_helper_tests::supported_runtime_versions_are_not_just_executable_names ... ok
+test engine::tests::a_decoded_picture_is_not_a_video ... ok
+test engine::tests::adaptive_pair_selection ... ok
+test dupcheck::tests::a_running_transfer_is_reported_as_active ... ok
+test debrid::tests::a_wrong_token_is_refused_before_any_torrent_is_submitted ... ok
+test engine::audit_cookie_tests::audit_concurrent_cookie_jars_are_independent_and_private ... ok
+test dupcheck::tests::a_generic_path_with_a_stable_parameter_keeps_its_identity ... ok
+test dupcheck::tests::a_generic_path_without_a_stable_parameter_identifies_nothing ... ok
+test engine::tests::aes_roundtrip ... ok
+test archive::tests::an_archive_that_expands_too_far_is_refused ... ok
+test debrid::tests::direct_links_carry_their_lifetime_and_can_be_refreshed ... ok
+test engine::tests::completed_duration_checks_allow_short_and_silent_sources ... ok
+test engine::tests::cloudflare_markers_and_naming_rules ... ok
+test engine::tests::content_range_is_parsed_strictly ... ok
+test engine::tests::dash_timeline ... ok
+test engine::tests::dash_helpers ... ok
+test dupcheck::tests::a_failed_row_never_blocks_a_new_capture ... ok
+test debrid::tests::resolved_cloud_targets_can_go_into_the_queue ... ok
+test debrid::tests::alldebrid_says_with_the_submission_whether_the_torrent_is_ready ... ok
+test debrid::tests::the_backoff_honours_retry_after_but_stays_bounded ... ok
+test debrid::tests::a_session_never_resolves_without_a_selection ... ok
+test debrid::tests::providers_without_a_cache_query_say_why ... ok
+test engine::tests::fb_slice_normalize ... ok
+test engine::tests::fragment_downloads_do_not_snowball_or_drift ... ok
+test engine::tests::general_fragments_need_a_complete_source ... ok
+test engine::tests::generic_fixture ... ok
+test engine::tests::dispositions ... ok
+test engine::tests::google_split_sizing ... ok
+test engine::tests::generic_hls_separate_audio_is_detected_from_manifest_evidence ... ok
+test engine::tests::hostile_pages_never_panic ... ok
+test debrid::tests::hosting_links_follow_each_providers_own_flow ... ok
+test engine::tests::captured_headers_stay_on_their_site ... ok
+test engine::tests::halve_schedule ... ok
+test debrid::tests::torrent_metadata_upload_uses_raw_put_or_multipart_as_documented ... ok
+test engine::tests::merged_progress_sizes_add_up_across_legs ... ok
+test engine::tests::meta_orders ... ok
+test engine::tests::opaque_manifests_are_recognized_by_content ... ok
+test engine::tests::sanitize_names ... ok
+test engine::tests::seg_fallback_table ... ok
+test debrid::tests::hosting_jobs_use_their_own_control_endpoint ... ok
+test engine::tests::social_captions_name_the_file ... ok
+test debrid::tests::torrent_metadata_is_uploaded_only_where_the_api_takes_it ... ok
+test engine::tests::resume_metadata_is_removed_only_for_completed_files ... ok
+test debrid::tests::rate_limited_requests_are_retried_with_a_backoff ... ok
+test engine::tests::unwraps_player_wrapper_urls ... ok
+test engine::tests::quality_selection ... ok
+test debrid::tests::hosting_flows_preserve_mega_keys_and_use_correct_provider_endpoints ... ok
+test engine::tests::validator_reads_only_strong_etags ... ok
+test engine::tests::vimeo_fragment_without_player_fails_before_transfer ... ok
+test debrid::tests::accounts_are_read_from_each_providers_own_endpoint ... ok
+test engine::tests::vimeo_finished_file_must_have_an_audio_track ... ok
+test engine::tests::vimeo_format_selection_requires_audio ... ok
+test debrid::tests::the_extra_providers_delete_their_own_tasks ... ok
+test engine::tests::vimeo_manifests_bypass_video_only_hls_concat ... ok
+test engine::tests::youtube_fixture ... ok
+test engine::tests::ytdlp_progress_lines_are_read ... ok
+test engine::tests::ytdlp_stage_lines ... ok
+test extension::tests::the_install_steps_name_the_folder_and_the_browser ... ok
+test engine::tests::zip_entry_reads_a_release_archive ... ok
+test extension::tests::the_steps_never_claim_a_web_store_listing ... ok
+test ftp::tests::url_parts_are_percent_decoded ... ok
+test engine::tests::helper_versions_compare_as_release_numbers ... ok
+test debrid::tests::the_extra_providers_errors_keep_their_own_code ... ok
+test engine::tests::hls_helpers ... ok
+test grabber::tests::extract_filters_and_resolves ... ok
+test engine::tests::youtube_cipher_fixtures ... ok
+test debrid::tests::cache_states_are_read_from_the_provider_answer ... ok
+test links::tests::dividers_follow_the_pointer_and_name_pages ... ok
+test links::tests::host_and_folder_for_the_from_column ... ok
+test helpers::tests::checksum_rejects_corrupt_download ... ok
+test engine::tests::social_pages_are_used_for_audio_merges ... ok
+test links::tests::links_file_must_come_from_the_config_dir ... ok
+test links::tests::page_cookies_stay_on_the_page_host ... ok
+test engine::tests::live_helpers ... ok
+test engine::tests::invalid_content_range_is_refused ... ok
+test links::tests::types_come_from_content_type_then_name ... ok
+test grabber::tests::page_links_same_host_only ... ok
+test helpers::tests::both_tools_have_pinned_downloads_for_this_platform ... ok
+test engine::tests::vimeo_range_captures_are_not_full_files ... ok
+test engine::tests::limiter_and_checksum ... ok
+test model::tests::a_magnet_is_never_a_download_url ... ok
+test model::preference_merge_tests::main_window_save_keeps_helper_locations ... ok
+test model::tests::a_captured_user_agent_survives_the_queue ... ok
+test model::tests::byte_formats ... ok
+test model::tests::a_magnet_is_told_apart_from_a_url ... ok
+test model::tests::categories ... ok
+test model::tests::mime_naming_matrix ... ok
+test model::tests::p5_overrides_and_compat ... ok
+test model::tests::folder_rules_and_templates ... ok
+test model::tests::queue_start_times ... ok
+test model::tests::relative_shapes ... ok
+test model::tests::update_asset_pick ... ok
+test model::tests::url_checks ... ok
+test archive::tests::the_right_password_opens_an_encrypted_archive ... ok
+test archive::tests::a_multipart_rar_is_unpacked_from_its_first_part ... ok
+test model::tests::sha256_helpers ... ok
+test native_host::media_tests::browser_user_agent_survives_the_capture ... ok
+test debrid::tests::rate_limited_requests_give_up_after_a_bounded_number_of_retries ... ok
+test engine::tests::resume_binds_strong_etag_and_sends_if_range ... ok
+test engine::tests::resume_meta_binding ... ok
+test native_host::media_tests::captured_headers_keep_only_replayable_tokens ... ok
+test native_host::media_tests::a_browser_path_must_sit_inside_a_download_folder ... ok
+test native_host::media_tests::player_expectations_survive_browser_and_inbox_formats ... ok
+test model::tests::windows_and_versions ... ok
+test native_host::media_tests::page_links_keep_only_unique_web_urls ... ok
+test engine::tests::last_modified_is_used_when_no_etag_is_offered ... ok
+test progress::tests::the_speed_graph_is_scaled_to_its_own_samples ... ok
+test settings::settings_file_tests::the_settings_file_has_no_place_for_a_credential ... ok
+test progress::tests::an_empty_or_flat_speed_graph_is_safe ... ok
+test native_host::media_tests::the_links_batch_never_carries_the_cookie ... ok
+test shaped::tests::only_text_that_needs_it_takes_the_shaped_path ... ok
+test model::tests::dead_entries_do_not_block_requeue ... ok
+test model::tests::dest_clash_refresh ... ok
+test settings::settings_file_tests::what_is_written_is_what_is_read_back ... ok
+test engine::tests::old_sidecar_without_validator_field_still_loads ... ok
+test shaped::tests::glyphs_are_drawn_at_the_size_their_advances_assume ... ok
+test window::tests::the_first_dialog_of_a_cascade_may_take_the_focus ... ok
+test shaped::tests::width_is_positive_and_cache_is_keyed_by_size ... ok
+test shaped::tests::shaping_reorders_the_e_matra ... ok
+test shaped::tests::shaping_forms_conjuncts ... ok
+test window::tests::a_dialog_never_leaves_the_work_area ... ok
+test shaped::tests::a_path_with_a_bengali_name_draws_both_scripts ... ok
+test model::tests::corrupt_queue_is_never_wiped ... ok
+test engine::tests::legacy_partial_without_validator_is_verified_by_overlap ... ok
+test window::tests::the_cascade_steps_down_and_to_the_right ... ok
+test model::tests::dead_row_is_refreshed_not_blocked ... ok
+test model::tests::queue_read_tolerates_bom_and_flags_corruption ... ok
+test engine::tests::changed_resource_restarts_instead_of_appending ... ok
+test model::tests::bom_queue_rows_survive_append ... ok
+test model::tests::other_quality_of_one_page_is_its_own_download ... ok
+test shaped::tests::emoji_render_as_ink_without_a_selector_box ... ok
+test shaped::tests::mixed_scripts_pick_a_font_per_run ... ok
+test engine::tests::wrong_validator_in_partial_is_refused ... ok
+test engine::tests::cloudflare_challenge_fails_and_extensionless_target_is_named ... ok
+test model::tests::removed_ids_are_never_reused ... ok
+test engine::tests::segmented_parts_of_a_changed_resource_are_not_merged ... ok
+test engine::tests::per_host_cap_limits_concurrency ... ok
+test engine::tests::legacy_partial_with_foreign_bytes_is_discarded ... ok
+test ftp::tests::ftp_login_refused ... ok
+test debrid::tests::a_rate_limited_submission_still_reaches_the_provider ... ok
+test engine::tests::live_hls_records_until_endlist ... ok
+test ftp::tests::ftp_full_and_resume ... ok
+test model::audit_lock_tests::audit_active_lock_is_not_stolen_after_twenty_seconds ... ok
+test engine::tests::strict_edge_matrix ... ok
+test engine::tests::local_http_matrix ... ok
+test engine::tests::facebook_cdn_matrix ... ok
+
+test result: ok. 228 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.36s
+

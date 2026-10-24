@@ -1,0 +1,11 @@
+# Symbols that the upstream v0.9.8 merge deliberately replaced.
+#
+# One `file|symbol` per line. A symbol listed here was removed on purpose
+# during the merge; scripts/check_merge_symbols.py reports it as replaced
+# instead of lost. Keep this list short and honest: an entry that is not
+# really a deliberate replacement hides a real loss.
+#
+# The Deno download moved from a moving "latest" URL to a pinned release
+# with a verified checksum, so the old helpers went with it.
+src/engine.rs|deno_zip_url
+src/engine.rs|BASE
