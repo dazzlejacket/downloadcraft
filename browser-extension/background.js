@@ -1074,15 +1074,13 @@ const BDL_HISTORY_MAX = 50;
 // The app's category folders (model::category_of), inside the browser's
 // Downloads folder - the browser cannot save anywhere else - so a file
 // saved in the browser lands where the app would put it by default.
+//
+// The table itself is in rank.js, so there is exactly one of it and the
+// node tests cover it. Without rank.js the file goes to "Other": a broken
+// install should not scatter files over folders it cannot be sure of.
 function bdlCategory(name) {
-  const ext = String(name || "").split(".").pop().toLowerCase();
-  if (["mp4", "mkv", "avi", "mov", "webm", "ts", "m4s"].includes(ext)) return "Video";
-  if (["mp3", "wav", "flac", "ogg", "m4a"].includes(ext)) return "Music";
-  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"].includes(ext)) return "Image";
-  if (["pdf", "doc", "docx", "txt", "epub"].includes(ext)) return "Document";
-  if (["zip", "rar", "7z", "tar", "gz"].includes(ext)) return "Compressed";
-  if (["exe", "msi"].includes(ext)) return "Apps";
-  return "Other";
+  return (typeof DCRank !== "undefined" && DCRank.categoryOf)
+    ? DCRank.categoryOf(name) : "Other";
 }
 // downloads.download() with the name (and category folder) Chrome must use.
 async function bdlDownload(url, name) {

@@ -984,6 +984,52 @@
     return "";
   }
 
+  // Every audio file the app knows. The category is decided by the file's
+  // own extension, so a stream without a name still lands in the right
+  // folder. This is the CATEGORY list: it is wider than the list the
+  // response classifier uses, because a file that is already on disk only
+  // has a name to go by.
+  const CATEGORY_AUDIO_EXT = new Set([
+    "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav",
+    "aif", "aiff", "weba", "mka", "wma", "amr", "m4b", "mpa", "mp2",
+  ]);
+
+  // Is this media audio?
+  //
+  // The MIME says so when the server names one. When it does not, the
+  // file's own extension decides - and anything else stays unknown rather
+  // than being called audio by accident.
+  function isAudioMedia(url, mime) {
+    const m = String(mime || "").toLowerCase().split(";")[0].trim();
+    if (m.startsWith("audio/")) return true;
+    if (m && m !== "application/octet-stream" && m !== "binary/octet-stream") return false;
+    return CATEGORY_AUDIO_EXT.has(extOf(url));
+  }
+
+  // The app's category folders (model::category_of), in one place.
+  //
+  // The browser saves into the same folder the app would choose, so a file
+  // saved in the browser lands where the app would put it by default. The
+  // Rust side has the same table; a change here needs the same change
+  // there.
+  const CATEGORY_VIDEO_EXT = ["mp4", "mkv", "avi", "mov", "webm", "ts", "m4s"];
+  const CATEGORY_IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"];
+  const CATEGORY_DOC_EXT = ["pdf", "doc", "docx", "txt", "epub"];
+  const CATEGORY_ZIP_EXT = ["zip", "rar", "7z", "tar", "gz"];
+  const CATEGORY_APP_EXT = ["exe", "msi"];
+
+  // The category a file belongs to, decided by its own extension.
+  function categoryOf(name) {
+    const ext = extOf(String(name || ""));
+    if (CATEGORY_VIDEO_EXT.includes(ext)) return "Video";
+    if (CATEGORY_AUDIO_EXT.has(ext)) return "Audio";
+    if (CATEGORY_IMAGE_EXT.includes(ext)) return "Image";
+    if (CATEGORY_DOC_EXT.includes(ext)) return "Document";
+    if (CATEGORY_ZIP_EXT.includes(ext)) return "Compressed";
+    if (CATEGORY_APP_EXT.includes(ext)) return "Apps";
+    return "Other";
+  }
+
   const DCRank = {
     // ours: the CHIRP response classifier, the manifest URL validator and
     // the Google Drive helpers
@@ -997,7 +1043,7 @@
     collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel,
     // Bandcamp
     isBandcampHost, isBandcampStream, bandcampFormat, bandcampParse, bandcampTrackFor,
-    bandcampCurrentTrack, bandcampFilename, audioExtForMime
+    bandcampCurrentTrack, bandcampFilename, audioExtForMime, isAudioMedia, categoryOf
   };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;

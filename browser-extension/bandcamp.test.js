@@ -140,6 +140,40 @@ describe("audio file names", () => {
   });
 });
 
+describe("the audio category", () => {
+  it("knows an audio file from its MIME", () => {
+    assert.equal(DCRank.isAudioMedia("https://h/stream/1", "audio/mpeg"), true);
+    assert.equal(DCRank.isAudioMedia("https://h/stream/1", "audio/flac; charset=x"), true);
+    assert.equal(DCRank.isAudioMedia("https://h/v.mp4", "video/mp4"), false);
+    assert.equal(DCRank.isAudioMedia("https://h/v.mp4", "text/html"), false);
+  });
+
+  it("knows an audio file from its own extension when the server names no type", () => {
+    assert.equal(DCRank.isAudioMedia("https://h/song.mp3", ""), true);
+    assert.equal(DCRank.isAudioMedia("https://h/song.flac", "application/octet-stream"), true);
+    assert.equal(DCRank.isAudioMedia("https://h/clip.mp4", "application/octet-stream"), false);
+    assert.equal(DCRank.isAudioMedia("https://h/clip.mp4", ""), false);
+  });
+
+  it("puts every audio file in the Audio category", () => {
+    for (const n of ["a.mp3", "a.m4a", "a.aac", "a.flac", "a.ogg", "a.oga",
+      "a.opus", "a.wav", "a.aiff", "a.weba", "a.mka"]) {
+      assert.equal(DCRank.categoryOf(n), "Audio", n + " is audio");
+    }
+    assert.equal(DCRank.categoryOf("The Testers - First Song.mp3"), "Audio");
+  });
+
+  it("leaves the other categories where they were", () => {
+    assert.equal(DCRank.categoryOf("a.mp4"), "Video");
+    assert.equal(DCRank.categoryOf("a.png"), "Image");
+    assert.equal(DCRank.categoryOf("a.pdf"), "Document");
+    assert.equal(DCRank.categoryOf("a.zip"), "Compressed");
+    assert.equal(DCRank.categoryOf("a.exe"), "Apps");
+    assert.equal(DCRank.categoryOf("a.bin"), "Other");
+    assert.equal(DCRank.categoryOf("noextension"), "Other");
+  });
+});
+
 describe("the response classifier", () => {
   it("takes a Bandcamp stream even when the answer names no MIME", () => {
     const r = DCRank.mediaResponse({

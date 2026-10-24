@@ -489,20 +489,20 @@ function collectItems(peek, pageUrl) {
     const kind = R ? R.kindOf(n) : "file";
     const isStream = kind === "playlist";
     const isSub = kind === "subtitle";
+    const isAudio = R && R.isAudioMedia ? R.isAudioMedia(n.url, n.mime) : /^audio\//i.test(n.mime || "");
     const tag = isSub ? "SUBS" : kind === "segment" ? "PART" : tagOf(n.url, n.mime);
     // The name the page itself knows (a Bandcamp track carries its own
     // title and artist), else the page title. And the extension the MIME
     // really is: an mp3 is not an m4a.
-    const isAudio = /^audio\//i.test(n.mime || "");
     const audioExt = (R && R.audioExtForMime) ? (R.audioExtForMime(n.mime) || ".m4a") : ".m4a";
     const ext = isAudio ? audioExt : ".mp4";
-    const rowTitle = n.title || pageTitle || "Video";
+    const rowTitle = n.title || pageTitle || (isAudio ? "Audio" : "Video");
     const name = isStream || isSub ? undefined
       : safeName(n.filename || rowTitle, ext);
     const streamName = safeName(pageTitle || "video", ".mp4");
     items.push({
       key: `net:${n.url}`,
-      kind: isStream ? "streams" : isSub || kind === "segment" ? "other" : "videos",
+      kind: isStream ? "streams" : isSub || kind === "segment" ? "other" : isAudio ? "audio" : "videos",
       title: rowTitle,
       thumb: n.thumb, dur: n.dur, tag, link: n.url, page: pageUrl,
       options: [{
@@ -569,7 +569,7 @@ function render(peek, pageUrl) {
     box.appendChild(e);
     return;
   }
-  const order = { videos: 0, streams: 1, other: 2 };
+  const order = { videos: 0, audio: 1, streams: 2, other: 3 };
   items.sort((a, b) => order[a.kind] - order[b.kind]);
   const browserCount = items.filter((it) => it.options.some((o) => o.browser)).length;
   // 1) With the app: every quality, the app resolves and merges.
@@ -602,7 +602,7 @@ $("filterBtn").onclick = (ev) => {
   const m = document.createElement("div");
   m.className = "menu";
   m.style.left = "0"; m.style.right = "auto";
-  for (const [k, label] of [["all", "Everything"], ["videos", "Videos"], ["streams", "Streams (HLS / DASH)"], ["other", "Other files"]]) {
+  for (const [k, label] of [["all", "Everything"], ["videos", "Videos"], ["audio", "Audio"], ["streams", "Streams (HLS / DASH)"], ["other", "Other files"]]) {
     const b = document.createElement("button");
     b.textContent = label;
     if (k === filterKind) b.className = "sel";
