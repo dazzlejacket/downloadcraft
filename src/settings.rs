@@ -284,6 +284,19 @@ fn save(s: &Settings) -> bool {
         Some(o) => o,
         None => return false,
     };
+    apply_settings(obj, s);
+    serde_json::to_string_pretty(&v)
+        .ok()
+        .and_then(|j| crate::model::atomic_write(&path, j.as_bytes()).ok())
+        .is_some()
+}
+
+/// Overlay the settings onto the object that will be written to disk.
+///
+/// Split out of `save` so the set of written keys can be checked by a test:
+/// the list below is the whole of what this app writes, and it holds no
+/// credential. A provider token lives in memory only and has no key here.
+fn apply_settings(obj: &mut serde_json::Map<String, serde_json::Value>, s: &Settings) {
     let set = |o: &mut serde_json::Map<String, serde_json::Value>, k: &str, v: serde_json::Value| {
         o.insert(k.to_string(), v);
     };
@@ -322,10 +335,6 @@ fn save(s: &Settings) -> bool {
         "speed_windows",
         serde_json::to_value(&s.speed_windows).unwrap_or_default(),
     );
-    serde_json::to_string_pretty(&v)
-        .ok()
-        .and_then(|j| crate::model::atomic_write(&path, j.as_bytes()).ok())
-        .is_some()
 }
 
 struct SettingsApp {
@@ -3361,6 +3370,58 @@ impl SettingsApp {
             "Checks GitHub releases; never downloads automatically.",
             reg(11.0),
             t.muted,
+        );
+    }
+}
+
+#[cfg(test)]
+mod settings_file_tests {
+    use super::*;
+
+    /// A provider token lives in memory only. The settings file has no
+    /// key for it, and no value that could carry one.
+    ///
+    /// This is the guard for the rule that a token is never written to a
+    /// settings file, a queue file or a download row.
+    #[test]
+    fn the_settings_file_has_no_place_for_a_credential() {
+        let mut obj = serde_json::Map::new();
+        apply_settings(&mut obj, &Settings::default());
+
+        // No key that could hold a provider token.
+        for key in obj.keys() {
+            let k = key.to_lowercase();
+            assert!(
+                !k.contains("token") && !k.contains("secret") && !k.contains("password"),
+                "the settings file grew a credential-shaped key: {key}"
+            );
+        }
+
+        // And no value that looks like one either.
+        let text = serde_json::to_string(&obj).unwrap();
+        for p in crate::debrid::Provider::ALL {
+            assert!(
+                !text.contains(p.label()) || !text.to_lowercase().contains("token"),
+                "the settings file mentions a provider with a token"
+            );
+        }
+    }
+
+    /// The settings the panel needs survive a round trip: what is written
+    /// is what is read back.
+    #[test]
+    fn what_is_written_is_what_is_read_back() {
+        let mut s = Settings::default();
+        s.overlay_style = "modern".into();
+        s.auto_extract = true;
+        s.extract_target = "custom".into();
+        let mut obj = serde_json::Map::new();
+        apply_settings(&mut obj, &s);
+        assert_eq!(obj.get("overlay_style").and_then(|v| v.as_str()), Some("modern"));
+        assert_eq!(obj.get("auto_extract").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            obj.get("extract_target").and_then(|v| v.as_str()),
+            Some("custom")
         );
     }
 }

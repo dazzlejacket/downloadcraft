@@ -1569,6 +1569,10 @@ const TOOL_GAP: f32 = 4.0;
 ///
 /// The only fill a button ever carries is the hover wash — no action is
 /// pre-highlighted, so nothing reads as permanently selected.
+///
+/// `tips` says whether the hover text may be shown. It is off while a
+/// modal is open: egui paints tooltips above every window, so a leftover
+/// tooltip would land on top of the dialog.
 fn tool_button(
     ui: &mut egui::Ui,
     man: &ManState,
@@ -1576,6 +1580,7 @@ fn tool_button(
     label: &str,
     enabled: bool,
     tip: &str,
+    tips: bool,
 ) -> egui::Rect {
     let label_w = ui
         .painter()
@@ -1607,7 +1612,7 @@ fn tool_button(
         egui::FontId::proportional(11.0),
         c,
     );
-    if enabled && !tip.is_empty() && hov {
+    if enabled && !tip.is_empty() && hov && tips {
         egui::Tooltip::always_open(
             ui.ctx().clone(),
             ui.layer_id(),
@@ -1626,9 +1631,9 @@ fn tool_button(
 /// toolbar buttons. When a download link is sitting on the clipboard it lights
 /// up in the accent colour (a soft breathing tint) so the user knows where to
 /// click, instead of a banner pushing the list down.
-fn add_url_button(ui: &mut egui::Ui, man: &ManState, hot: bool) -> egui::Rect {
+fn add_url_button(ui: &mut egui::Ui, man: &ManState, hot: bool, tips: bool) -> egui::Rect {
     if !hot {
-        return tool_button(ui, man, MI_ADD, "Add URL", true, "Add a download by URL");
+        return tool_button(ui, man, MI_ADD, "Add URL", true, "Add a download by URL", tips);
     }
     let label = "Add URL";
     let label_w = ui
@@ -1675,7 +1680,7 @@ fn add_url_button(ui: &mut egui::Ui, man: &ManState, hot: bool) -> egui::Rect {
         egui::FontId::proportional(11.0),
         pl().primary,
     );
-    if hov {
+    if hov && tips {
         egui::Tooltip::always_open(
             ui.ctx().clone(),
             ui.layer_id(),
@@ -2052,11 +2057,17 @@ pub struct CraftApp {
     grab_rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::grabber::GrabLink>, String>>>,
     // ---- cloud providers (debrid) ----
     show_debrid: bool,
-    /// 0 = Real-Debrid, 1 = TorBox.
+    /// Which provider the panel is pointed at, as an index into
+    /// `Provider::ALL`. The NAME is persisted in the settings file; a
+    /// token never is.
     debrid_provider_index: usize,
-    /// The API token. It lives in memory only: never written to a
-    /// settings file, a queue file or a download row.
-    debrid_token: String,
+    /// The API token of every provider, kept apart.
+    ///
+    /// They live in memory only: the store has no serialized form, so a
+    /// token is never written to a settings file, a queue file or a
+    /// download row. One token per provider is what keeps one provider's
+    /// token from being shown - or sent - under another provider's name.
+    debrid_tokens: crate::debrid::TokenStore,
     /// The magnet link or hosting URL to submit.
     debrid_input: String,
     /// The hosting password, when the host needs one.
@@ -2231,7 +2242,7 @@ impl CraftApp {
             grab_rx: None,
             show_debrid: false,
             debrid_provider_index: 0,
-            debrid_token: String::new(),
+            debrid_tokens: crate::debrid::TokenStore::default(),
             debrid_input: String::new(),
             debrid_password: String::new(),
             debrid_notice: String::new(),
@@ -3277,9 +3288,39 @@ impl CraftApp {
 
     // ---- cloud providers (debrid) ----
 
+    /// True while a modal dialog owns the screen.
+    ///
+    /// egui draws tooltips in its topmost layer, above every window, so a
+    /// tooltip left over from the window behind would paint over an open
+    /// dialog. While a modal is up the window behind is dimmed and its
+    /// tooltips stay silent.
+    fn modal_open(&self) -> bool {
+        self.show_add
+            || self.show_queues
+            || self.show_grabber
+            || self.show_about
+            || self.show_debrid
+            || self.show_extract
+            || self.details_id.is_some()
+    }
+
     /// The provider the panel is pointed at.
     fn debrid_provider(&self) -> crate::debrid::Provider {
         crate::debrid::Provider::from_index(self.debrid_provider_index)
+    }
+
+    /// The token of the provider the panel is pointed at.
+    ///
+    /// Each provider keeps its own token, so a token can never be read
+    /// under another provider's name.
+    fn debrid_token(&self) -> &str {
+        self.debrid_tokens.get(self.debrid_provider())
+    }
+
+    /// The token field of the provider the panel is pointed at.
+    fn debrid_token_mut(&mut self) -> &mut String {
+        let provider = self.debrid_provider();
+        self.debrid_tokens.field(provider)
     }
 
     /// Build a provider client, or explain why the token cannot be used.
@@ -3287,7 +3328,7 @@ impl CraftApp {
     /// The token is copied into the client and stays in memory: it is
     /// never written to a settings file, a queue file or a download row.
     fn debrid_client(&self) -> Result<crate::debrid::Api, String> {
-        crate::debrid::Api::new(self.debrid_provider(), self.debrid_token.trim().to_string())
+        crate::debrid::Api::new(self.debrid_provider(), self.debrid_token().trim().to_string())
             .map_err(|e| format!("{e:#}"))
     }
 
@@ -5944,10 +5985,13 @@ impl eframe::App for CraftApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing = egui::vec2(TOOL_GAP, 2.0);
-                    let r = add_url_button(ui, &self.man, self.clipboard_url.is_some());
+                    // A tooltip belongs to the window it came from. While a
+                    // modal is up, the window behind must stay silent.
+                    let tips = !self.modal_open();
+                    let r = add_url_button(ui, &self.man, self.clipboard_url.is_some(), tips);
                     self.hits.push((HitKind::Tool(ToolId::AddUrl), r));
                     for (id, icon, label, enabled, tip) in tools {
-                        let r = tool_button(ui, &self.man, icon, label, enabled, tip);
+                        let r = tool_button(ui, &self.man, icon, label, enabled, tip, tips);
                         self.hits.push((HitKind::Tool(id), r));
                     }
                 });
@@ -6337,12 +6381,10 @@ impl eframe::App for CraftApp {
         }
 
         // ================= modal backdrop (dim only — never intercepts clicks) =================
-        if self.show_add
-            || self.show_queues
-            || self.show_grabber
-            || self.show_about
-            || self.details_id.is_some()
-        {
+        // Every dialog is dimmed behind, including the cloud-provider panel:
+        // a window that is not dimmed reads as a separate app, and the
+        // toolbar behind it stays clickable in the user's mind.
+        if self.modal_open() {
             ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Middle,
                 egui::Id::new("modal_dim"),
@@ -7053,7 +7095,7 @@ impl eframe::App for CraftApp {
                         let r = mtext(
                             ui,
                             "debrid_token",
-                            &mut self.debrid_token,
+                            self.debrid_token_mut(),
                             "API token",
                             300.0,
                             true,
@@ -8622,6 +8664,11 @@ impl CraftApp {
             ButtonId::DebridProvider => {
                 // Another provider means another account and another task:
                 // what was read for the old one is dropped.
+                //
+                // The TOKEN is not dropped - it is kept in its own provider's
+                // slot, so it can never be shown or sent under the new
+                // provider's name, and switching back finds it where it was
+                // left.
                 self.debrid_provider_index =
                     (self.debrid_provider_index + 1) % crate::debrid::Provider::ALL.len();
                 self.debrid_account = None;

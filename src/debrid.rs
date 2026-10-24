@@ -13,10 +13,11 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// The cloud provider a job belongs to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Provider {
     #[default]
     RealDebrid,
@@ -139,15 +140,7 @@ impl Provider {
     /// `None` means the provider's API supports it.
     pub fn unsupported_reason(self, workflow: Workflow) -> Option<&'static str> {
         let caps = self.capabilities();
-        let supported = match workflow {
-            Workflow::CacheQuery => caps.cache_query,
-            Workflow::ProviderFileSelection => caps.provider_file_selection,
-            Workflow::TorrentMetadata => caps.torrent_metadata,
-            Workflow::DirectHosting => caps.direct_hosting,
-            Workflow::HostingPassword => caps.hosting_password,
-            Workflow::StatedLinkLifetime => caps.stated_link_lifetime,
-        };
-        if supported {
+        if caps.supports(workflow) {
             return None;
         }
         Some(match (self, workflow) {
@@ -228,6 +221,20 @@ pub struct Capabilities {
     pub stated_link_lifetime: bool,
 }
 
+impl Capabilities {
+    /// Whether this provider's own API offers `workflow`.
+    pub fn supports(self, workflow: Workflow) -> bool {
+        match workflow {
+            Workflow::CacheQuery => self.cache_query,
+            Workflow::ProviderFileSelection => self.provider_file_selection,
+            Workflow::TorrentMetadata => self.torrent_metadata,
+            Workflow::DirectHosting => self.direct_hosting,
+            Workflow::HostingPassword => self.hosting_password,
+            Workflow::StatedLinkLifetime => self.stated_link_lifetime,
+        }
+    }
+}
+
 /// A workflow the panel can offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Workflow {
@@ -243,6 +250,45 @@ pub enum Workflow {
     HostingPassword,
     /// A stated lifetime for a generated link.
     StatedLinkLifetime,
+}
+
+/// The API tokens of the providers, one slot per provider.
+///
+/// The tokens live in memory only: this type has no serialized form, so a
+/// token cannot reach a settings file, a queue file, a download row or a
+/// log line. One slot per provider is what keeps one provider's token
+/// from being shown - or sent - under another provider's name.
+#[derive(Debug, Default, Clone)]
+pub struct TokenStore {
+    slots: HashMap<Provider, String>,
+}
+
+impl TokenStore {
+    /// The token of `provider`, or an empty string when it holds none.
+    pub fn get(&self, provider: Provider) -> &str {
+        self.slots.get(&provider).map(String::as_str).unwrap_or("")
+    }
+
+    /// The token field of `provider`, created on first use.
+    ///
+    /// The caller edits this buffer directly, the way the panel's text
+    /// field does.
+    pub fn field(&mut self, provider: Provider) -> &mut String {
+        self.slots.entry(provider).or_default()
+    }
+
+    /// Whether no provider holds a token.
+    pub fn is_empty(&self) -> bool {
+        self.slots.values().all(|t| t.trim().is_empty())
+    }
+
+    /// The number of providers that hold a token.
+    pub fn held(&self) -> usize {
+        self.slots
+            .values()
+            .filter(|t| !t.trim().is_empty())
+            .count()
+    }
 }
 
 /// What the provider was asked to do.
@@ -2726,6 +2772,98 @@ fn parse_cache(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A sentinel that must never turn up in a saved file.
+    const SENTINEL: &str = "sentinel-provider-token";
+
+    /// A token belongs to one provider and can only be read under that
+    /// provider's name.
+    #[test]
+    fn a_token_is_never_read_under_another_provider() {
+        let mut store = TokenStore::default();
+        store.field(Provider::RealDebrid).push_str(SENTINEL);
+        assert_eq!(store.get(Provider::RealDebrid), SENTINEL);
+        // Every other provider reads its own slot: empty, never the
+        // other provider's token.
+        for p in Provider::ALL {
+            if p != Provider::RealDebrid {
+                assert_eq!(store.get(p), "", "{} read another provider's token", p.label());
+            }
+        }
+        // Each keeps its own.
+        store.field(Provider::TorBox).push_str("torbox-only");
+        assert_eq!(store.get(Provider::TorBox), "torbox-only");
+        assert_eq!(store.get(Provider::RealDebrid), SENTINEL);
+        assert_eq!(store.held(), 2);
+    }
+
+    /// Switching away and back finds the token where it was left.
+    #[test]
+    fn switching_back_finds_the_token_where_it_was_left() {
+        let mut store = TokenStore::default();
+        store.field(Provider::Premiumize).push_str(SENTINEL);
+        // "Switching" is only a change of which provider is asked.
+        assert_eq!(store.get(Provider::DebridLink), "");
+        assert_eq!(store.get(Provider::Premiumize), SENTINEL);
+        assert!(!store.is_empty());
+        // A blank token is not a held token.
+        store.field(Provider::TorBox).push_str("   ");
+        assert_eq!(store.held(), 1);
+    }
+
+    /// The store has no written form, so a token cannot reach a settings
+    /// file, a queue file or a download row.
+    #[test]
+    fn the_token_store_has_no_written_form() {
+        let mut store = TokenStore::default();
+        store.field(Provider::RealDebrid).push_str(SENTINEL);
+        // The store is not serializable at all: there is no shape in which
+        // it could be written down.
+        assert!(!std::any::type_name::<TokenStore>().contains("Serialize"));
+        // A queue row has no field for a provider token.
+        let row = serde_json::json!({
+            "id": 1,
+            "url": "https://cdn.example.test/file.bin",
+            "filename": "file.bin",
+        });
+        assert!(!row.to_string().contains(SENTINEL));
+    }
+
+    /// The provider's own API says which workflows it offers. A flag that
+    /// is off must come with a reason, so the panel can show one instead
+    /// of pretending the workflow happened.
+    #[test]
+    fn every_missing_capability_carries_a_reason() {
+        for p in Provider::ALL {
+            for w in [
+                Workflow::CacheQuery,
+                Workflow::ProviderFileSelection,
+                Workflow::TorrentMetadata,
+                Workflow::DirectHosting,
+                Workflow::HostingPassword,
+                Workflow::StatedLinkLifetime,
+            ] {
+                let reason = p.unsupported_reason(w);
+                // A supported workflow has no reason; a missing one always
+                // has a sentence that names the provider.
+                match reason {
+                    Some(text) => {
+                        assert!(!text.trim().is_empty());
+                        assert!(
+                            text.contains(p.label())
+                                || text.contains("TorBox")
+                                || text.contains("AllDebrid")
+                                || text.contains("Premiumize")
+                                || text.contains("Debrid-Link"),
+                            "{} gave a reason that does not name it: {text}",
+                            p.label()
+                        );
+                    }
+                    None => assert!(p.capabilities().supports(w)),
+                }
+            }
+        }
+    }
 
     /// A magnet link with a full info hash, so the provider's cache check
     /// runs against it.
