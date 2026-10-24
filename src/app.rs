@@ -2055,6 +2055,130 @@ fn extract_worker(
     let _ = tx.send(ExtractUpdate::Done(message));
 }
 
+/// The provider control: a LIST of the five providers, not a cycle.
+///
+/// The button opens the list and the list does the choosing. Clicking the
+/// provider that is already chosen picks that same provider again - it
+/// never moves on to the next one.
+///
+/// The list is a popup, and the app closes every open popup when the user
+/// clicks anywhere else. The click that OPENS the list therefore has to be
+/// recognised as a popup click: treated as an ordinary click, the list is
+/// closed again in the very same frame, the user never sees it, and the
+/// provider can never be changed.
+///
+/// The whole interaction lives here, away from the painting, so a test can
+/// drive it exactly the way the mouse and the keyboard do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPicker {
+    /// Which provider is chosen, as an index into `Provider::ALL`.
+    index: usize,
+    /// Is the list open?
+    open: bool,
+    /// The row the keyboard is on.
+    highlight: usize,
+}
+
+impl Default for ProviderPicker {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            open: false,
+            highlight: 0,
+        }
+    }
+}
+
+impl ProviderPicker {
+    /// The provider that is chosen.
+    pub fn provider(&self) -> crate::debrid::Provider {
+        crate::debrid::Provider::from_index(self.index)
+    }
+
+    /// The chosen provider's index.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Is the list open?
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The row the keyboard is on.
+    pub fn highlight(&self) -> usize {
+        self.highlight
+    }
+
+    /// Point the picker at a provider, without opening the list.
+    ///
+    /// An index outside the list is wrapped, so a stale value can never
+    /// point the panel at nothing.
+    pub fn select(&mut self, index: usize) {
+        let n = crate::debrid::Provider::ALL.len();
+        if n == 0 {
+            return;
+        }
+        self.index = index % n;
+        self.highlight = self.index;
+    }
+
+    /// The anchor was clicked: open the list, or close it if it was open.
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+        self.highlight = self.index;
+    }
+
+    /// A row of the list was clicked: choose it and close the list.
+    ///
+    /// Choosing the provider that was already chosen keeps that provider:
+    /// a list never moves on to the next one by itself.
+    pub fn choose(&mut self, row: usize) {
+        self.select(row);
+        self.open = false;
+    }
+
+    /// The keyboard moved inside the open list.
+    pub fn move_highlight(&mut self, delta: isize) {
+        let n = crate::debrid::Provider::ALL.len() as isize;
+        if n <= 0 || !self.open {
+            return;
+        }
+        let cur = self.highlight as isize;
+        self.highlight = ((cur + delta).rem_euclid(n)) as usize;
+    }
+
+    /// Enter picks the highlighted row.
+    pub fn accept(&mut self) {
+        if self.open {
+            self.choose(self.highlight);
+        }
+    }
+
+    /// Escape closes the list without choosing anything.
+    pub fn dismiss(&mut self) {
+        self.open = false;
+    }
+}
+
+/// Does a click on this button open one of the app's popups?
+///
+/// The app closes every open popup when the user clicks anywhere else. A
+/// click that OPENS a popup is not "anywhere else": the provider list is
+/// opened by a button, and if that click counted as an ordinary click the
+/// list would be closed again in the very same frame - the user would
+/// never see it, and the provider could never be changed.
+fn button_opens_popup(b: ButtonId) -> bool {
+    matches!(b, ButtonId::DebridProvider)
+}
+
+/// The end-of-frame rule for the app's open popups.
+///
+/// A click closes them - unless the click belonged to a popup of its own.
+fn close_popups_after_click(clicked: bool, popup_click: bool) -> bool {
+    clicked && !popup_click
+}
+
 pub struct CraftApp {
     rt: Arc<tokio::runtime::Runtime>,
     downloads: Vec<DownloadItem>,
@@ -2169,10 +2293,11 @@ pub struct CraftApp {
     grab_rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::grabber::GrabLink>, String>>>,
     // ---- cloud providers (debrid) ----
     show_debrid: bool,
-    /// Which provider the panel is pointed at, as an index into
-    /// `Provider::ALL`. The NAME is persisted in the settings file; a
-    /// token never is.
-    debrid_provider_index: usize,
+    /// The provider dropdown: which provider is chosen, whether the list is
+    /// open and which row the keyboard is on.
+    ///
+    /// The NAME is persisted in the settings file; a token never is.
+    debrid_picker: ProviderPicker,
     /// The API token of every provider, kept apart.
     ///
     /// They live in memory only: the store has no serialized form, so a
@@ -2180,10 +2305,6 @@ pub struct CraftApp {
     /// download row. One token per provider is what keeps one provider's
     /// token from being shown - or sent - under another provider's name.
     debrid_tokens: crate::debrid::TokenStore,
-    /// The provider dropdown is open.
-    debrid_provider_open: bool,
-    /// The provider row the keyboard is on.
-    debrid_provider_highlight: usize,
     /// The magnet link or hosting URL to submit.
     debrid_input: String,
     /// The hosting password, when the host needs one.
@@ -2369,10 +2490,8 @@ impl CraftApp {
             grab_notice: String::new(),
             grab_rx: None,
             show_debrid: false,
-            debrid_provider_index: 0,
+            debrid_picker: ProviderPicker::default(),
             debrid_tokens: crate::debrid::TokenStore::default(),
-            debrid_provider_open: false,
-            debrid_provider_highlight: 0,
             debrid_input: String::new(),
             debrid_password: String::new(),
             debrid_notice: String::new(),
@@ -2823,7 +2942,7 @@ impl CraftApp {
                     // nothing.
                     if let Some(s) = g("debrid_provider").and_then(|x| x.as_str()) {
                         if let Some(p) = crate::debrid::Provider::from_key(s) {
-                            self.debrid_provider_index = p.index();
+                            self.debrid_picker.select(p.index());
                         }
                     }
                     if let Some(n) = g("connections_default").and_then(|x| x.as_u64()) {
@@ -3480,7 +3599,7 @@ impl CraftApp {
 
     /// The provider the panel is pointed at.
     fn debrid_provider(&self) -> crate::debrid::Provider {
-        crate::debrid::Provider::from_index(self.debrid_provider_index)
+        self.debrid_picker.provider()
     }
 
     /// The token of the provider the panel is pointed at.
@@ -3497,19 +3616,16 @@ impl CraftApp {
         self.debrid_tokens.field(provider)
     }
 
-    /// Point the panel at another provider.
+    /// The chosen provider changed.
     ///
     /// The account, the session and the notice belong to the old provider
     /// and are dropped. The TOKEN is not: it stays in its own provider's
     /// slot, so it can never be shown - or sent - under the new provider's
     /// name, and switching back finds it where it was left.
-    fn debrid_set_provider(&mut self, index: usize) {
-        let n = crate::debrid::Provider::ALL.len();
-        self.debrid_provider_index = index % n;
+    fn debrid_provider_changed(&mut self) {
         self.debrid_account = None;
         self.debrid_session = None;
         self.debrid_notice.clear();
-        self.debrid_provider_highlight = self.debrid_provider_index;
         // The NAME is a preference and is remembered. A token never is.
         self.save_ui_state();
     }
@@ -3542,23 +3658,21 @@ impl CraftApp {
         // closes it. Otherwise Escape closes the panel. The app never asks
         // for the keyboard, so it does not take it away either.
         let ctx = ui.ctx().clone();
-        if self.debrid_provider_open {
+        if self.debrid_picker.is_open() {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                self.debrid_provider_highlight = (self.debrid_provider_highlight + 1) % n_providers;
+                self.debrid_picker.move_highlight(1);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                self.debrid_provider_highlight =
-                    (self.debrid_provider_highlight + n_providers - 1) % n_providers;
+                self.debrid_picker.move_highlight(-1);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                let pick = self.debrid_provider_highlight;
-                self.debrid_set_provider(pick);
-                self.debrid_provider_open = false;
+                self.debrid_picker.accept();
+                self.debrid_provider_changed();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Escape))
                 || ctx.input(|i| i.key_pressed(egui::Key::Tab))
             {
-                self.debrid_provider_open = false;
+                self.debrid_picker.dismiss();
             }
         } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.show_debrid = false;
@@ -3590,7 +3704,7 @@ impl CraftApp {
         dm_icon_btn(&p, &self.man, close, DmIcon::Close, 12.0, 2.0, pl().dm_dim);
         if self.man.clicked(&close) {
             self.show_debrid = false;
-            self.debrid_provider_open = false;
+            self.debrid_picker.dismiss();
         }
         // The header rule.
         let (rule, _) = ui.allocate_exact_size(
@@ -3612,7 +3726,7 @@ impl CraftApp {
                 c,
                 hov,
                 provider.label(),
-                self.debrid_provider_open,
+                self.debrid_picker.is_open(),
             );
             self.hits.push((HitKind::Btn(ButtonId::DebridProvider), c));
             let (v, _) = ui.allocate_exact_size(egui::vec2(110.0, DM_BOX_H), egui::Sense::hover());
@@ -3854,7 +3968,7 @@ impl CraftApp {
         // ---- the provider dropdown ----
         // Painted last, so it sits over the card. The rows are real hits:
         // the list is drawn where the pointer can reach it.
-        if self.debrid_provider_open && !combo.is_negative() {
+        if self.debrid_picker.is_open() && !combo.is_negative() {
             let row_h = 42.0;
             let list_w = 320.0;
             let list_h = n_providers as f32 * row_h + 10.0;
@@ -3879,11 +3993,11 @@ impl CraftApp {
                     egui::pos2(list.min.x + 6.0, list.min.y + 5.0 + i as f32 * row_h),
                     egui::vec2(list_w - 12.0, row_h),
                 );
-                let hot = self.man.hover(&r) || self.debrid_provider_highlight == i;
+                let hot = self.man.hover(&r) || self.debrid_picker.highlight() == i;
                 if hot {
                     p.rect_filled(r, 4.0, pl().dm_hover);
                 }
-                if i == self.debrid_provider_index {
+                if i == self.debrid_picker.index() {
                     let cr = egui::Rect::from_center_size(
                         egui::pos2(r.min.x + 12.0, r.center().y),
                         egui::Vec2::splat(14.0),
@@ -3906,7 +4020,7 @@ impl CraftApp {
                 );
                 // The validation state, for the provider the panel is on.
                 // The others are not known, and are not guessed.
-                if i == self.debrid_provider_index {
+                if i == self.debrid_picker.index() {
                     let text = if self.debrid_account.is_some() {
                         "signed in"
                     } else {
@@ -9427,7 +9541,7 @@ impl CraftApp {
                 self.add_focus_req = false;
                 self.add_recent_open = false;
                 self.show_debrid = true;
-                self.debrid_provider_open = false;
+                self.debrid_picker.dismiss();
                 self.push_log("Magnet handed to the cloud provider panel.");
             }
             ButtonId::AddCancel => {
@@ -9455,8 +9569,7 @@ impl CraftApp {
             ButtonId::DebridProvider => {
                 // The provider is a list, not a cycle: the button opens
                 // it and the list does the choosing.
-                self.debrid_provider_open = !self.debrid_provider_open;
-                self.debrid_provider_highlight = self.debrid_provider_index;
+                self.debrid_picker.toggle();
             }
             ButtonId::DebridValidate => self.start_debrid_validate(),
             ButtonId::DebridSubmit => self.start_debrid_submit(),
@@ -10122,6 +10235,11 @@ impl CraftApp {
                 }
                 HitKind::Btn(b) => {
                     if clk {
+                        // A button that opens one of the app's popups is a
+                        // popup click, not "a click somewhere else".
+                        if button_opens_popup(b) {
+                            fired_menu = true;
+                        }
                         self.do_button(b);
                     }
                 }
@@ -10189,8 +10307,8 @@ impl CraftApp {
                 HitKind::DebridProviderRow(i) => {
                     if clk {
                         fired_menu = true;
-                        self.debrid_set_provider(i);
-                        self.debrid_provider_open = false;
+                        self.debrid_picker.choose(i);
+                        self.debrid_provider_changed();
                     }
                 }
             }
@@ -10209,11 +10327,11 @@ impl CraftApp {
             self.drop_menu = None;
         }
         // Clicks elsewhere dismiss open popups (standard behavior).
-        if fired_any && !fired_menu && !fired_ctx {
+        if close_popups_after_click(fired_any, fired_menu) && !fired_ctx {
             self.drop_menu = None;
             self.ctx_menu = None;
             self.col_menu = None;
-            self.debrid_provider_open = false;
+            self.debrid_picker.dismiss();
         }
         self.man_hover_dbg = hover_dbg;
     }
@@ -10255,6 +10373,141 @@ mod audit_completion_tests {
         assert!(!task_can_complete(&success,false));
         success.cancelled.store(true,Ordering::SeqCst);
         assert!(!task_can_complete(&success,true));
+    }
+}
+
+/// The provider dropdown is a LIST, and the user reported that it never
+/// opened: the click that opens it was read as "a click somewhere else",
+/// and the app's own rule closed the list again in the same frame.
+///
+/// These tests drive the dropdown the way the mouse and the keyboard do.
+#[cfg(test)]
+mod provider_picker_tests {
+    use super::*;
+    use crate::debrid::Provider;
+
+    #[test]
+    fn the_list_opens_and_every_provider_can_be_chosen() {
+        let mut p = ProviderPicker::default();
+        assert_eq!(p.provider(), Provider::RealDebrid);
+        assert!(!p.is_open());
+
+        // The anchor opens the list and puts the keyboard on the current
+        // provider.
+        p.toggle();
+        assert!(p.is_open());
+        assert_eq!(p.highlight(), p.index());
+        p.dismiss();
+
+        // Every provider of the list can be chosen, and the choice is what
+        // the panel then talks to.
+        for (i, want) in Provider::ALL.into_iter().enumerate() {
+            p.toggle();
+            assert!(p.is_open(), "the anchor opens the list");
+            p.choose(i);
+            assert!(!p.is_open(), "choosing a row closes the list");
+            assert_eq!(p.provider(), want);
+            assert_eq!(p.index(), i);
+        }
+    }
+
+    #[test]
+    fn choosing_the_provider_that_is_already_chosen_does_not_cycle() {
+        let mut p = ProviderPicker::default();
+        p.select(2); // AllDebrid
+        p.toggle();
+        p.choose(p.index());
+        // Still AllDebrid: a list never moves on to the next one by itself.
+        assert_eq!(p.provider(), Provider::AllDebrid);
+        assert!(!p.is_open());
+    }
+
+    #[test]
+    fn the_keyboard_walks_the_list_and_enter_picks() {
+        let mut p = ProviderPicker::default();
+        p.toggle();
+        // The keyboard starts on the chosen provider and walks the list.
+        assert_eq!(p.highlight(), 0);
+        p.move_highlight(1);
+        assert_eq!(p.highlight(), 1);
+        p.move_highlight(-1);
+        assert_eq!(p.highlight(), 0);
+        // Up from the first row wraps round to the last.
+        p.move_highlight(-1);
+        assert_eq!(p.highlight(), Provider::ALL.len() - 1);
+        p.accept();
+        assert_eq!(p.provider(), Provider::DebridLink);
+        assert!(!p.is_open());
+
+        // Escape closes the list without choosing anything.
+        p.toggle();
+        p.move_highlight(1);
+        p.dismiss();
+        assert!(!p.is_open());
+        assert_eq!(p.provider(), Provider::DebridLink);
+    }
+
+    #[test]
+    fn a_stale_index_cannot_point_the_panel_at_nothing() {
+        let mut p = ProviderPicker::default();
+        p.select(99);
+        assert!(p.index() < Provider::ALL.len());
+        assert_eq!(p.provider(), Provider::ALL[99 % Provider::ALL.len()]);
+    }
+
+    #[test]
+    fn the_click_that_opens_the_list_survives_the_end_of_frame_rule() {
+        use super::{button_opens_popup, close_popups_after_click};
+        // The frame: the user clicks the provider button, the list opens,
+        // and then the app applies its "a click elsewhere closes the
+        // popups" rule.
+        let mut p = ProviderPicker::default();
+        let clicked = ButtonId::DebridProvider;
+        p.toggle();
+        let popup_click = button_opens_popup(clicked);
+        if close_popups_after_click(true, popup_click) {
+            p.dismiss();
+        }
+        assert!(
+            p.is_open(),
+            "the provider list must still be open after the click that opened it"
+        );
+    }
+
+    #[test]
+    fn only_the_provider_button_opens_a_popup() {
+        use super::button_opens_popup;
+        assert!(button_opens_popup(ButtonId::DebridProvider));
+        // Every other button is an ordinary click.
+        assert!(!button_opens_popup(ButtonId::DebridValidate));
+        assert!(!button_opens_popup(ButtonId::DebridSubmit));
+        assert!(!button_opens_popup(ButtonId::DebridClose));
+        assert!(!button_opens_popup(ButtonId::DebridQueue));
+    }
+
+    #[test]
+    fn a_click_elsewhere_still_closes_the_list() {
+        use super::{button_opens_popup, close_popups_after_click};
+        let mut p = ProviderPicker::default();
+        p.toggle();
+        let popup_click = button_opens_popup(ButtonId::DebridValidate);
+        assert!(close_popups_after_click(true, popup_click));
+        if close_popups_after_click(true, popup_click) {
+            p.dismiss();
+        }
+        assert!(!p.is_open());
+    }
+
+    #[test]
+    fn the_chosen_provider_survives_a_round_trip_through_its_key() {
+        // The NAME is remembered across restarts; a token never is.
+        for p in Provider::ALL {
+            let mut picker = ProviderPicker::default();
+            picker.select(p.index());
+            let key = picker.provider().key();
+            let back = Provider::from_key(key).expect("the key must be known");
+            assert_eq!(back, p);
+        }
     }
 }
 
