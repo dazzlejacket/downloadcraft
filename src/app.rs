@@ -1583,10 +1583,48 @@ fn col_w_of(map: &std::collections::HashMap<SortCol, f32>, c: SortCol) -> f32 {
     map.get(&c).copied().unwrap_or(col_default(c))
 }
 
+/// The columns the table shows: the order, minus the hidden ones.
+///
+/// Name is the anchor of the table and is always there.
+fn visible_cols(order: &[SortCol], hidden: &[SortCol]) -> Vec<SortCol> {
+    order
+        .iter()
+        .copied()
+        .filter(|c| *c == SortCol::Name || !hidden.contains(c))
+        .collect()
+}
+
+/// Turn a column off, or back on.
+///
+/// The Name column is the anchor of the table and is never hidden.
+fn toggle_hidden_col(hidden: &mut Vec<SortCol>, col: SortCol) {
+    if col == SortCol::Name {
+        return;
+    }
+    match hidden.iter().position(|c| *c == col) {
+        Some(pos) => {
+            hidden.remove(pos);
+        }
+        None => hidden.push(col),
+    }
+}
+
 /// Uniform toolbar metrics: every action button shares one height.
 const TOOL_H: f32 = 46.0;
 /// Gap between toolbar buttons (`.toolbar { gap: 4px }`).
 const TOOL_GAP: f32 = 4.0;
+
+/// A thin rule between two groups of toolbar buttons.
+///
+/// IDM separates its toolbar into groups. Ten identical buttons in one row
+/// are hard to scan, and the destructive ones ended up next to Settings.
+fn tool_group_sep(ui: &mut egui::Ui) {
+    ui.add_space(10.0);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, TOOL_H), egui::Sense::hover());
+    let line = egui::Rect::from_center_size(r.center(), egui::vec2(1.0, 22.0));
+    ui.painter().rect_filled(line, 0.0, pl().card_bd);
+    ui.add_space(10.0);
+}
 
 /// Toolbar button: icon above label, content-sized width, uniform height.
 /// Manual-input version: reserves space, paints (hover from caller),
@@ -1765,7 +1803,7 @@ struct ActiveTask {
     last_bytes: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum SortCol {
     Name,
     Size,
@@ -1776,6 +1814,16 @@ enum SortCol {
 }
 
 impl SortCol {
+    /// Every column, in the order the Columns menu lists them.
+    const ALL: [SortCol; 6] = [
+        SortCol::Name,
+        SortCol::Size,
+        SortCol::Status,
+        SortCol::Speed,
+        SortCol::Eta,
+        SortCol::Date,
+    ];
+
     fn key(&self) -> &'static str {
         match self {
             SortCol::Name => "name",
@@ -1853,6 +1901,9 @@ enum HitKind {
     /// A provider row in the cloud-provider dropdown: the index into
     /// `Provider::ALL`.
     DebridProviderRow(usize),
+    /// A row of the Columns menu: an index into `SortCol::ALL`, or one of
+    /// the two reset actions.
+    ColMenuItem(u8),
     /// Queue v2 reorder: (item id, -1 up / +1 down).
     QMove(u64, i32),
 }
@@ -2022,6 +2073,13 @@ pub struct CraftApp {
     known_ids: std::collections::HashSet<u64>,
     col_order: Vec<SortCol>,
     col_w: std::collections::HashMap<SortCol, f32>,
+    /// The columns the user has turned off.
+    ///
+    /// The Name column is the anchor of the table and is always there; the
+    /// rest can be hidden from the header's right-click menu.
+    col_hidden: Vec<SortCol>,
+    /// Where the Columns menu was opened, when it is open.
+    col_menu: Option<egui::Pos2>,
     // ---- power features ----
     max_concurrent: usize,
     /// Cap on simultaneous connections per host across every download
@@ -2230,6 +2288,8 @@ impl CraftApp {
                 SortCol::Date,
             ],
             col_w: Default::default(),
+            col_hidden: Vec::new(),
+            col_menu: None,
             max_concurrent: 3,
         per_host_conns: 0,
             show_complete: true,
@@ -2564,6 +2624,7 @@ impl CraftApp {
                 let _ = std::fs::create_dir_all(parent);
             }
             let order: Vec<&str> = self.col_order.iter().map(|c| c.key()).collect();
+            let hidden: Vec<&str> = self.col_hidden.iter().map(|c| c.key()).collect();
             let widths: std::collections::HashMap<&str, f32> = self
                 .col_w
                 .iter()
@@ -2571,6 +2632,7 @@ impl CraftApp {
                 .collect();
             let mine = serde_json::json!({
                 "columns": order,
+                "columns_hidden": hidden,
                 "widths": widths,
                 "max_concurrent": self.max_concurrent,
                 "per_host_conns": self.per_host_conns,
@@ -2649,6 +2711,22 @@ impl CraftApp {
                             }
                         }
                         self.col_order = order;
+                    }
+                    // The hidden columns are a closed set: an unknown key is
+                    // ignored, and the Name column can never be hidden
+                    // because the table hangs off it.
+                    if let Some(arr) = v.get("columns_hidden").and_then(|c| c.as_array()) {
+                        let mut hidden = Vec::new();
+                        for item in arr {
+                            if let Some(s) = item.as_str() {
+                                if let Some(c) = SortCol::from_key(s) {
+                                    if c != SortCol::Name && !hidden.contains(&c) {
+                                        hidden.push(c);
+                                    }
+                                }
+                            }
+                        }
+                        self.col_hidden = hidden;
                     }
                     if let Some(w) = v.get("widths").and_then(|x| x.as_object()) {
                         for (k, val) in w {
@@ -6237,6 +6315,18 @@ impl eframe::App for CraftApp {
             }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Left: what is running right now. The strip answers
+                    // "is anything happening?" without reading the list.
+                    let active = self
+                        .downloads
+                        .iter()
+                        .filter(|d| d.status == Status::Downloading)
+                        .count();
+                    let total = self.downloads.len();
+                    if active > 0 {
+                        let text = format!("{active} of {total} active");
+                        ui.label(egui::RichText::new(text).size(10.5).color(pl().dim));
+                    }
                     // Session totals live in the sidebar's footer, inside its
                     // card — the strip only carries live state ("Ready" / speed).
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -6448,17 +6538,89 @@ impl eframe::App for CraftApp {
                 // Manual routing: paint (+record hit); process_hits acts.
                 ui.add_space(6.0);
                 let n_checked = self.selected_ids().len();
-                let mut tools: Vec<(ToolId, &str, &str, bool, &str)> = Vec::new();
-                tools.push((ToolId::ResumeSel, MI_PLAY_CIRCLE, "Resume", true, "Resume the selected downloads (all paused when none is checked)"));
-                tools.push((ToolId::StopSel, MI_STOP_CIRCLE, "Stop", true, "Pause the selected downloads (all active when none is checked)"));
-                tools.push((ToolId::StopAll, MI_PAUSE_CIRCLE, "Stop All", true, "Pause every active download now"));
-                tools.push((ToolId::Delete, MI_DELETE, "Delete", n_checked > 0, "Remove the checked rows from the list"));
-                tools.push((ToolId::StartQueue, MI_PLAY, "Start Queue", true, "Start queued downloads"));
-                tools.push((ToolId::StopQueue, MI_STOP, "Stop Queue", true, "Stop starting new downloads (active ones finish)"));
-                tools.push((ToolId::Queues, MI_REORDER, "Open Queue", true, "Queue status, scheduler and log"));
-                tools.push((ToolId::Grabber, MI_PUBLIC, "Site Grabber", true, "Collect file links from a web page"));
-                tools.push((ToolId::Debrid, MI_CLOUD_DL, "Debrid", true, "Resolve magnet and hosting links with a cloud provider"));
-                tools.push((ToolId::Settings, MI_TUNE, "Settings", true, "Open Settings in its own window"));
+                // The toolbar is grouped the way IDM groups its own: what
+                // starts something, what controls what is running, and what
+                // manages the queues. Ten identical buttons in one row are
+                // hard to scan, and the destructive ones sat next to
+                // Settings.
+                let groups: Vec<Vec<(ToolId, &str, &str, bool, &str)>> = vec![
+                    vec![
+                        (
+                            ToolId::Grabber,
+                            MI_PUBLIC,
+                            "Site Grabber",
+                            true,
+                            "Collect file links from a web page",
+                        ),
+                        (
+                            ToolId::Debrid,
+                            MI_CLOUD_DL,
+                            "Debrid",
+                            true,
+                            "Resolve magnet and hosting links with a cloud provider",
+                        ),
+                    ],
+                    vec![
+                        (
+                            ToolId::ResumeSel,
+                            MI_PLAY_CIRCLE,
+                            "Resume",
+                            true,
+                            "Resume the selected downloads (all paused when none is checked)",
+                        ),
+                        (
+                            ToolId::StopSel,
+                            MI_STOP_CIRCLE,
+                            "Stop",
+                            true,
+                            "Pause the selected downloads (all active when none is checked)",
+                        ),
+                        (
+                            ToolId::StopAll,
+                            MI_PAUSE_CIRCLE,
+                            "Stop All",
+                            true,
+                            "Pause every active download now",
+                        ),
+                        (
+                            ToolId::Delete,
+                            MI_DELETE,
+                            "Delete",
+                            n_checked > 0,
+                            "Remove the checked rows from the list",
+                        ),
+                    ],
+                    vec![
+                        (
+                            ToolId::StartQueue,
+                            MI_PLAY,
+                            "Start Queue",
+                            true,
+                            "Start queued downloads",
+                        ),
+                        (
+                            ToolId::StopQueue,
+                            MI_STOP,
+                            "Stop Queue",
+                            true,
+                            "Stop starting new downloads (active ones finish)",
+                        ),
+                        (
+                            ToolId::Queues,
+                            MI_REORDER,
+                            "Open Queue",
+                            true,
+                            "Queue status, scheduler and log",
+                        ),
+                    ],
+                    vec![(
+                        ToolId::Settings,
+                        MI_TUNE,
+                        "Settings",
+                        true,
+                        "Open Settings in its own window",
+                    )],
+                ];
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing = egui::vec2(TOOL_GAP, 2.0);
@@ -6467,9 +6629,13 @@ impl eframe::App for CraftApp {
                     let tips = !self.modal_open();
                     let r = add_url_button(ui, &self.man, self.clipboard_url.is_some(), tips);
                     self.hits.push((HitKind::Tool(ToolId::AddUrl), r));
-                    for (id, icon, label, enabled, tip) in tools {
-                        let r = tool_button(ui, &self.man, icon, label, enabled, tip, tips);
-                        self.hits.push((HitKind::Tool(id), r));
+                    for group in groups.iter() {
+                        tool_group_sep(ui);
+                        for (id, icon, label, enabled, tip) in group {
+                            let r =
+                                tool_button(ui, &self.man, icon, label, *enabled, tip, tips);
+                            self.hits.push((HitKind::Tool(*id), r));
+                        }
                     }
                 });
                 ui.add_space(6.0);
@@ -6517,7 +6683,9 @@ impl eframe::App for CraftApp {
                     // column right-aligned, and one rule under the header.
                     const ROW_H: f32 = 34.0;
                     const HDR_H: f32 = 22.0;
-                    let cols = self.col_order.clone();
+                    // The columns the user has turned off are not drawn.
+                    // Name is the anchor of the table and is always there.
+                    let cols = visible_cols(&self.col_order, &self.col_hidden);
                     let avail_w = ui.available_width();
                     // The numeric columns keep their stored widths, but when the
                     // window is too narrow for them plus a readable Name column
@@ -8762,6 +8930,9 @@ impl eframe::App for CraftApp {
         if let Some((id, pos)) = self.ctx_menu {
             self.render_ctx_menu(ctx, id, pos);
         }
+        if let Some(pos) = self.col_menu {
+            self.render_col_menu(ctx, pos);
+        }
         self.process_hits(ctx);
         self.diag_hits_n = self.hits.len();
     }
@@ -9354,6 +9525,36 @@ impl CraftApp {
         self.render_popup(ctx, "ctx_menu", pos, 230.0, rows);
     }
 
+    /// The Columns menu: which columns the table shows.
+    ///
+    /// Right-clicking a column header opens it. The menu stays open while
+    /// it is used, so several columns can be turned off in a row.
+    fn render_col_menu(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
+        let rows = self.column_rows();
+        self.render_popup(ctx, "col_menu", pos, 210.0, rows);
+    }
+
+    /// The rows of the Columns menu.
+    ///
+    /// The Name column is the anchor of the table and is always shown, so
+    /// it is listed and says so rather than pretending to be a choice.
+    fn column_rows(&self) -> Vec<(String, Option<HitKind>)> {
+        let mut out = Vec::new();
+        for (i, c) in SortCol::ALL.iter().enumerate() {
+            let mut label = c.title().to_string();
+            if *c == SortCol::Name {
+                label.push_str("  (always shown)");
+            } else if !self.col_hidden.contains(c) {
+                label = format!("✓ {label}");
+            }
+            out.push((label, Some(HitKind::ColMenuItem(i as u8))));
+        }
+        out.push((String::new(), None));
+        out.push(("Reset widths".into(), Some(HitKind::ColMenuItem(90))));
+        out.push(("Reset order".into(), Some(HitKind::ColMenuItem(91))));
+        out
+    }
+
     /// Match recorded hit rects (reverse = topmost first) against manual
     /// pointer state and dispatch. The single place anything "clicks".
     fn process_hits(&mut self, ctx: &egui::Context) {
@@ -9405,6 +9606,7 @@ impl CraftApp {
                     | HitKind::Field(_)
                     | HitKind::ComboAnchor
                     | HitKind::DebridProviderRow(_)
+                    | HitKind::ColMenuItem(_)
                     | HitKind::QMove(_, _)
             );
             if modal_open && !dialog_kind {
@@ -9432,6 +9634,7 @@ impl CraftApp {
                     HitKind::Field(f) => format!("field:{f}"),
                     HitKind::ComboAnchor => "combo".to_string(),
                     HitKind::DebridProviderRow(i) => format!("provider:{i}"),
+                    HitKind::ColMenuItem(i) => format!("colmenu:{i}"),
                     HitKind::QMove(id, d) => format!("qmove:#{id}:{d}"),
                 };
             }
@@ -9540,6 +9743,22 @@ impl CraftApp {
                         self.do_menu_act(ctx, a);
                     }
                 }
+                HitKind::ColMenuItem(a) => {
+                    if clk {
+                        // The menu stays open so several columns can be
+                        // turned off in a row.
+                        fired_menu = true;
+                        if a < SortCol::ALL.len() as u8 {
+                            let col = SortCol::ALL[a as usize];
+                            toggle_hidden_col(&mut self.col_hidden, col);
+                        } else if a == 90 {
+                            self.col_w.clear();
+                        } else if a == 91 {
+                            self.col_order = SortCol::ALL.to_vec();
+                        }
+                        self.save_ui_state();
+                    }
+                }
                 HitKind::SideRow(key) => {
                     if clk {
                         if key == "Queues" {
@@ -9607,6 +9826,12 @@ impl CraftApp {
                             self.sort_col = c;
                             self.sort_asc = true;
                         }
+                    } else if sec {
+                        // Right-clicking a header opens the Columns menu,
+                        // the way IDM does.
+                        self.col_menu = self.man.pos().or(Some(egui::pos2(120.0, 120.0)));
+                        self.drop_menu = None;
+                        self.ctx_menu = None;
                     }
                 }
                 HitKind::HdrCheck => {
@@ -9742,6 +9967,7 @@ impl CraftApp {
         if fired_any && !fired_menu && !fired_ctx {
             self.drop_menu = None;
             self.ctx_menu = None;
+            self.col_menu = None;
             self.debrid_provider_open = false;
         }
         self.man_hover_dbg = hover_dbg;
@@ -9799,5 +10025,46 @@ mod cloud_queue_tests {
         assert_eq!(cloud_row_settings(&target(Some(99), 10), 12), (16, Some(10)));
         // A size the provider did not report stays unknown.
         assert_eq!(cloud_row_settings(&target(Some(4), 0), 12), (4, None));
+    }
+    /// A column can be turned off and back on, and the Name column - the
+    /// anchor of the table - is never one of them.
+    #[test]
+    fn a_column_can_be_hidden_and_shown_again() {
+        let mut hidden: Vec<SortCol> = Vec::new();
+        toggle_hidden_col(&mut hidden, SortCol::Speed);
+        assert_eq!(hidden, vec![SortCol::Speed]);
+        // The Name column hangs the table off itself and stays.
+        toggle_hidden_col(&mut hidden, SortCol::Name);
+        assert_eq!(hidden, vec![SortCol::Speed]);
+        // Turning it off again brings it back.
+        toggle_hidden_col(&mut hidden, SortCol::Speed);
+        assert!(hidden.is_empty());
+        // Turning the same column off and on again leaves it shown.
+        toggle_hidden_col(&mut hidden, SortCol::Eta);
+        assert_eq!(hidden, vec![SortCol::Eta]);
+        toggle_hidden_col(&mut hidden, SortCol::Eta);
+        assert!(hidden.is_empty());
+    }
+
+    /// The table shows the ordered columns minus the hidden ones, and Name
+    /// is always in there.
+    #[test]
+    fn the_table_keeps_its_name_column() {
+        let order = SortCol::ALL.to_vec();
+        assert_eq!(visible_cols(&order, &[]).len(), 6);
+        let hidden = vec![SortCol::Speed, SortCol::Eta, SortCol::Date];
+        let shown = visible_cols(&order, &hidden);
+        assert_eq!(shown, vec![
+            SortCol::Name,
+            SortCol::Size,
+            SortCol::Status
+        ]);
+        // Even with everything else hidden, the table still has its anchor.
+        let all_hidden: Vec<SortCol> = SortCol::ALL
+            .iter()
+            .copied()
+            .filter(|c| *c != SortCol::Name)
+            .collect();
+        assert_eq!(visible_cols(&order, &all_hidden), vec![SortCol::Name]);
     }
 }
