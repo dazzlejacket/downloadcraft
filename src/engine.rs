@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// Shared state between the UI thread and the download task.
 pub struct SharedState {
@@ -387,6 +387,209 @@ struct ResumeMeta {
     url: String,
     total: Option<u64>,
     conns: usize,
+    /// Version binding of the saved bytes (QR-02). Absent in sidecars
+    /// written before this change: those are re-checked against the
+    /// server (overlap window) instead of being trusted.
+    #[serde(default)]
+    validator: Option<Validator>,
+}
+
+/// HTTP validators that bind saved bytes to one exact version of a
+/// resource (QR-02).
+///
+/// Only a STRONG ETag proves that two responses carry the same bytes:
+/// `W/"…"` is explicitly allowed to change meaning between responses, so
+/// it is never stored. `Last-Modified` is the fallback condition for
+/// servers that send no ETag at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Validator {
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub modified: Option<String>,
+}
+
+impl Validator {
+    /// Read the validators out of a response.
+    pub(crate) fn read(h: &reqwest::header::HeaderMap) -> Option<Self> {
+        let text = |key: reqwest::header::HeaderName| {
+            h.get(key)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let etag = text(reqwest::header::ETAG)
+            .filter(|v| !v.starts_with("W/") && v.starts_with('"') && v.ends_with('"'));
+        let modified = text(reqwest::header::LAST_MODIFIED);
+        (etag.is_some() || modified.is_some()).then_some(Self { etag, modified })
+    }
+
+    /// The `If-Range` condition: a strong ETag wins over a date.
+    pub(crate) fn condition(&self) -> Option<&str> {
+        self.etag.as_deref().or(self.modified.as_deref())
+    }
+
+    /// Do both sets of validators describe the same version of the file?
+    /// Anything unproven counts as "not the same": the caller then
+    /// re-checks the saved bytes instead of trusting them.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        match (&self.etag, &other.etag) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => self.modified == other.modified,
+            _ => false,
+        }
+    }
+}
+
+/// The saved bytes belong to a different version of the resource (QR-02).
+/// The caller discards them and restarts the transfer from scratch.
+#[derive(Debug)]
+struct SourceChanged;
+
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the source changed on the server — the saved data was discarded")
+    }
+}
+impl std::error::Error for SourceChanged {}
+
+fn source_changed() -> anyhow::Error {
+    anyhow::Error::new(SourceChanged)
+}
+
+fn is_source_changed(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<SourceChanged>().is_some()
+}
+
+/// Parse `Content-Range: bytes <first>-<last>/<total>`.
+fn content_range(h: &reqwest::header::HeaderMap) -> Option<(u64, u64, Option<u64>)> {
+    let text = h.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?.trim();
+    let rest = text.strip_prefix("bytes ")?;
+    let (span, total) = rest.split_once('/')?;
+    let (first, last) = span.split_once('-')?;
+    let first = first.trim().parse::<u64>().ok()?;
+    let last = last.trim().parse::<u64>().ok()?;
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse::<u64>().ok()?),
+    };
+    Some((first, last, total))
+}
+
+/// How many bytes at the end of a saved prefix are re-fetched and compared
+/// when no validator proves the versions match (QR-02).
+const OVERLAP_WINDOW: u64 = 4096;
+
+/// Remove every partial file and the sidecar of `dest`.
+///
+/// Used when the saved bytes turn out to belong to a different version of
+/// the resource: they are discarded, never appended to.
+fn discard_partials(dest: &std::path::Path) {
+    let _ = std::fs::remove_file(dest.with_extension("dcpart"));
+    let _ = std::fs::remove_file(resume_meta_path(dest));
+    for i in 0..16 {
+        let _ = std::fs::remove_file(dest.with_extension(format!("dcpart{i}")));
+    }
+}
+
+/// Compare the tail of a saved range with the server's copy (QR-02).
+///
+/// Without a strong validator nothing proves that the saved bytes still
+/// belong to the resource. Re-fetching a small window of the file and
+/// comparing it byte for byte is the only safe answer: equal -> the
+/// saved range is the same resource and may be continued; different ->
+/// the resource changed and the saved bytes must be discarded.
+///
+/// `part_start` is the absolute offset of the part file inside the
+/// resource, `have` the number of bytes already saved in it.
+async fn overlap_matches(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    part: &std::path::Path,
+    part_start: u64,
+    have: u64,
+) -> Result<bool> {
+    if have == 0 {
+        return Ok(true);
+    }
+    let window = have.min(OVERLAP_WINDOW);
+    let from = part_start + have - window;
+    let to = part_start + have - 1;
+    let resp = opts
+        .get(client, url)
+        .header(reqwest::header::RANGE, format!("bytes={from}-{to}"))
+        .send()
+        .await?;
+    // A server that cannot serve the window cannot prove anything: the
+    // saved range stays unproven and the caller restarts instead.
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(false);
+    }
+    match content_range(resp.headers()) {
+        Some((first, last, _)) if first == from && last == to => {}
+        _ => return Ok(false),
+    }
+    let mut remote = Vec::with_capacity(window as usize);
+    let mut stream = resp.bytes_stream();
+    while let Some(next) = stream.next().await {
+        let chunk = next?;
+        if remote.len() as u64 + chunk.len() as u64 > window {
+            return Ok(false);
+        }
+        remote.extend_from_slice(&chunk);
+    }
+    if remote.len() as u64 != window {
+        return Ok(false);
+    }
+    let mut file = tokio::fs::File::open(part).await?;
+    file.seek(std::io::SeekFrom::Start(part_start + have - window))
+        .await?;
+    let mut local = vec![0u8; window as usize];
+    file.read_exact(&mut local).await?;
+    Ok(local == remote)
+}
+
+/// Check that the saved bytes still belong to the resource being served
+/// (QR-02).
+///
+/// - validators that disagree prove a change: the saved bytes must be
+///   discarded;
+/// - a response that repeats no validator proves nothing: an overlap
+///   window of the saved bytes is compared with the server's copy
+///   instead;
+/// - validators that agree prove the saved bytes may be continued.
+///
+/// Returns the validator of the current response (the caller stores it
+/// for the next resume).
+async fn verify_version(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    part: &std::path::Path,
+    part_start: u64,
+    have: u64,
+    saved: Option<&Validator>,
+    resp: &reqwest::Response,
+) -> Result<Option<Validator>> {
+    let current = Validator::read(resp.headers());
+    match (saved, current.as_ref()) {
+        (Some(a), Some(b)) => {
+            if !a.same(b) {
+                return Err(source_changed());
+            }
+        }
+        (Some(_), None) => {
+            // The server did not repeat the validator: prove the saved
+            // bytes by comparing them with the server's own copy.
+            if !overlap_matches(client, opts, url, part, part_start, have).await? {
+                return Err(source_changed());
+            }
+        }
+        (None, _) => {}
+    }
+    Ok(current)
 }
 
 fn resume_meta_path(dest: &std::path::Path) -> std::path::PathBuf {
@@ -414,10 +617,33 @@ fn read_resume_meta(dest: &std::path::Path) -> Option<ResumeMeta> {
     serde_json::from_str(&raw).ok()
 }
 
-fn write_resume_meta(dest: &std::path::Path, url: &str, total: Option<u64>, conns: usize) {
-    let m = ResumeMeta { url: url.to_string(), total, conns };
+fn write_resume_meta(
+    dest: &std::path::Path,
+    url: &str,
+    total: Option<u64>,
+    conns: usize,
+    validator: Option<&Validator>,
+) {
+    let m = ResumeMeta {
+        url: url.to_string(),
+        total,
+        conns,
+        validator: validator.cloned(),
+    };
     if let Ok(json) = serde_json::to_string(&m) {
         let _ = std::fs::write(resume_meta_path(dest), json);
+    }
+}
+
+/// Remember the version of the resource the saved bytes belong to (QR-02).
+/// Only the validator is touched: the URL/total/split binding stays as it
+/// was.
+fn bind_validator(dest: &std::path::Path, validator: &Validator) {
+    if let Some(mut meta) = read_resume_meta(dest) {
+        meta.validator = Some(validator.clone());
+        if let Ok(json) = serde_json::to_string(&meta) {
+            let _ = std::fs::write(resume_meta_path(dest), json);
+        }
     }
 }
 
@@ -449,7 +675,7 @@ pub(crate) fn resume_offset(
         Some(meta) if meta_matches(&meta, url, total, conns) => {
             // Adopt a newly learned total into the binding.
             if meta.total.is_none() && total.is_some() {
-                write_resume_meta(dest, url, total, conns);
+                write_resume_meta(dest, url, total, conns, meta.validator.as_ref());
             }
             // Clamp absurd prefixes (total shrank server-side): the 416
             // paths handle the restart; never resume past the end.
@@ -467,13 +693,13 @@ pub(crate) fn resume_offset(
                 let _ = std::fs::remove_file(dest.with_extension(format!("dcpart{i}")));
             }
             let _ = std::fs::remove_file(resume_meta_path(dest));
-            write_resume_meta(dest, url, total, conns);
+            write_resume_meta(dest, url, total, conns, None);
             0
         }
         None => {
             // Legacy/unbound partial: resume once by length, then bind it.
             // (One-time hole for pre-sidecar files; self-heals on next run.)
-            write_resume_meta(dest, url, total, conns);
+            write_resume_meta(dest, url, total, conns, None);
             have
         }
     }
@@ -6681,6 +6907,8 @@ async fn single_stream(
     // A 416 (offset rejected — total shrank or server forgot the file) is
     // only worth one clean restart; a second 416 means the URL itself is bad.
     let mut restarted_416 = false;
+    // A changed source (QR-02) is worth one clean restart as well.
+    let mut restarted_changed = false;
     loop {
         attempt += 1;
         let len_before = tokio::fs::metadata(dest.with_extension("dcpart"))
@@ -6719,6 +6947,22 @@ async fn single_stream(
                     continue;
                 }
                 let msg = e.to_string();
+                // QR-02: the saved bytes belong to a different version of
+                // the file. Drop them and download the current one from
+                // the start — never append one version to another.
+                if is_source_changed(&e) && !restarted_changed {
+                    restarted_changed = true;
+                    restarts += 1;
+                    discard_partials(dest);
+                    shared.downloaded.store(0, Ordering::SeqCst);
+                    if let Ok(mut g) = shared.part_done.lock() {
+                        if let Some(slot) = g.first_mut() {
+                            *slot = 0;
+                        }
+                    }
+                    stalled = 0;
+                    continue;
+                }
                 match classify_attempt(&msg) {
                     "cut" => cuts += 1,
                     "stalled" => stalls += 1,
@@ -6782,6 +7026,22 @@ async fn single_stream_once(
     };
     let mut start_at: u64 = resume_offset(dest, "dcpart", url, known_total, 1);
 
+    // QR-02: the saved prefix belongs to one exact version of the
+    // resource. Bind it before a single byte is appended: a strong
+    // validator travels as If-Range, and without one the saved bytes are
+    // only continued when an overlap window matches the server's copy.
+    let saved_validator = read_resume_meta(dest).and_then(|m| m.validator);
+    if start_at > 0 && saved_validator.is_none() {
+        // Legacy sidecar (or a server that sends no validator): nothing
+        // proves the saved bytes still belong to this resource.
+        if !overlap_matches(client, opts, url, &tmp, 0, start_at).await? {
+            discard_partials(dest);
+            write_resume_meta(dest, url, known_total, 1, None);
+            start_at = 0;
+            shared.downloaded.store(0, Ordering::SeqCst);
+        }
+    }
+
     // Always request a range (even from 0): some media servers truncate
     // plain 200 responses but serve full content for range requests.
     // Bounded when the total is known: strict edges (googlevideo SABR
@@ -6801,6 +7061,13 @@ async fn single_stream_once(
     } else {
         req.header(reqwest::header::RANGE, format!("bytes={start_at}-"))
     };
+    if start_at > 0 {
+        // The saved bytes are bound to a version: ask the server for that
+        // exact version. A changed resource answers 200 instead of 206.
+        if let Some(c) = saved_validator.as_ref().and_then(|v| v.condition()) {
+            req = req.header(reqwest::header::IF_RANGE, c);
+        }
+    }
     let resp = match req.send().await?.error_for_status() {
         Ok(r) => r,
         Err(e) => {
@@ -6833,7 +7100,59 @@ async fn single_stream_once(
 
     // If server ignored our Range, restart from 0.
     let is_partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    // QR-02: a 206 names the window it answered in Content-Range, and
+    // those bytes belong exactly there. A window that starts somewhere
+    // else would land them at the wrong offset, so it is refused.
+    if is_partial {
+        match content_range(resp.headers()) {
+            Some((first, last, total)) => {
+                if first != start_at {
+                    return Err(anyhow!(
+                        "server answered range {first}-{last} instead of {start_at}- — refusing to write bytes at the wrong offset"
+                    ));
+                }
+                if start_at > 0 {
+                    if let (Some(want), Some(got)) = (known_total, total) {
+                        if want != got {
+                            // The file changed size: the saved prefix
+                            // belongs to a different resource.
+                            return Err(source_changed());
+                        }
+                    }
+                }
+            }
+            None => {
+                if start_at > 0 {
+                    return Err(anyhow!(
+                        "server answered 206 without a usable Content-Range — refusing to resume"
+                    ));
+                }
+            }
+        }
+    }
+    // QR-02: the saved bytes must belong to the version now being served.
+    if start_at > 0 {
+        let current = verify_version(
+            client,
+            opts,
+            url,
+            &tmp,
+            0,
+            start_at,
+            saved_validator.as_ref(),
+            &resp,
+        )
+        .await?;
+        if let Some(v) = current.as_ref() {
+            bind_validator(dest, v);
+        }
+    }
+    let mut truncate_to_zero = false;
     if !is_partial && start_at > 0 {
+        // The server sent the whole file (it ignored the Range, or the
+        // resource changed and If-Range made it answer 200). The body on
+        // disk must not keep a single byte of the old version.
+        truncate_to_zero = true;
         start_at = 0;
         shared.downloaded.store(0, Ordering::SeqCst);
     }
@@ -6872,10 +7191,12 @@ async fn single_stream_once(
         .write(true)
         .open(&tmp)
         .await?;
-    if start_at > 0 && is_partial {
-        raw.seek(std::io::SeekFrom::Start(start_at)).await?;
-    } else if start_at > 0 {
+    if truncate_to_zero {
+        // The saved prefix belongs to a different body: drop it entirely,
+        // so not one byte of it survives next to the new one.
         raw.set_len(0).await?;
+    } else if start_at > 0 && is_partial {
+        raw.seek(std::io::SeekFrom::Start(start_at)).await?;
     }
     let mut file = tokio::io::BufWriter::with_capacity(WRITE_BUF, raw);
 
@@ -7002,6 +7323,8 @@ async fn chunked_stream(
     resume_offset(dest, "dcpart", url, Some(total), 1);
     // One restart-from-zero per download (stale offset / shrunken file).
     let mut restarted = false;
+    // A changed source (QR-02) is worth one clean restart as well.
+    let mut restarted_changed = false;
     let mut stalled = 0u32;
     let mut attempt = 0u32;
     // Attempt telemetry for the final summary (see with_attempt_summary).
@@ -7015,6 +7338,19 @@ async fn chunked_stream(
     let mut refusals = 0u32;
     // Single part view for the dialogs (no lock held across awaits).
     let have_now = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+    // QR-02: the saved prefix belongs to one exact version of the
+    // resource. A strong validator travels as If-Range with every chunk;
+    // without one the saved bytes are only continued when an overlap
+    // window matches the server's copy.
+    let mut saved_validator = read_resume_meta(dest).and_then(|m| m.validator);
+    if have_now > 0 && saved_validator.is_none() {
+        if !overlap_matches(client, opts, url, &tmp, 0, have_now).await? {
+            discard_partials(dest);
+            write_resume_meta(dest, url, Some(total), 1, None);
+            saved_validator = None;
+            shared.downloaded.store(0, Ordering::SeqCst);
+        }
+    }
     {
         let mut totals = mutex_guard(&shared.part_total);
         let mut dones = mutex_guard(&shared.part_done);
@@ -7040,7 +7376,7 @@ async fn chunked_stream(
         };
         let want = end.saturating_sub(offset).saturating_add(1);
         let len_before = offset;
-        match chunked_once(client, opts, url, &tmp, offset, end, want, stall_timeout, &shared, &limiter).await {
+        match chunked_once(client, opts, url, &tmp, offset, end, want, stall_timeout, &shared, &limiter, saved_validator.as_ref()).await {
             Ok(wrote) => {
                 stalled = 0;
                 refusals = 0;
@@ -7054,6 +7390,18 @@ async fn chunked_stream(
             Err(e) => {
                 if shared.cancelled.load(Ordering::SeqCst) || e.to_string() == "cancelled" {
                     return Err(e);
+                }
+                // QR-02: the saved bytes belong to a different version of
+                // the file. Drop them and fetch the current one from zero.
+                if is_source_changed(&e) && !restarted_changed {
+                    restarted_changed = true;
+                    restarts += 1;
+                    discard_partials(dest);
+                    write_resume_meta(dest, url, Some(total), 1, None);
+                    saved_validator = None;
+                    shared.downloaded.store(0, Ordering::SeqCst);
+                    stalled = 0;
+                    continue;
                 }
                 if is_final_http_error(&e) {
                     // Refusal on a live offset: throttle burst OR expiry.
@@ -7121,7 +7469,8 @@ async fn chunked_stream(
                             shared.total.store(t, Ordering::SeqCst);
                             shared.has_total.store(true, Ordering::SeqCst);
                             // Rebind resume state to the refreshed total.
-                            write_resume_meta(dest, url, Some(t), 1);
+                            let keep = read_resume_meta(dest).and_then(|m| m.validator);
+                            write_resume_meta(dest, url, Some(t), 1, keep.as_ref());
                         }
                     }
                     stalled = 0;
@@ -7175,12 +7524,18 @@ async fn chunked_once(
     stall_timeout: u64,
     shared: &Arc<SharedState>,
     limiter: &std::sync::Arc<RateLimiter>,
+    saved_validator: Option<&Validator>,
 ) -> Result<u64> {
-    let resp = opts
+    let mut req = opts
         .get(client, url)
-        .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
-        .send()
-        .await?;
+        .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"));
+    if offset > 0 {
+        // The saved bytes are bound to a version: ask for that exact one.
+        if let Some(c) = saved_validator.and_then(|v| v.condition()) {
+            req = req.header(reqwest::header::IF_RANGE, c);
+        }
+    }
+    let resp = req.send().await?;
     let resp = resp
         .error_for_status()
         .map_err(|e| http_status_err(url, e))?;
@@ -7196,6 +7551,37 @@ async fn chunked_once(
         shared.resumable.store(false, Ordering::SeqCst);
     } else {
         shared.resumable.store(true, Ordering::SeqCst);
+    }
+    if is_partial {
+        // QR-02: the answered window must start where we asked, otherwise
+        // the bytes belong at another offset.
+        match content_range(resp.headers()) {
+            Some((first, last, _)) => {
+                if first != offset || last > end {
+                    return Err(anyhow!(
+                        "server answered range {first}-{last} instead of {offset}-{end} — refusing to write bytes at the wrong offset"
+                    ));
+                }
+            }
+            None => {
+                if offset > 0 {
+                    return Err(anyhow!(
+                        "server answered 206 without a usable Content-Range — refusing to resume"
+                    ));
+                }
+            }
+        }
+    }
+    if offset > 0 {
+        // QR-02: the saved bytes must belong to the version now served.
+        let current =
+            verify_version(client, opts, url, tmp, 0, offset, saved_validator, &resp).await?;
+        if let Some(v) = current.as_ref() {
+            bind_validator(tmp, v);
+        }
+    } else if let Some(v) = Validator::read(resp.headers()) {
+        // Learn the version for the next resume.
+        bind_validator(tmp, &v);
     }
     // Kept for the short error below: a zero-byte range with a 200/empty
     // body vs a cut 206 mean very different things (see probe_range_once).
@@ -7296,7 +7682,45 @@ async fn chunked_once(
     Ok(wrote)
 }
 
+/// Download a file as several parallel byte ranges and merge them.
+///
+/// QR-02: when the resource changes under the transfer the saved parts
+/// belong to a different version of the file. They are dropped and the
+/// current version is downloaded from the start — two versions of a file
+/// are never merged into one.
 async fn segmented(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    dest: &PathBuf,
+    total: u64,
+    connections: usize,
+    shared: Arc<SharedState>,
+    limiter: std::sync::Arc<RateLimiter>,
+) -> Result<()> {
+    let first = segmented_once(
+        client,
+        opts,
+        url,
+        dest,
+        total,
+        connections,
+        shared.clone(),
+        limiter.clone(),
+    )
+    .await;
+    match first {
+        Ok(()) => Ok(()),
+        Err(e) if is_source_changed(&e) => {
+            discard_partials(dest);
+            shared.downloaded.store(0, Ordering::SeqCst);
+            segmented_once(client, opts, url, dest, total, connections, shared, limiter).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn segmented_once(
     client: &reqwest::Client,
     opts: &EngineOpts,
     url: &str,
@@ -7478,7 +7902,10 @@ async fn download_range(
                 if shared.cancelled.load(Ordering::SeqCst) {
                     return Err(e);
                 }
-                if e.to_string() == "cancelled" || is_final_http_error(&e) {
+                if e.to_string() == "cancelled" || is_final_http_error(&e) || is_source_changed(&e) {
+                    // A changed source (QR-02) is not a transport hiccup:
+                    // retrying the same part would append one version to
+                    // another. The caller restarts the whole file.
                     return Err(e);
                 }
                 // Attempts append, so file growth == progress.
@@ -7520,12 +7947,26 @@ async fn download_range_once(
         orig
     };
     let from = start.saturating_add(have);
-    let resp = opts
+    // QR-02: the saved part bytes belong to one exact version of the
+    // resource. The binding lives in the sidecar next to the parts (the
+    // part file carries the same stem, so the sidecar path is the same).
+    let saved_validator = read_resume_meta(part).and_then(|m| m.validator);
+    if have > 0 && saved_validator.is_none() {
+        // Nothing proves the saved part belongs to this resource.
+        if !overlap_matches(client, opts, url, part, start, have).await? {
+            return Err(source_changed());
+        }
+    }
+    let mut req = opts
         .get(client, url)
-        .header(
-            reqwest::header::RANGE,
-            format!("bytes={from}-{end}"),
-        )
+        .header(reqwest::header::RANGE, format!("bytes={from}-{end}"));
+    if have > 0 {
+        // The saved bytes are bound to a version: ask for that exact one.
+        if let Some(c) = saved_validator.as_ref().and_then(|v| v.condition()) {
+            req = req.header(reqwest::header::IF_RANGE, c);
+        }
+    }
+    let resp = req
         .send()
         .await?
         .error_for_status()
@@ -7535,6 +7976,46 @@ async fn download_range_once(
     // and sent the whole file: slice our window out of the stream instead of
     // writing garbage (or failing outright).
     let is_partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if is_partial {
+        // QR-02: the answered window must be exactly the requested one.
+        // Bytes that belong elsewhere would land at the wrong offset.
+        match content_range(resp.headers()) {
+            Some((first, last, _)) => {
+                if first != from || last != end {
+                    return Err(anyhow!(
+                        "server answered range {first}-{last} instead of {from}-{end} — refusing to write bytes at the wrong offset"
+                    ));
+                }
+            }
+            None => {
+                if have > 0 {
+                    return Err(anyhow!(
+                        "server answered 206 without a usable Content-Range — refusing to resume"
+                    ));
+                }
+            }
+        }
+    }
+    if have > 0 {
+        // QR-02: the saved bytes must belong to the version now served.
+        let current = verify_version(
+            client,
+            opts,
+            url,
+            part,
+            start,
+            have,
+            saved_validator.as_ref(),
+            &resp,
+        )
+        .await?;
+        if let Some(v) = current.as_ref() {
+            bind_validator(part, v);
+        }
+    } else if let Some(v) = Validator::read(resp.headers()) {
+        // Learn the version for the next resume.
+        bind_validator(part, &v);
+    }
     if !is_partial && have > 0 {
         let _ = tokio::fs::remove_file(part).await;
     }
@@ -7971,7 +8452,7 @@ mod tests {
 
         // Different URL: stale prefix discarded (the FB slice case).
         std::fs::write(&part, vec![7u8; 100]).unwrap();
-        write_resume_meta(&dest, url_a, Some(1000), 1);
+        write_resume_meta(&dest, url_a, Some(1000), 1, None);
         assert_eq!(resume_offset(&dest, "dcpart", url_b, Some(1000), 1), 0);
         assert!(!part.exists());
 
@@ -7988,7 +8469,7 @@ mod tests {
         assert!(!p0.exists());
 
         // meta_matches unit rules.
-        let m = ResumeMeta { url: url_a.into(), total: Some(1000), conns: 1 };
+        let m = ResumeMeta { url: url_a.into(), total: Some(1000), conns: 1, validator: None };
         assert!(meta_matches(&m, url_a, Some(1000), 1));
         assert!(!meta_matches(&m, url_b, Some(1000), 1));
         assert!(!meta_matches(&m, url_a, Some(999), 1));
@@ -7996,6 +8477,617 @@ mod tests {
         assert!(meta_matches(&m, url_a, None, 1)); // unknown: wildcard
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- QR-02: version-bound resume --------------------------------------
+    //
+    // A local file server whose served version can change under the engine:
+    // it carries an ETag (or a Last-Modified date), honours `If-Range`, and
+    // can answer with a deliberately wrong `Content-Range`.
+
+    #[derive(Clone)]
+    struct Versioned {
+        inner: std::sync::Arc<VersionedInner>,
+    }
+
+    struct VersionedInner {
+        state: std::sync::Mutex<VersionedState>,
+        /// (Range, If-Range) of every request the engine made.
+        seen: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
+    }
+
+    #[derive(Clone)]
+    struct VersionedState {
+        body: Vec<u8>,
+        etag: Option<String>,
+        modified: Option<String>,
+        /// Name a different window in `Content-Range`.
+        wrong_range: bool,
+        /// Answer 206 even when the `If-Range` condition does not match.
+        ignore_if_range: bool,
+    }
+
+    impl Versioned {
+        fn new(body: Vec<u8>, etag: Option<&str>, modified: Option<&str>) -> Self {
+            Self {
+                inner: std::sync::Arc::new(VersionedInner {
+                    state: std::sync::Mutex::new(VersionedState {
+                        body,
+                        etag: etag.map(str::to_string),
+                        modified: modified.map(str::to_string),
+                        wrong_range: false,
+                        ignore_if_range: false,
+                    }),
+                    seen: std::sync::Mutex::new(Vec::new()),
+                }),
+            }
+        }
+
+        /// Serve a different version from now on.
+        fn serve(&self, body: Vec<u8>, etag: Option<&str>, modified: Option<&str>) {
+            let mut g = mutex_guard(&self.inner.state);
+            g.body = body;
+            g.etag = etag.map(str::to_string);
+            g.modified = modified.map(str::to_string);
+        }
+
+        fn flags(&self, wrong_range: bool, ignore_if_range: bool) {
+            let mut g = mutex_guard(&self.inner.state);
+            g.wrong_range = wrong_range;
+            g.ignore_if_range = ignore_if_range;
+        }
+
+        fn requests(&self) -> Vec<(Option<String>, Option<String>)> {
+            mutex_guard(&self.inner.seen).clone()
+        }
+    }
+
+    async fn serve_versioned(mut s: tokio::net::TcpStream, v: Versioned) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match s.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&chunk[..n]);
+                    if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let head = String::from_utf8_lossy(&raw).into_owned();
+        let mut lines = head.lines();
+        let rl = lines.next().unwrap_or("").to_string();
+        let mut it = rl.split_whitespace();
+        let method = it.next().unwrap_or("").to_string();
+        let mut range: Option<(u64, u64)> = None;
+        let mut if_range: Option<String> = None;
+        for l in lines {
+            if l.trim().is_empty() {
+                break;
+            }
+            if let Some((k, val)) = l.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("range") {
+                    let v = val.trim().strip_prefix("bytes=").unwrap_or("").trim();
+                    if let Some((a, b)) = v.split_once('-') {
+                        if let Ok(start) = a.trim().parse::<u64>() {
+                            let end = b.trim().parse::<u64>().unwrap_or(u64::MAX);
+                            range = Some((start, end));
+                        }
+                    }
+                } else if k.trim().eq_ignore_ascii_case("if-range") {
+                    if_range = Some(val.trim().to_string());
+                }
+            }
+        }
+        let (body, etag, modified, wrong_range, ignore_if_range) = {
+            let g = mutex_guard(&v.inner.state);
+            (
+                g.body.clone(),
+                g.etag.clone(),
+                g.modified.clone(),
+                g.wrong_range,
+                g.ignore_if_range,
+            )
+        };
+        mutex_guard(&v.inner.seen).push((
+            range.map(|(a, _)| format!("bytes={a}-")),
+            if_range.clone(),
+        ));
+        let total = body.len() as u64;
+        let etag_h = etag
+            .as_ref()
+            .map(|e| format!("ETag: {e}\r\n"))
+            .unwrap_or_default();
+        let mod_h = modified
+            .as_ref()
+            .map(|m| format!("Last-Modified: {m}\r\n"))
+            .unwrap_or_default();
+        // Does the condition the client sent still describe what we serve?
+        let cond_ok = match (&if_range, &etag, &modified) {
+            (None, _, _) => true,
+            (Some(c), Some(e), _) => c == e,
+            (Some(c), None, Some(m)) => c == m,
+            (Some(_), None, None) => false,
+        };
+        let is_head = method.eq_ignore_ascii_case("HEAD");
+        let served = match range {
+            Some((start, end)) if start < total && (cond_ok || ignore_if_range) => {
+                let last = if end == u64::MAX {
+                    total - 1
+                } else {
+                    end.min(total - 1)
+                };
+                Some((start, last))
+            }
+            Some((start, _)) if start >= total => {
+                let r = format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\n{etag_h}{mod_h}Connection: close\r\n\r\n");
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.flush().await;
+                return;
+            }
+            _ => None,
+        };
+        match served {
+            Some((start, last)) => {
+                let slice = &body[start as usize..=last as usize];
+                let first = if wrong_range { start + 1 } else { start };
+                let r = format!("HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {first}-{last}/{total}\r\nContent-Length: {}\r\n{etag_h}{mod_h}Connection: close\r\n\r\n", slice.len());
+                let _ = s.write_all(r.as_bytes()).await;
+                if !is_head {
+                    let _ = s.write_all(slice).await;
+                }
+                let _ = s.flush().await;
+            }
+            None => {
+                let r = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n{etag_h}{mod_h}Connection: close\r\n\r\n", body.len());
+                let _ = s.write_all(r.as_bytes()).await;
+                if !is_head {
+                    let _ = s.write_all(&body).await;
+                }
+                let _ = s.flush().await;
+            }
+        }
+    }
+
+    async fn versioned_server(v: Versioned) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind versioned fixture");
+        let addr = listener.local_addr().expect("versioned addr");
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((s, _)) => {
+                        let v = v.clone();
+                        tokio::spawn(async move { serve_versioned(s, v).await });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        format!("http://{addr}/file")
+    }
+
+    fn versioned_body(len: usize, salt: u8) -> Vec<u8> {
+        (0..len).map(|i| ((i % 251) as u8).wrapping_add(salt)).collect()
+    }
+
+    #[tokio::test]
+    async fn resume_binds_strong_etag_and_sends_if_range() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("etag.bin");
+
+        // A saved prefix bound to version 1 of the resource.
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("resume with etag");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+
+        // The resume carried the binding as If-Range.
+        let seen = v.requests();
+        assert!(
+            seen.iter()
+                .any(|(_, ir)| ir.as_deref() == Some("\"v1\"")),
+            "the resume must send If-Range, saw: {seen:?}"
+        );
+        // ...and asked for the window that continues the saved prefix.
+        let expect = format!("bytes={PREFIX}-");
+        assert!(
+            seen.iter().any(|(r, _)| r.as_deref() == Some(expect.as_str())),
+            "the resume must continue at the saved offset, saw: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn changed_resource_restarts_instead_of_appending() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let v1 = versioned_body(LEN, 0);
+        let v2 = versioned_body(LEN, 90); // same size, different bytes
+        let v = Versioned::new(v1.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02b_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("changed.bin");
+
+        std::fs::write(dest.with_extension("dcpart"), &v1[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+        // The server now serves a different version of the same URL.
+        v.serve(v2.clone(), Some("\"v2\""), None);
+
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("changed resource must restart, not fail");
+        // The file must be the current version, byte for byte: not one byte
+        // of the old prefix may survive.
+        assert_eq!(std::fs::read(&dest).unwrap(), v2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wrong_validator_in_partial_is_refused() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let v1 = versioned_body(LEN, 0);
+        let v2 = versioned_body(LEN, 90);
+        let v = Versioned::new(v1.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02c_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("wrongvalidator.bin");
+
+        std::fs::write(dest.with_extension("dcpart"), &v1[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+        // A server that ignores If-Range and answers 206 with the NEW etag:
+        // the bytes belong to another version and must not be appended.
+        v.serve(v2.clone(), Some("\"v2\""), None);
+        v.flags(false, true);
+
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("wrong validator must restart");
+        assert_eq!(std::fs::read(&dest).unwrap(), v2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn segmented_parts_of_a_changed_resource_are_not_merged() {
+        const LEN: usize = 3 * 1024 * 1024; // >= 1 MiB forces the segmented path
+        const PREFIX: usize = 100 * 1024;
+        let v1 = versioned_body(LEN, 0);
+        let v2 = versioned_body(LEN, 90);
+        let v = Versioned::new(v1.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02i_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("segchanged.bin");
+
+        // Part 0 holds a prefix of version 1; the split matches the sidecar.
+        std::fs::write(dest.with_extension("dcpart0"), &v1[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            4,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+        // The server keeps answering ranges, but with the new version.
+        v.serve(v2.clone(), Some("\"v2\""), None);
+        v.flags(false, true);
+
+        download(
+            url.clone(),
+            dest.clone(),
+            4,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("segmented changed resource must restart");
+        // Two versions of a file must never be merged into one.
+        assert_eq!(std::fs::read(&dest).unwrap(), v2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_content_range_is_refused() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02d_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("badrange.bin");
+
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: Some("\"v1\"".into()),
+                modified: None,
+            }),
+        );
+        // The server names a window that is not the one we asked for.
+        v.flags(true, false);
+
+        let err = download(
+            url.clone(),
+            dest.clone(),
+            1,
+            EngineOpts {
+                max_retries: 1,
+                ..matrix_opts()
+            },
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect_err("a wrong Content-Range must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("wrong offset"),
+            "must name the offset problem, got: {msg}"
+        );
+        // Nothing was appended: the saved prefix is untouched.
+        let part = std::fs::read(dest.with_extension("dcpart")).unwrap();
+        assert_eq!(part.len(), PREFIX);
+        assert_eq!(part, body[..PREFIX]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_partial_without_validator_is_verified_by_overlap() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02e_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("legacy.bin");
+
+        // A legacy partial: correct bytes, but no sidecar at all.
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("legacy partial");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        // The engine proved the saved bytes with a small overlap window.
+        let seen = v.requests();
+        assert!(
+            seen.iter().any(|(r, _)| r
+                .as_deref()
+                .map(|r| r.starts_with("bytes=") && r.contains('-'))
+                .unwrap_or(false)),
+            "the overlap check must ask for a window, saw: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_partial_with_foreign_bytes_is_discarded() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02f_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("foreign.bin");
+
+        // A partial from a DIFFERENT version of the file, no sidecar.
+        std::fs::write(dest.with_extension("dcpart"), vec![0xABu8; PREFIX]).unwrap();
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("foreign partial must be replaced");
+        // Not one byte of the foreign prefix may survive.
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn old_sidecar_without_validator_field_still_loads() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), Some("\"v1\""), None);
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02g_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("oldsidecar.bin");
+
+        // A sidecar written before the validator existed.
+        std::fs::write(
+            resume_meta_path(&dest),
+            format!("{{\"url\":\"{url}\",\"total\":{LEN},\"conns\":1}}"),
+        )
+        .unwrap();
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+
+        let meta = read_resume_meta(&dest).expect("old sidecar must still load");
+        assert!(meta.validator.is_none(), "old sidecar has no validator");
+        assert_eq!(meta.url, url);
+        assert_eq!(meta.total, Some(LEN as u64));
+
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("old sidecar resume");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn last_modified_is_used_when_no_etag_is_offered() {
+        const LEN: usize = 256 * 1024;
+        const PREFIX: usize = 100 * 1024;
+        const DATE: &str = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let body = versioned_body(LEN, 0);
+        let v = Versioned::new(body.clone(), None, Some(DATE));
+        let url = versioned_server(v.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc_qr02h_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("lastmod.bin");
+
+        std::fs::write(dest.with_extension("dcpart"), &body[..PREFIX]).unwrap();
+        write_resume_meta(
+            &dest,
+            &url,
+            Some(LEN as u64),
+            1,
+            Some(&Validator {
+                etag: None,
+                modified: Some(DATE.into()),
+            }),
+        );
+        download(
+            url.clone(),
+            dest.clone(),
+            1,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("last-modified resume");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let seen = v.requests();
+        assert!(
+            seen.iter()
+                .any(|(_, ir)| ir.as_deref() == Some(DATE)),
+            "the resume must send If-Range with the date, saw: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validator_reads_only_strong_etags() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::ETAG,
+            reqwest::header::HeaderValue::from_static("W/\"weak\""),
+        );
+        // A weak ETag proves nothing about the bytes: it is not stored.
+        assert!(Validator::read(&h).is_none());
+        h.insert(
+            reqwest::header::ETAG,
+            reqwest::header::HeaderValue::from_static("\"strong\""),
+        );
+        let v = Validator::read(&h).expect("strong etag");
+        assert_eq!(v.etag.as_deref(), Some("\"strong\""));
+        assert_eq!(v.condition(), Some("\"strong\""));
+        assert!(v.same(&v.clone()));
+
+        let mut other = reqwest::header::HeaderMap::new();
+        other.insert(
+            reqwest::header::ETAG,
+            reqwest::header::HeaderValue::from_static("\"other\""),
+        );
+        let o = Validator::read(&other).expect("other etag");
+        assert!(!v.same(&o), "different etags are different versions");
+    }
+
+    #[test]
+    fn content_range_is_parsed_strictly() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            reqwest::header::HeaderValue::from_static("bytes 100-199/1000"),
+        );
+        assert_eq!(content_range(&h), Some((100, 199, Some(1000))));
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            reqwest::header::HeaderValue::from_static("bytes 0-99/*"),
+        );
+        assert_eq!(content_range(&h), Some((0, 99, None)));
+        for bad in ["bytes abc-def/10", "items 1-2/3", "bytes 1-2", "nonsense"] {
+            h.insert(
+                reqwest::header::CONTENT_RANGE,
+                reqwest::header::HeaderValue::from_str(bad).unwrap(),
+            );
+            assert_eq!(content_range(&h), None, "must refuse {bad}");
+        }
     }
 
     #[test]
