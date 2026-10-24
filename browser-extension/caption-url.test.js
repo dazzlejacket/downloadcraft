@@ -58,3 +58,12 @@ test('a track without a usable URL is not offered',()=>{
   assert.deepEqual( tracks({}),[]);
   assert.deepEqual( tracks(null),[]);
 });
+
+ test('caption chip uses the selected SRT format and preserves signed parameters',()=>{
+  const raw='https://www.youtube.com/api/timedtext?v=x&lang=de&fmt=srt&signature=Ab%2FC&name=CC';
+  const sb=tracks(player([{baseUrl:raw,languageCode:'de'}]))[0];
+  assert.equal(sb.url,raw);
+  assert.equal(sb.format,'srt');
+  assert.match(source,/sb\.format === "srt" \? "application\/x-subrip"/);
+  assert.match(source,/sb\.format \|\| "vtt"/);
+});

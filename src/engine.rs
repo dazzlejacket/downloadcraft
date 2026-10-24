@@ -292,6 +292,10 @@ impl Default for EngineOpts {
 
 impl EngineOpts {
     pub fn build_client(&self) -> Result<reqwest::Client> {
+        self.build_client_redirects(true)
+    }
+
+    fn build_client_redirects(&self, follow: bool) -> Result<reqwest::Client> {
         // HTTP/1.1 only: several media servers RST or truncate H2 streams
         // from non-browser TLS stacks, while plain H1 range GETs work.
         // IPv4-only egress: a broken IPv6 path (tunnel/relay) completes TCP
@@ -323,6 +327,7 @@ impl EngineOpts {
                 })
             }
         };
+        let redirect = if follow { redirect } else { reqwest::redirect::Policy::none() };
         let mut b = reqwest::Client::builder()
             .user_agent(self.user_agent.clone())
             .redirect(redirect)
@@ -1260,6 +1265,8 @@ fn is_youtube_page(url: &str) -> bool {
     url.contains("youtube.com") || url.contains("youtu.be")
 }
 
+include!("captions.rs");
+
 /// A caption file YouTube serves itself.
 ///
 /// The caption endpoint (`/api/timedtext`) hands out a WebVTT when it is
@@ -1267,31 +1274,16 @@ fn is_youtube_page(url: &str) -> bool {
 /// so every YouTube-shaped test calls it a page, and resolving it as one
 /// downloads the VIDEO the captions belong to instead of the captions.
 pub fn is_youtube_caption_url(url: &str) -> bool {
-    let low = url.to_ascii_lowercase();
-    if !(low.contains("youtube.com") || low.contains("youtu.be")) {
-        return false;
-    }
-    if low.contains("/api/timedtext") {
-        return true;
-    }
-    // A caption URL names its own format: fmt=vtt, srt, srv3, ttml, json3.
-    match low.split_once('?') {
-        Some((_, query)) => query.split('&').any(|pair| {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            k.eq_ignore_ascii_case("fmt")
-                && matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "vtt" | "srt" | "srv1" | "srv2" | "srv3" | "ttml" | "json3"
-                )
-        }),
-        None => false,
-    }
+    url::Url::parse(url).ok().map(|u| {
+        youtube_host(u.host_str().unwrap_or("")) && u.path() == "/api/timedtext"
+    }).unwrap_or(false)
 }
 
 /// A YouTube *page* is a video to resolve. A YouTube *file* — the caption
 /// endpoint above — is a file to download as it is.
 pub fn is_youtube_video_page(url: &str) -> bool {
-    (url.contains("youtube.com") || url.contains("youtu.be")) && !is_youtube_caption_url(url)
+    url::Url::parse(url).ok().map(|u| youtube_host(u.host_str().unwrap_or(""))).unwrap_or(false)
+        && !is_youtube_caption_url(url)
 }
 
 /// Does this URL have to be resolved into a media stream before it can be
@@ -1301,8 +1293,8 @@ pub fn is_youtube_video_page(url: &str) -> bool {
 /// resolves it to the stream instead of saving the HTML. A caption file is
 /// neither: it is downloaded as it is.
 pub fn needs_resolve(url: &str, content_type: Option<&str>) -> bool {
-    content_type.map(|c| c.contains("text/html")).unwrap_or(false)
-        || is_youtube_video_page(url)
+    !is_youtube_caption_url(url) && (content_type.map(|c| c.contains("text/html")).unwrap_or(false)
+        || is_youtube_video_page(url))
 }
 
 /// Verify a finished file against an expected SHA-256 hex digest.
@@ -4235,6 +4227,9 @@ async fn download_inner(
     mut opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    if is_youtube_caption_url(&url) {
+        return download_caption(&url, dest, &opts, &shared).await;
+    }
     // Resolve Vimeo before probing the CDN: a successful fragment response
     // proves nothing about the full video's size or completeness.
     let resolve_page = match vimeo_download_target(&url, &opts.referer)? {
@@ -8853,6 +8848,9 @@ async fn segmented_once(
     // (P0); same-URL+total+conns still resumes via download_range seeding.
     resume_offset(dest, "dcpart", url, Some(total), connections);
 
+    // Every worker must validate against the same saved version. A fresh
+    // sibling can update the shared sidecar before a resumed worker reads it.
+    let saved_validator = read_resume_meta(dest).and_then(|m| m.validator);
     let chunk = total / connections as u64;
 
     let mut handles = Vec::new();
@@ -8883,6 +8881,7 @@ async fn segmented_once(
         let shared = shared.clone();
         let opts = opts.clone();
         let limiter = limiter.clone();
+        let saved_validator = saved_validator.clone();
         handles.push(tokio::spawn(async move {
             download_range(
                 &client,
@@ -8894,6 +8893,7 @@ async fn segmented_once(
                 limiter,
                 i,
                 shared,
+                saved_validator,
             )
             .await
         }));
@@ -8967,6 +8967,7 @@ async fn download_range(
     limiter: std::sync::Arc<RateLimiter>,
     part_idx: usize,
     shared: Arc<SharedState>,
+    saved_validator: Option<Validator>,
 ) -> Result<()> {
     // One host-wide slot per open connection (Queue v2): with the cap set,
     // three jobs to the same CDN can never open 3×8 sockets.
@@ -9008,6 +9009,7 @@ async fn download_range(
             limiter.clone(),
             part_idx,
             &shared,
+            saved_validator.as_ref(),
         )
         .await;
         match res {
@@ -9049,6 +9051,7 @@ async fn download_range_once(
     limiter: std::sync::Arc<RateLimiter>,
     part_idx: usize,
     shared: &Arc<SharedState>,
+    saved_validator: Option<&Validator>,
 ) -> Result<()> {
     let range_len = end.saturating_sub(start).saturating_add(1);
     // Resume offset: previous attempts (or an earlier throttled run) may
@@ -9064,7 +9067,6 @@ async fn download_range_once(
     // QR-02: the saved part bytes belong to one exact version of the
     // resource. The binding lives in the sidecar next to the parts (the
     // part file carries the same stem, so the sidecar path is the same).
-    let saved_validator = read_resume_meta(part).and_then(|m| m.validator);
     if have > 0 && saved_validator.is_none() {
         // Nothing proves the saved part belongs to this resource.
         if !overlap_matches(client, opts, url, part, start, have).await? {
@@ -9076,7 +9078,7 @@ async fn download_range_once(
         .header(reqwest::header::RANGE, format!("bytes={from}-{end}"));
     if have > 0 {
         // The saved bytes are bound to a version: ask for that exact one.
-        if let Some(c) = saved_validator.as_ref().and_then(|v| v.condition()) {
+        if let Some(c) = saved_validator.and_then(|v| v.condition()) {
             req = req.header(reqwest::header::IF_RANGE, c);
         }
     }
@@ -9123,7 +9125,7 @@ async fn download_range_once(
             part,
             start,
             have,
-            saved_validator.as_ref(),
+            saved_validator,
             &resp,
         )
         .await?;

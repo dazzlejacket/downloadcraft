@@ -269,6 +269,25 @@ fn target_path(dest: &Path, rel: &Path) -> Option<PathBuf> {
     {
         return None;
     }
+    // Lexical containment alone follows an existing directory junction or
+    // symlink out of the extraction folder. Reject reparse points in every
+    // component, including a dangling link or the destination file itself.
+    let mut checked = dest.to_path_buf();
+    for component in rel.components() {
+        checked.push(component);
+        match std::fs::symlink_metadata(&checked) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() { return None; }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if meta.file_attributes() & 0x400 != 0 { return None; }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
     let joined = dest.join(rel);
     if !joined.starts_with(dest) {
         return None;
@@ -1116,5 +1135,33 @@ mod tests {
         r.read_to_string(&mut tail).unwrap();
         assert_eq!(tail, "world");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod final_audit_path_tests {
+    use super::*;
+    #[test]
+    fn extraction_refuses_existing_directory_links() {
+        let root = std::env::temp_dir().join(format!("dc-archive-link-{}", std::process::id()));
+        let dest = root.join("dest"); let outside = root.join("outside");
+        std::fs::create_dir_all(&dest).unwrap(); std::fs::create_dir_all(&outside).unwrap();
+        let link = dest.join("redirect");
+        #[cfg(windows)]
+        {
+            let result = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&outside).output().unwrap();
+            assert!(result.status.success(), "test junction must be created");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(target_path(&dest, Path::new("redirect/escaped.txt")).is_none());
+        let mut input = std::io::Cursor::new(b"must stay inside");
+        assert!(write_entry(&dest, Path::new("redirect/escaped.txt"), &mut input, false).is_err());
+        assert!(!outside.join("escaped.txt").exists());
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir(&dest).unwrap(); std::fs::remove_dir(&outside).unwrap(); std::fs::remove_dir(&root).unwrap();
     }
 }

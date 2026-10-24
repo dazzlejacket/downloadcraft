@@ -244,6 +244,7 @@
           url: /[?&]fmt=/i.test(u) ? u : u + "&fmt=vtt",
           label: `${short}${c.kind === "asr" ? " (auto)" : ""}`,
           lang: c.languageCode || "",
+          format: /[?&]fmt=srt(?:&|$)/i.test(u) ? "srt" : "vtt",
         });
       }
     } catch (e) { /* captions are optional */ }
@@ -2690,9 +2691,9 @@
     // "Other Files": subtitle tracks and audio-only streams as chips.
     for (const sb of (info.subs || [])) {
       api.addChip({
-        label: `📄 VTT ${sb.label}`,
+        label: `📄 ${(sb.format || "vtt").toUpperCase()} ${sb.label}`,
         tip: sb.url.slice(0, 120),
-        send: () => sendDownload(sb.url, `${fname} [${sb.lang || sb.label}].vtt`, "text/vtt", null, null, null, null),
+        send: () => sendDownload(sb.url, `${fname} [${sb.lang || sb.label}].${sb.format || "vtt"}`, sb.format === "srt" ? "application/x-subrip" : "text/vtt", null, null, null, null),
       });
     }
     for (const st of (info.audio || [])) {
