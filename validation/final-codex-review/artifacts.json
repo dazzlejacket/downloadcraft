@@ -1,0 +1,22 @@
+[
+  {
+    "path": "C:\\Users\\grego\\Documents\\Codex Projects\\DownloadCraft\\integration-098\\dist\\final-codex-review\\extensions\\DownloadCraft-Chromium-0.9.8.2.zip",
+    "bytes": 161092,
+    "sha256": "87aa10991838b9edf969ad31766f10ec7997bd2027f5d54a70d6dd3cfc9878ab"
+  },
+  {
+    "path": "C:\\Users\\grego\\Documents\\Codex Projects\\DownloadCraft\\integration-098\\dist\\final-codex-review\\extensions\\DownloadCraft-Firefox-0.9.8.2.xpi",
+    "bytes": 158905,
+    "sha256": "64a4315326be92b1708cb3f68948a3662060c31e41706ed522f0c8f37d2fd639"
+  },
+  {
+    "path": "C:\\Users\\grego\\Documents\\Codex Projects\\DownloadCraft\\integration-098\\dist\\final-codex-review\\windows\\DownloadCraft-0.9.8-windows-AMD64.zip",
+    "bytes": 9752077,
+    "sha256": "1ee8faf89cc44620cdc8eb3373acb72bba1f42a4284ceb54c152d08664dade86"
+  },
+  {
+    "path": "C:\\Users\\grego\\Documents\\Codex Projects\\DownloadCraft\\integration-098\\dist\\final-codex-review\\windows\\DownloadCraft-0.9.8.exe",
+    "bytes": 21512704,
+    "sha256": "6b896e6a3721909095d65f08042f54e6d942b09288043947dc204f2f16b71337"
+  }
+]

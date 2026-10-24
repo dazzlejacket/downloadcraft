@@ -1,0 +1,33 @@
+{
+  "timeUTC": "2026-10-24T22:11:31.038750+00:00",
+  "expiryUTC": "2026-10-25T05:01:12+00:00",
+  "sessionCookiesProvided": false,
+  "results": [
+    {
+      "client": "desktop-default",
+      "status": 200,
+      "finalHost": "www.youtube.com",
+      "finalPath": "/api/timedtext",
+      "redirects": [],
+      "contentType": "text/html; charset=UTF-8",
+      "bytes": 0,
+      "signature": "empty",
+      "consent": false,
+      "login": false,
+      "challenge": false
+    },
+    {
+      "client": "browser-UA-no-session",
+      "status": 200,
+      "finalHost": "www.youtube.com",
+      "finalPath": "/api/timedtext",
+      "redirects": [],
+      "contentType": "text/html; charset=UTF-8",
+      "bytes": 0,
+      "signature": "empty",
+      "consent": false,
+      "login": false,
+      "challenge": false
+    }
+  ]
+}
