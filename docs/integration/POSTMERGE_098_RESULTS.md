@@ -19,6 +19,7 @@ root, next to this checkout. This file is the in-repo summary.
 | `4a10e9c` | The extension is version **0.9.8.2**. The native-host protocol version is untouched, so both sides stay compatible. |
 | `2178c02` | The security follow-up. |
 | `f8776da` | A caption track downloads the caption, not the video. |
+| `4a8d630` | A caption file keeps its own name (`.vtt`), not an unnamed blob. |
 
 ## The security follow-up
 
@@ -68,7 +69,9 @@ window's add-dialog probe.
 A caption URL is a **file**, not a page. `engine::is_youtube_video_page()`
 separates the two — the caption endpoint, and any YouTube URL that names its
 own subtitle format — and the three call sites now share one predicate
-(`engine::needs_resolve()`), so they cannot drift apart again.
+(`engine::needs_resolve()`), so they cannot drift apart again. The file also
+keeps its own suffix: a caption URL names no file, so the MIME gives it one
+(`text/vtt` → `.vtt`).
 
 `validation/postmerge-098/RESULTS.md` §10 has the details.
 
