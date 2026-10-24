@@ -18,6 +18,7 @@ root, next to this checkout. This file is the in-repo summary.
 | `df718ec` | The app agrees: `model::category_of` knows the whole audio family, and the "Download all links" window says what a row is (`Name \| Size \| Category \| Download from`, **Download selected (n)**, a row menu with **Copy URL** and **Download**). |
 | `4a10e9c` | The extension is version **0.9.8.2**. The native-host protocol version is untouched, so both sides stay compatible. |
 | `2178c02` | The security follow-up. |
+| `f8776da` | A caption track downloads the caption, not the video. |
 
 ## The security follow-up
 
@@ -50,13 +51,34 @@ cookie in `queue.json` and the moving "latest" URL for yt-dlp and
 ffmpeg-static are both real gaps with the reasoning written down in
 `validation/postmerge-098/RESULTS.md` §9.
 
+## A caption must stay a caption
+
+The in-page panel offers a caption track as a chip next to the video's
+qualities. Clicking it sent the caption URL to the app — and the app
+downloaded **the video**.
+
+YouTube's caption endpoint is
+`https://www.youtube.com/api/timedtext?v=<video id>&…&fmt=vtt`, and the app
+decided "this is a YouTube link, so it is a page to resolve" with a plain
+`url.contains("youtube.com")`. The caption URL carries the *video's id*, so
+the resolver handed back the video's stream. Three places made that call:
+the transfer itself, the Download File Info dialog's probe and the main
+window's add-dialog probe.
+
+A caption URL is a **file**, not a page. `engine::is_youtube_video_page()`
+separates the two — the caption endpoint, and any YouTube URL that names its
+own subtitle format — and the three call sites now share one predicate
+(`engine::needs_resolve()`), so they cannot drift apart again.
+
+`validation/postmerge-098/RESULTS.md` §10 has the details.
+
 ## The numbers
 
 | Check | Before | After |
 |---|---|---|
-| `cargo test --locked --release` | 228 passed | **248 passed, 0 failed** |
+| `cargo test --locked --release` | 228 passed | **249 passed, 0 failed** |
 | `cargo build --locked --release` warnings | 112 | **112** (unchanged) |
-| `node --test browser-extension/*.test.js` | 258 passed | **275 passed, 0 failed** |
+| `node --test browser-extension/*.test.js` | 258 passed | **278 passed, 0 failed** |
 | `python scripts/media_detection_smoke.py --browser …msedge.exe` | passed | **passed, 9/9 checks** |
 | `python scripts/check_merge_symbols.py --base v0.9.8` | ok | **ok** — "no symbol was lost (2 replacement(s) on record)" |
 
