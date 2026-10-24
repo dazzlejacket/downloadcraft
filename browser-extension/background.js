@@ -785,9 +785,8 @@ async function sendToHostPing() {
   }
   setBadge();
   await syncBrowserDownloadUI();
-  // The app owns the overlay style while the extension does not: pick up
-  // its choice on every ping (startup, install, popup open).
-  await syncOverlayStyleFromApp();
+  // One overlay only: an older install's style keys are cleared once.
+  await migrateLegacyOverlayStyle();
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -1242,15 +1241,22 @@ try {
 
 // ---- popup / content-script messages ----
 // Everything below this marker is also loaded by the node tests, which slice
-// the file from here: keep every helper this section uses BELOW the marker
-// (only plain values such as lastPrefsPoll may live above it).
+// the file from here: keep every helper this section uses BELOW the marker.
 
-// The desktop app exposes the overlay style ("modern" | "classic"). The
-// extension keeps its own copy; `overlayStyleSource` says who owns it
-// ("app" by default, "extension" once the user picks one here).
-const OVERLAY_STYLES = ["modern", "classic"];
-function normalizeOverlayStyle(v) {
-  return OVERLAY_STYLES.indexOf(v) >= 0 ? v : null;
+// The overlay style setting is GONE: there is one overlay, the download bar.
+// An older install may still hold the two keys that chose between the round
+// mark and the bar. They are cleared once, so the old choice cannot linger
+// and the bar is what every page shows from now on.
+const LEGACY_OVERLAY_KEYS = ["overlayStyle", "overlayStyleSource"];
+async function migrateLegacyOverlayStyle() {
+  try {
+    const got = await api.storage.local.get(LEGACY_OVERLAY_KEYS);
+    if (!got || !LEGACY_OVERLAY_KEYS.some((k) => got[k] !== undefined)) return false;
+    await api.storage.local.remove(LEGACY_OVERLAY_KEYS);
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 // A hostname is the per-site key. Anything that is not a plain hostname is
 // ignored so a stray value can never create a junk storage entry.
@@ -1258,38 +1264,6 @@ function siteKey(v) {
   if (typeof v !== "string") return "";
   const s = v.trim().toLowerCase();
   return /^[a-z0-9][a-z0-9.\-_]*$/.test(s) ? s : "";
-}
-async function storedOverlayStyle() {
-  try {
-    const s = await api.storage.local.get({ overlayStyle: "classic", overlayStyleSource: "app" });
-    const style = normalizeOverlayStyle(s && s.overlayStyle) || "classic";
-    const source = (s && s.overlayStyleSource === "extension") ? "extension" : "app";
-    return { style, source };
-  } catch (e) {
-    return { style: "classic", source: "app" };
-  }
-}
-// The app owns the value while the source is "app": adopt what the app
-// reports and never push our cached copy back (no ping-pong). A missing or
-// invalid answer means "no change".
-// `var` on purpose: the timestamp is read from the startup ping, which runs
-// before this line - a `let` would still be uninitialized there.
-var lastPrefsPoll = 0;
-async function syncOverlayStyleFromApp(force) {
-  try {
-    const now = Date.now();
-    if (!force && now - lastPrefsPoll < 5000) return;
-    lastPrefsPoll = now;
-    const current = await storedOverlayStyle();
-    if (current.source !== "app") return; // the extension owns the value
-    const res = await api.runtime.sendNativeMessage(HOST, { type: "prefs" });
-    if (!res || res.type !== "prefs") return;
-    const style = normalizeOverlayStyle(res.overlayStyle);
-    if (!style || style === current.style) return;
-    await api.storage.local.set({ overlayStyle: style });
-  } catch (e) {
-    /* no desktop app: keep the cached value */
-  }
 }
 // The legacy global position (one value for every site) plus the one-time
 // session-storage migration. Callers that name a site fall back to it.
@@ -1324,23 +1298,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.target === "offscreen") return false;
   (async () => {
     if (!msg || typeof msg !== "object") return { ok: false };
-    if (msg.type === "getOverlayStyle") {
-      const current = await storedOverlayStyle();
-      // Poll the app in the background: a live page picks the new value up
-      // through the storage change listener.
-      syncOverlayStyleFromApp().catch(() => {});
-      return { ok: true, style: current.style };
-    }
-    if (msg.type === "setOverlayStyle") {
-      const value = normalizeOverlayStyle(msg.value);
-      if (!value) return { ok: false, error: "unknown overlay style" };
-      await api.storage.local.set({ overlayStyle: value, overlayStyleSource: "extension" });
-      // The extension owns the value from now on: push it, never poll it back.
-      try {
-        await api.runtime.sendNativeMessage(HOST, { type: "setOverlayStyle", style: value });
-      } catch (e) { /* the desktop app is optional */ }
-      return { ok: true, style: value };
-    }
     if (msg.type === "getVideoBarPosition") {
       const site = siteKey(msg.site);
       if (site) {
@@ -1637,8 +1594,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await sendToHostPing();
       const cfg = await settings();
       const downloadUI = await syncBrowserDownloadUI();
-      const overlay = await storedOverlayStyle();
-      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, detection: (typeof detectionOn !== "undefined") ? detectionOn : true, deepDetect: cfg.deepDetect !== false, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null, overlayStyle: overlay.style };
+      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, detection: (typeof detectionOn !== "undefined") ? detectionOn : true, deepDetect: cfg.deepDetect !== false, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
     }
     if (msg.type === "setAuto" && typeof msg.value === "boolean") {
       await api.storage.local.set({ autoCapture: msg.value });

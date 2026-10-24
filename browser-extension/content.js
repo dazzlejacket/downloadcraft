@@ -1295,8 +1295,8 @@
     if (!barPosition || document.fullscreenElement) return false;
     const parent=document.documentElement;
     if(host.parentNode!==parent)parent.appendChild(host);
-    // The modern round button is a fixed 36 px circle, the classic bar the
-    // width its label needs (one reader for every placement path).
+    // The bar is as wide as its label needs (one reader for every
+    // placement path).
     const width=barHostWidth(host);
     host.style.position="fixed";host.style.width=width+"px";
     host.style.right="auto";host.style.bottom="auto";
@@ -1608,114 +1608,16 @@
     return svg;
   }
 
-  // ---- overlay style: classic bar | modern round mark ----
-  // The desktop app owns the choice; the extension keeps its own copy and
-  // falls back to the classic bar whenever the style is unknown.
-  let overlayStyle = "classic";
-  function setOverlayStyle(style) {
-    overlayStyle = (style === "modern") ? "modern" : "classic";
-  }
-  function currentOverlayStyle() {
-    return overlayStyle === "modern" ? "modern" : "classic";
-  }
-  // Rebuild every overlay when the style changes: the classic bar and the
-  // modern circle are different elements, not a restyled one.
-  function rerenderOverlays() {
-    try {
-      document.querySelectorAll("[data-dc-pill]").forEach(host => {
-        const video = host.__dcVideo;
-        if (video) { video.__dcBtn = null; video.__dcKey = null; }
-        try { if (host.__dcFbPanel) host.__dcFbPanel.remove(); } catch (e) {}
-        try { host.remove(); } catch (e) {}
-      });
-    } catch (e) {}
-    try { ensureUniversalButtons(); } catch (e) {}
-  }
-  function applyOverlayStyle(style) {
-    const next = (style === "modern") ? "modern" : "classic";
-    if (next === overlayStyle) return false;
-    setOverlayStyle(next);
-    rerenderOverlays();
-    return true;
-  }
-  // Ask the worker which style the app selected. An unknown or missing
-  // answer keeps the classic bar.
-  function loadOverlayStyle() {
-    try {
-      chrome.runtime.sendMessage({type:"getOverlayStyle"},res => {
-        if (chrome.runtime.lastError || !alive()) return;
-        applyOverlayStyle(res && res.style);
-      });
-    } catch (e) { /* classic stays */ }
-  }
-  // The modern mark: the DownloadCraft logo (blue ring + blue arrow) drawn
-  // inline. No web_accessible_resources, no page-context icon URL.
-  function modernMarkSvg(size) {
-    const ns = "http://www.w3.org/2000/svg";
-    const svg = document.createElementNS(ns, "svg");
-    svg.setAttribute("viewBox", "0 0 64 64");
-    svg.setAttribute("width", String(size));
-    svg.setAttribute("height", String(size));
-    svg.setAttribute("aria-hidden", "true");
-    svg.setAttribute("focusable", "false");
-    svg.style.cssText = "display:block;flex:0 0 auto;pointer-events:none;";
-    const ring = document.createElementNS(ns, "circle");
-    ring.setAttribute("cx", "32"); ring.setAttribute("cy", "32"); ring.setAttribute("r", "26");
-    ring.setAttribute("fill", "none"); ring.setAttribute("stroke", "#3b82f6");
-    ring.setAttribute("stroke-width", "8");
-    const arrow = document.createElementNS(ns, "path");
-    arrow.setAttribute("d", "M32 16V44M20 33l12 12 12-12");
-    arrow.setAttribute("fill", "none"); arrow.setAttribute("stroke", "#3b82f6");
-    arrow.setAttribute("stroke-width", "8");
-    arrow.setAttribute("stroke-linecap", "round"); arrow.setAttribute("stroke-linejoin", "round");
-    svg.appendChild(ring); svg.appendChild(arrow);
-    return svg;
-  }
-  // Modern overlay: a small round button with the mark, no text label and no
-  // X button. Single click downloads, double click resets the position.
-  function modernDownloadButton(title, kind) {
-    const host = document.createElement("div");
-    host.title = title;
-    host.__dcStyle = "modern";
-    host.style.cssText = "all:initial;display:block;width:36px;height:36px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
-    const root = host.attachShadow ? host.attachShadow({mode:"open"}) : host;
-    const style = document.createElement("style");
-    style.textContent = `
-      :host { color-scheme:light; }
-      * { box-sizing:border-box; }
-      .mark { all:unset;display:flex;align-items:center;justify-content:center;width:36px;height:36px;
-        border-radius:50%;background:#f8fafc;box-shadow:0 1px 5px #0003;cursor:pointer;touch-action:none; }
-      .mark:hover { background:#e7eff7; }
-      .mark:focus-visible { outline:2px solid #2563eb;outline-offset:-2px; }
-      svg { display:block;width:26px;height:26px;pointer-events:none; }
-    `;
-    const btn = document.createElement("button");
-    btn.type = "button"; btn.className = "mark";
-    const action = "Download this " + kind;
-    btn.setAttribute("aria-label", action);
-    btn.title = title;
-    btn.appendChild(modernMarkSvg(26));
-    root.append(style, btn);
-    installBarDrag(host, btn, null);
-    host.__dcMain = btn;
-    host.__dcClose = null;
-    return host;
-  }
-
-  // One isolated toolbar: the primary action, the help segment and the
-  // dismiss button never overlap. Shadow DOM keeps player/site button and
-  // SVG rules out of these controls.
+  // One isolated toolbar: the primary action and the dismiss button never
+  // overlap. Shadow DOM keeps player/site button and SVG rules out of these
+  // controls.
+  //
+  // There is ONE overlay style: the bar. The old round "modern" mark and the
+  // Modern/Classic picker are gone, so nothing has to rebuild an overlay
+  // when a style changes.
   function videoDownloadBar(title, kind = "video", opts) {
-    // The style decides how the overlay looks; an explicit "classic" wins
-    // (the quality-menu button keeps its label).
-    const forced = (opts && typeof opts.style === "string") ? opts.style : "";
-    const styleName = forced === "classic" ? "classic"
-      : forced === "modern" ? "modern"
-      : (typeof currentOverlayStyle === "function" ? currentOverlayStyle() : "classic");
-    if (styleName === "modern" && document.createElementNS) return modernDownloadButton(title, kind);
     const host = document.createElement("div");
     host.title = title;
-    host.__dcStyle = "classic";
     // The action owns the copy: a download says what it downloads, the
     // quality menu keeps its own label.
     const action = (opts && typeof opts.label === "string" && opts.label.trim())
@@ -1750,8 +1652,6 @@
       button:focus-visible { outline:2px solid #3b82f6;outline-offset:-3px; }
       .download { touch-action:none;flex:1;min-width:0;gap:6px;padding:0 8px; }
       .label { white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
-      .help { flex:0 0 25px;width:25px;border-left:1px solid var(--line); }
-      .help[aria-expanded="true"] { background:var(--hover); }
       .close { flex:0 0 25px;width:25px;border-left:1px solid var(--line);color:var(--dim); }
       .close:hover { color:var(--x-fg);background:var(--x-bg); }
       [hidden] { display:none !important; }
@@ -1764,44 +1664,18 @@
     main.appendChild(arrow);
     const label=document.createElement("span");label.className="label";
     main.appendChild(label);
-    // The help segment: a "?" that opens the explanation under the bar.
-    const help=document.createElement("button");help.type="button";help.className="help";
-    help.setAttribute("aria-label","What this button downloads");
-    help.setAttribute("aria-expanded","false");
-    help.title="What this button downloads";
-    help.appendChild(svgIcon(12,ICON_HELP,2));
     const close=document.createElement("button");close.type="button";close.className="close";close.hidden=false;
     close.setAttribute("data-dc-dismiss","1");
     close.setAttribute("aria-label","Hide download bar for this " + kind);
     close.title="Hide for this " + kind + " — restore from the extension toolbar";
     close.appendChild(svgIcon(12,ICON_CLOSE,2));
-    bar.append(main,help,close);
-    const panel=classicHelpPanel();
-    root.append(style,bar,panel);
+    bar.append(main,close);
+    root.append(style,bar);
     // The whole action button is the drag handle (the old grip is gone).
     installBarDrag(host,main,null);
-    host.__dcMain=main;host.__dcClose=close;host.__dcHelp=help;host.__dcHelpPanel=panel;host.__dcLabel=label;
+    host.__dcMain=main;host.__dcClose=close;host.__dcLabel=label;
     // The label (and with it the measured width) is set in one place.
     setClassicBarLabel(host,action);
-    // The popover opens under the bar and closes on Escape or on a click
-    // away (the shared closer hides every panel).
-    help.onclick=(ev)=>{
-      if (ev) { if (ev.stopPropagation) ev.stopPropagation(); if (ev.preventDefault) ev.preventDefault(); }
-      const open=panel.style.display==="none";
-      if (typeof hidePanels === "function") hidePanels();
-      panel.style.display=open?"block":"none";
-      help.setAttribute("aria-expanded",open?"true":"false");
-      if (open) {
-        // Keep it on screen when the bar sits close to the right edge.
-        try {
-          const r=host.getBoundingClientRect?host.getBoundingClientRect():null;
-          const vw=(typeof window!=="undefined"&&window.innerWidth)?window.innerWidth:0;
-          if (r&&vw&&r.left+300>vw-8){panel.style.left="auto";panel.style.right="0px";}
-          else {panel.style.left="0px";panel.style.right="auto";}
-        } catch (e) {}
-      }
-    };
-    if (typeof installDcCloser === "function") installDcCloser();
     // Upstream's theme repaint finds the bar through this attribute.
     host.setAttribute("data-dc-bar","1");
     if (typeof paintBar === "function") paintBar(host);
@@ -1828,14 +1702,13 @@
     host.style.colorScheme = light ? "light" : "dark";
   }
 
-  // The classic bar's width: the label decides, the window is the limit.
-  // 240 px is the floor (icon, help and close always fit), 460 px the
+  // The bar's width: the label decides, the window is the limit.
+  // 240 px is the floor (icon and close always fit), 460 px the
   // ceiling (a long label still fits on a normal screen).
   const CLASSIC_BAR_MIN = 240;
   const CLASSIC_BAR_MAX = 460;
-  const CLASSIC_BAR_CHROME = 88; // arrow + gap + padding + help + close + borders
-  // The "?" glyph, drawn inline: no web font, no remote asset.
-  const ICON_HELP = "M9.2 9a3 3 0 1 1 4.4 2.5c-.9.5-1.6 1.1-1.6 2.1v.4M12 17.6h.01";
+  // arrow (14) + gap (6) + padding (16) + close (25) + borders (2)
+  const CLASSIC_BAR_CHROME = 63;
   let dcMeasureCtx = null, dcMeasuredText = null, dcMeasuredWidth = 0;
   // How wide the label really is, in the bar's own font.
   function classicLabelWidth(text) {
@@ -1873,37 +1746,6 @@
   // keeps its own label.
   function classicActionLabel(kind) {
     return kind === "audio" ? "Download audio from this page" : "Download this " + kind;
-  }
-  // Panels that live inside a shadow root are invisible to the page's own
-  // querySelectorAll, so they are tracked here and closed with the rest.
-  const dcShadowPanels = new Set();
-  // The "?" popover: an in-product explanation inside the bar's own shadow
-  // root. It never navigates anywhere.
-  function classicHelpPanel() {
-    const panel = document.createElement("div");
-    panel.className = "help-panel";
-    panel.setAttribute("data-dc-panel", "help");
-    panel.setAttribute("role", "note");
-    panel.style.display = "none";
-    // Clicks inside the popover never reach the page.
-    panel.onclick = (ev) => { if (ev && ev.stopPropagation) ev.stopPropagation(); };
-    const head = document.createElement("div");
-    head.className = "help-title";
-    head.textContent = "What this captures";
-    panel.appendChild(head);
-    const list = document.createElement("ul");
-    for (const line of [
-      "The direct media file for this element, with the page's cookies and User-Agent, so the download speaks with the same voice as your browser.",
-      "The quality is chosen in Download Craft, not here.",
-      "If a browser check appears, Download Craft reports it and stops - it does not try to get around it.",
-    ]) {
-      const li = document.createElement("li");
-      li.textContent = line;
-      list.appendChild(li);
-    }
-    panel.appendChild(list);
-    dcShadowPanels.add(panel);
-    return panel;
   }
   // A changed label is re-measured: the bar follows its text.
   function setClassicBarLabel(host, text) {
@@ -1971,9 +1813,6 @@
       }
     } catch (e) {}
     repaintTheme();
-    // The Modern overlay is a different element, not a restyled one: it has
-    // to be rebuilt when the theme changes.
-    try { if (typeof rerenderOverlays === "function") rerenderOverlays(); } catch (e) {}
   }
   try {
     chrome.storage.local.get({ appTheme: "system" }, (r) => { if (!chrome.runtime.lastError) applyAppTheme(r && r.appTheme); });
@@ -1999,7 +1838,7 @@
   function pagePanels() { try { return [...document.querySelectorAll("[data-dc-panel]")]; } catch (e) { return []; } }
   // Panels inside a shadow root are invisible to the page's querySelectorAll:
   // they are tracked separately, but they open and close with the rest.
-  function allPanels() { return [...pagePanels(), ...dcShadowPanels]; }
+  function allPanels() { return pagePanels(); }
   function hidePanels() { allPanels().forEach((p) => { p.style.display = "none"; }); }
   // Click-away / Escape closes any open panel. One listener per page (a
   // per-rebuild listener leaked and stale closures fought the new panel);
@@ -2485,13 +2324,45 @@
   function dismissalKey(video, id) {
     return DCRank.videoDismissKey(location.href, video && (video.currentSrc || video.src), id);
   }
-  // One reader for the overlay width: the modern round button is a fixed
-  // 36 px circle, the classic bar the width its label needs. The drag maths,
-  // the saved position and the auto placement all use it, so the bar never
-  // jumps while it is dragged.
+  // ---- overlay visibility for THIS page ----
+  // One switch. OFF hides the download bars on this page; ON shows them
+  // again. The media itself is still DETECTED either way: the popup's list
+  // and its downloads keep working while the bars are hidden, so hiding the
+  // buttons never throws away a found file.
+  //
+  // The state lives in this content script, so it is per document: every
+  // tab and every page has its own, and a reload starts from the default
+  // (visible).
+  let overlaysVisible = true;
+  // Show or hide the bars of this page.
+  function setOverlaysVisible(visible) {
+    overlaysVisible = !!visible;
+    if (overlaysVisible) {
+      // Show again: forget the per-media dismissals too, so every bar that
+      // was hidden comes back.
+      dismissedVideos.clear();
+      try { bcDismissed.clear(); } catch (e) {}
+      try { refreshYouTube(); } catch (e) {}
+      try { ensureUniversalButtons(); } catch (e) {}
+      try { syncDismissControls(); } catch (e) {}
+      // The Bandcamp bar is not a pill, so it is shown on its own.
+      try {
+        if (bcBar) {
+          bcBar.style.display = "block";
+          if (typeof bcBar.__dcPlace === "function") bcBar.__dcPlace();
+        }
+      } catch (e) {}
+    } else {
+      // Hide: take the bars off the page, but keep detecting the media.
+      try { hideOverlaysNow(); } catch (e) {}
+    }
+    return overlaysVisible;
+  }
+  // One reader for the overlay width: the bar is as wide as its label needs.
+  // The drag maths, the saved position and the auto placement all use it,
+  // so the bar never jumps while it is dragged.
   function barHostWidth(host) {
     if (!host) return 0;
-    if (host.__dcStyle === "modern") return 36;
     const w = host.__dcWidth;
     if (Number.isFinite(w)) return Math.max(0, w);
     // A bar from an older generation has no measured width: keep its own.
@@ -2517,8 +2388,7 @@
       if(host.parentNode!==parent)parent.appendChild(host);
       const r=video.getBoundingClientRect();
       const vw=window.innerWidth, vh=window.innerHeight;
-      // The modern round button keeps its own 36 px box; the classic bar
-      // is as wide as its label needs (one rule, one number).
+      // The bar is as wide as its label needs (one rule, one number).
       const width = barHostWidth(host);
       const audio=video.tagName === "AUDIO";
       if(audio && !video.controls){host.remove();return;}
@@ -2526,7 +2396,7 @@
       // Mostly scrolled away = not the video being watched: its bar would be
       // pinned to the window edge, over the page.
       const visH=Math.min(r.bottom,vh)-Math.max(r.top,0), visW=Math.min(r.right,vw)-Math.max(r.left,0);
-      const shown=visible && r.width>=120 && r.height>=(audio?24:70) && visW>0
+      const shown=overlaysVisible && visible && r.width>=120 && r.height>=(audio?24:70) && visW>0
         && visH>=Math.min(r.height*0.35,200)
         && (!fbActive || video===fbActive)
         && r.bottom>0 && r.top<vh && r.right>0 && r.left<vw;
@@ -2556,10 +2426,12 @@
       if(button.__dcFbPanel)button.__dcFbPanel.remove();
     };
   }
-  // Dismiss every overlay of this page (the modern circle has no X button,
-  // so the popup uses this path).
+  // Dismiss every overlay of this page (the popup uses this path).
   function hideOverlaysNow() {
     if(dismissedVideos.size>=100)dismissedVideos.clear();
+    // The Bandcamp bar is not a pill: it is hidden on its own, and the
+    // media behind it stays detected.
+    try { if (bcBar) bcBar.style.display="none"; } catch(e) {}
     try {
       document.querySelectorAll("video, audio[controls]").forEach(v=>{
         dismissedVideos.add(dismissalKey(v,null));
@@ -2589,7 +2461,7 @@
   let ytOpenWhenReady = "";
   function ensureButton(info) {
     const key = dismissalKey(null,info.videoId);
-    if (dismissedVideos.has(key)) {
+    if (dismissedVideos.has(key) || !overlaysVisible) {
       const old=document.getElementById("dc-yt-btn");
       if(old){if(old.__dcClose)old.__dcClose.remove();old.remove();}
       const panel=document.getElementById("dc-yt-panel");if(panel)panel.remove();
@@ -2651,10 +2523,9 @@
       oldBtn.remove();
       if (oldPanel) oldPanel.remove();
     }
-    // The quality-menu button is not a download button: it keeps its label
-    // in both overlay styles.
+    // The quality-menu button is not a download button: it keeps its label.
     const btn = videoDownloadBar("Choose video quality in Download Craft", "video",
-      {style:"classic", label:"Choose video quality in Download Craft"});
+      {label:"Choose video quality in Download Craft"});
     btn.id = "dc-yt-btn";
     btn.dataset.vid = info.videoId;
     btn.dataset.gen = String(GEN);
@@ -3012,6 +2883,12 @@
       return;
     }
     syncDismissControls();
+    // The bars are hidden on this page: take every one off. The media is
+    // still detected - the popup's list and its downloads keep working.
+    if (!overlaysVisible) {
+      document.querySelectorAll("[data-dc-pill]").forEach((el) => { if (el.__dcClose) el.__dcClose.remove(); el.remove(); });
+      return;
+    }
     // YouTube watch/Shorts pages already have the quality menu button —
     // a second generic pill on the same player is the "double button" bug.
     try { if (ytVideoId()) return; } catch (e) { /* ignore */ }
@@ -3218,6 +3095,10 @@
         if (!alive()) return;
         const items = (res && res.items) || [];
         if (!items.length) return;
+        // Bandcamp has no media element to hang a bar on: its track is
+        // fetched by XHR and played from a blob. The fetched stream is the
+        // only evidence of the file, so it is offered here.
+        try { checkBandcamp(items); } catch (e) { /* best effort */ }
         // On Facebook the tab's list spans every reel of the session, so the
         // streams offered for storage are narrowed to the reel on screen -
         // otherwise the popup keeps offering the reel the user scrolled away
@@ -3254,6 +3135,141 @@
     } catch (e) { /* background unreachable */ }
   }
 
+  // ---- Bandcamp ----
+  // Bandcamp's player is its own widget: there is no <audio controls> and
+  // no <video>, so the ordinary overlay path never runs here. The track is
+  // fetched by XHR and played from a blob: the FILE is the network
+  // response, and the NAME is the page's own player metadata.
+  const bcDismissed = new Set();
+  let bcBar = null;
+  let bcBarUrl = "";
+
+  // The page's player metadata: the album's tracks with the file URL of
+  // every format, and the track the player is on. It is the only place the
+  // real title and artist live - the page title carries the album, or
+  // "Artist - Track" on a track page, and neither is the track's own name
+  // once the listener walks through an album.
+  function bandcampMeta() {
+    try {
+      if (typeof DCRank === "undefined" || !DCRank.bandcampParse) return null;
+      let raw = "";
+      try {
+        const el = document.querySelector("script[data-tralbum]");
+        if (el) raw = el.getAttribute("data-tralbum") || "";
+      } catch (e) { /* no such script */ }
+      if (!raw) {
+        // The older page assigns the object: TralbumData = {...};
+        try {
+          const scripts = document.querySelectorAll("script");
+          for (let i = 0; i < scripts.length; i++) {
+            const t = scripts[i].textContent || "";
+            const at = t.indexOf("TralbumData");
+            if (at >= 0) { raw = t.slice(at); break; }
+          }
+        } catch (e) { /* no script */ }
+      }
+      if (!raw) return null;
+      return DCRank.bandcampParse(raw);
+    } catch (e) { return null; }
+  }
+
+  // The track a stream belongs to. The stream's own track wins; otherwise
+  // the track the player is on. Never the album title.
+  function bandcampTrack(bc, url) {
+    if (!bc) return null;
+    let t = null;
+    try { t = DCRank.bandcampTrackFor(url, bc); } catch (e) { t = null; }
+    if (t) return t;
+    try { return DCRank.bandcampCurrentTrack(bc); } catch (e) { return null; }
+  }
+
+  // Where the bar goes: the player's own box, when the page has one.
+  function bandcampPlayerBox() {
+    const sels = ["#bcPlayer", ".playbutton", "#trackInfoInner", ".trackInfo", "#name-section"];
+    for (const s of sels) {
+      let el = null;
+      try { el = document.querySelector(s); } catch (e) { el = null; }
+      if (!el || !el.getBoundingClientRect) continue;
+      const r = el.getBoundingClientRect();
+      if (r && r.width > 0 && r.height > 0) return r;
+    }
+    return null;
+  }
+
+  // The bar for a Bandcamp track.
+  //
+  // It is not a "pill": there is no media element to sit on, so it is
+  // placed on the player's box and keeps its own spot.
+  function showBandcampBar(url, mime, size, track, filename) {
+    if (bcBar && bcBarUrl === url) return bcBar;
+    if (bcBar) { try { bcBar.remove(); } catch (e) {} bcBar = null; }
+    const host = videoDownloadBar("Download this audio with Download Craft", "audio");
+    host.id = "dc-bandcamp-btn";
+    host.setAttribute("data-dc-bandcamp", "1");
+    host.__dcMain.onclick = (ev) => {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      if (ev && ev.preventDefault) ev.preventDefault();
+      sendDownload(url, filename, mime || "audio/mpeg", size || null, null, null,
+        (track && track.duration) || null);
+    };
+    host.__dcClose.onclick = (ev) => {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+      bcDismissed.add(url);
+      try { host.remove(); } catch (e) {}
+      bcBar = null;
+    };
+    const place = () => {
+      try {
+        const vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
+        const width = barHostWidth(host);
+        host.style.position = "fixed";
+        host.style.right = "auto"; host.style.bottom = "auto";
+        host.style.width = Math.max(0, width) + "px";
+        const r = bandcampPlayerBox();
+        if (r) {
+          host.style.left = Math.max(8, Math.min(vw - width - 8, r.left)) + "px";
+          host.style.top = Math.max(8, Math.min(vh - 36, r.top - 32)) + "px";
+        } else {
+          host.style.left = "8px";
+          host.style.top = "8px";
+        }
+      } catch (e) { /* best effort */ }
+    };
+    host.__dcPlace = place;
+    try { document.documentElement.appendChild(host); } catch (e) {}
+    place();
+    bcBar = host; bcBarUrl = url;
+    return host;
+  }
+
+  // Look at what the page has fetched and offer the track it is playing.
+  function checkBandcamp(items) {
+    try {
+      if (!overlaysVisible) return;
+      if (!items || !items.length) return;
+      if (typeof DCRank === "undefined" || !DCRank.isBandcampStream) return;
+      const bc = bandcampMeta();
+      if (!bc) return;
+      for (const m of items) {
+        if (!m || !m.url) continue;
+        if (!DCRank.isBandcampStream(m.url)) continue;
+        if (bcDismissed.has(m.url)) continue;
+        const track = bandcampTrack(bc, m.url);
+        if (!track) continue;
+        const fmt = DCRank.bandcampFormat(m.url) || "";
+        const ext = (DCRank.audioExtForMime && DCRank.audioExtForMime(m.mime))
+          || (fmt ? "." + fmt : ".mp3");
+        const filename = DCRank.bandcampFilename(track, ext);
+        // No title, no name: the original file name is kept, nothing is
+        // invented.
+        if (!filename) continue;
+        showBandcampBar(m.url, m.mime || (fmt === "mp3" ? "audio/mpeg" : ""), m.size || null,
+          track, filename);
+        return;
+      }
+    } catch (e) { /* best effort */ }
+  }
+
   // Popup peek: the popup asks the ACTIVE tab directly so it never shows
   // another tab's stale snapshot (global storage keys are fallback only).
   try {
@@ -3264,10 +3280,18 @@
         sendResponse({ok:true});return false;
       }
       if (msg && msg.type === "hideOverlay" && alive()) {
-        // The modern circle has no X button: the popup dismisses the
-        // overlay of the media on this page instead.
+        // The popup dismisses the overlay of the media on this page.
         try { hideOverlaysNow(); } catch (e) {}
         sendResponse({ok:true});return false;
+      }
+      if (msg && msg.type === "setOverlayVisibility" && alive()) {
+        // The popup's "Show download buttons on this page" switch.
+        let visible = false;
+        try { visible = setOverlaysVisible(msg.visible); } catch (e) { visible = overlaysVisible; }
+        sendResponse({ok:true, visible});return false;
+      }
+      if (msg && msg.type === "getOverlayVisibility" && alive()) {
+        sendResponse({ok:true, visible: overlaysVisible});return false;
       }
       if (msg && msg.type === "mediaFrameInfo") {
         const videos = [...document.querySelectorAll("video")];
@@ -3331,6 +3355,28 @@
             }
           }
         } catch (e) { fb = []; }
+        // Bandcamp: the sniffed rows are the tracks, and the page's own
+        // player metadata knows their real title and artist. The name is
+        // carried with the row so the popup and the app agree on it.
+        try {
+          const bc = bandcampMeta();
+          if (bc) {
+            net = net.map((n) => {
+              if (!n || !n.url) return n;
+              if (typeof DCRank === "undefined" || !DCRank.isBandcampStream) return n;
+              if (!DCRank.isBandcampStream(n.url)) return n;
+              const t = bandcampTrack(bc, n.url);
+              if (!t) return n;
+              const fmt = DCRank.bandcampFormat(n.url) || "";
+              const ext = (DCRank.audioExtForMime && DCRank.audioExtForMime(n.mime))
+                || (fmt ? "." + fmt : ".mp3");
+              const filename = DCRank.bandcampFilename(t, ext);
+              if (!filename) return n;
+              const title = (t.artist ? t.artist + " - " : "") + t.title;
+              return { ...n, title, filename, dur: n.dur || (t.duration || null) };
+            });
+          }
+        } catch (e) { /* the rows keep their plain names */ }
         sendResponse({
           videos,
           links,
@@ -3375,14 +3421,6 @@
 
   loadBarPosition();
   window.addEventListener("focus",loadBarPosition);
-  loadOverlayStyle();
-  // The app (or the popup) can change the style while this page is open.
-  try {
-    chrome.storage.onChanged.addListener((changes,area) => {
-      if (!alive() || !changes || area !== "local") return;
-      if (changes.overlayStyle) applyOverlayStyle(changes.overlayStyle.newValue);
-    });
-  } catch (e) { /* storage listener optional */ }
 
   // Initial pass + SPA navigation (YouTube AND Facebook rarely reload).
   // Facebook reels swap /reel/<id> via history API: no reload, same video

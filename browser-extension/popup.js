@@ -91,11 +91,52 @@ $("tabDownloads").onclick = () => showTab("downloads");
 $("tabSettings").onclick = () => showTab("settings");
 
 // ---------- settings + toolbar state ----------
-function setToolState(auto, detect) {
+function setToolState(auto) {
   $("autoBtn").classList.toggle("on", !!auto);
   $("autoBtn").title = auto ? "Browser downloads go to the app automatically (on)" : "Send the browser's downloads to the app automatically (off)";
-  $("detectBtn").classList.toggle("off", detect === false);
-  $("detectBtn").title = detect === false ? "Video detection is off — click to turn it on" : "Video detection is on — click to turn it off";
+}
+// ---- overlay visibility for the current page ----
+// ONE switch. ON shows the download bars on this page, OFF takes them off.
+// The media is still FOUND either way, so the list below and its downloads
+// keep working while the bars are hidden - hiding never throws a file away.
+let overlayVisible = true;
+function paintOverlayToggle() {
+  const b = $("detectBtn");
+  b.classList.toggle("off", !overlayVisible);
+  b.setAttribute("aria-pressed", overlayVisible ? "true" : "false");
+  b.title = overlayVisible
+    ? "Download buttons are shown on this page — click to hide them"
+    : "Download buttons are hidden on this page — click to show them";
+  const sw = $("showButtons");
+  if (sw) sw.checked = overlayVisible;
+}
+async function readOverlayVisibility() {
+  try {
+    const tab = await activeTab();
+    if (!tab || tab.id === undefined) { overlayVisible = true; paintOverlayToggle(); return; }
+    // The top frame owns the page's state.
+    const res = await api.tabs.sendMessage(tab.id, { type: "getOverlayVisibility" }, { frameId: 0 });
+    overlayVisible = !(res && res.visible === false);
+  } catch (e) {
+    // No content script on this page (a settings page, the store, a PDF):
+    // there is nothing here to show or hide.
+    overlayVisible = true;
+    $("detectBtn").disabled = true;
+  }
+  paintOverlayToggle();
+}
+async function writeOverlayVisibility(visible) {
+  overlayVisible = !!visible;
+  paintOverlayToggle();
+  try {
+    const tab = await activeTab();
+    if (!tab || tab.id === undefined) throw new Error("No active page");
+    // Every frame of the page: an embedded player has its own bars.
+    await api.tabs.sendMessage(tab.id, { type: "setOverlayVisibility", visible: overlayVisible });
+    status(overlayVisible ? "Download buttons are shown on this page." : "Download buttons are hidden on this page.");
+  } catch (e) {
+    status("This page has no download buttons.", "bad");
+  }
 }
 chrome.runtime.sendMessage({ type: "getState" }, (res) => {
   if (chrome.runtime.lastError || !res) {
@@ -115,8 +156,8 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
   $("hideUI").disabled = !(res.downloadUI && res.downloadUI.supported);
   if (res.minSizeKB !== undefined) $("minSize").value = String(res.minSizeKB);
   if (typeof res.blockHosts === "string") $("block").value = res.blockHosts;
-  $("overlayStyle").value = res.overlayStyle || "classic";
-  setToolState(res.autoCapture, res.detection);
+  setToolState(res.autoCapture);
+  paintOverlayToggle();
   if (res.fallbackError) status("Browser re-download failed: " + res.fallbackError, "bad");
   else if (!res.hostOk) {
     status("App not connected — open Download Craft once (Install Chrome host)." +
@@ -125,44 +166,27 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
   if (lastRender) lastRender();
 });
 
-const setAuto = (v) => { $("auto").checked = v; setToolState(v, $("detect").checked); chrome.runtime.sendMessage({ type: "setAuto", value: v }); };
-const setDetect = (v) => { $("detect").checked = v; setToolState($("auto").checked, v); chrome.runtime.sendMessage({ type: "setDetection", value: v }); };
+const setAuto = (v) => { $("auto").checked = v; setToolState(v); chrome.runtime.sendMessage({ type: "setAuto", value: v }); };
+// The global switch: stop looking for media on EVERY page. It is not the
+// same as hiding the buttons on this one page.
+const setDetect = (v) => { $("detect").checked = v; chrome.runtime.sendMessage({ type: "setDetection", value: v }); };
 $("auto").onchange = () => setAuto($("auto").checked);
 $("detect").onchange = () => setDetect($("detect").checked);
 $("autoBtn").onclick = () => setAuto(!$("auto").checked);
-$("detectBtn").onclick = () => setDetect(!$("detect").checked);
+// The per-page switch: show or hide the download bars on this page.
+$("detectBtn").onclick = () => writeOverlayVisibility(!overlayVisible);
+$("showButtons").onchange = () => writeOverlayVisibility($("showButtons").checked);
 $("deep").onchange = () => chrome.runtime.sendMessage({ type: "setDeepDetect", value: $("deep").checked });
 $("hideUI").onchange = () => {
   chrome.runtime.sendMessage({ type: "setBrowserUI", value: $("hideUI").checked }, (res) => {
     status(res && res.ok ? "Browser download UI preference saved" : "This browser could not change its download UI.", res && res.ok ? "ok" : "bad");
   });
 };
-// Overlay style: the desktop app owns this setting, the popup writes the
-// extension's copy and pushes it to the app.
-$("overlayStyle").onchange = () => {
-  chrome.runtime.sendMessage({type:"setOverlayStyle", value:$("overlayStyle").value}, res => {
-    if (chrome.runtime.lastError || !res) {
-      status("Extension background unreachable.", "bad");
-      return;
-    }
-    status(res.ok ? "Overlay style saved ✓" : ("Could not save the overlay style. " + (res.error || "")), res.ok ? "ok" : "bad");
-  });
-};
-
 $("saveFilters").onclick = () => {
   chrome.runtime.sendMessage({ type: "setFilters", minSizeKB: $("minSize").value.trim(), blockHosts: $("block").value.trim() }, (res) => {
     if (chrome.runtime.lastError || !res) status("Extension background unreachable.", "bad");
     else status(res.ok ? "Filters saved ✓" : ("Could not save filters. " + (res.error || "")), res.ok ? "ok" : "bad");
   });
-};
-$("restoreVideoButtons").onclick = async () => {
-  try {
-    const [tab] = await api.tabs.query({ active: true, currentWindow: true });
-    if (!tab || !tab.id) throw new Error("No active page");
-    // Omit frameId so embedded Vimeo and other players receive it too.
-    await api.tabs.sendMessage(tab.id, { type: "restoreVideoButtons" });
-    status("Video download buttons restored.", "ok");
-  } catch (e) { status("Reload this page, then try again.", "bad"); }
 };
 $("pauseBtn").onclick = () => {
   chrome.runtime.sendMessage({ type: "appControl", action: "pause_all" }, (res) => {
@@ -466,12 +490,20 @@ function collectItems(peek, pageUrl) {
     const isStream = kind === "playlist";
     const isSub = kind === "subtitle";
     const tag = isSub ? "SUBS" : kind === "segment" ? "PART" : tagOf(n.url, n.mime);
-    const name = isStream || isSub ? undefined : safeName(pageTitle || "video", /^audio\//i.test(n.mime || "") ? ".m4a" : ".mp4");
+    // The name the page itself knows (a Bandcamp track carries its own
+    // title and artist), else the page title. And the extension the MIME
+    // really is: an mp3 is not an m4a.
+    const isAudio = /^audio\//i.test(n.mime || "");
+    const audioExt = (R && R.audioExtForMime) ? (R.audioExtForMime(n.mime) || ".m4a") : ".m4a";
+    const ext = isAudio ? audioExt : ".mp4";
+    const rowTitle = n.title || pageTitle || "Video";
+    const name = isStream || isSub ? undefined
+      : safeName(n.filename || rowTitle, ext);
     const streamName = safeName(pageTitle || "video", ".mp4");
     items.push({
       key: `net:${n.url}`,
       kind: isStream ? "streams" : isSub || kind === "segment" ? "other" : "videos",
-      title: pageTitle || "Video",
+      title: rowTitle,
       thumb: n.thumb, dur: n.dur, tag, link: n.url, page: pageUrl,
       options: [{
         label: isStream ? (n.master ? "Best quality" : "Stream") : isSub ? "Subtitles" : `${tag}${n.pairUrl ? " + audio" : ""}`,
@@ -784,15 +816,6 @@ $("refreshBtn").onclick = async () => {
   await loadVideos();
   status("");
 };
-// The modern round overlay has no X button: dismiss it from here.
-$("hideOverlay").onclick = async () => {
-  try {
-    const [tab]=await api.tabs.query({active:true,currentWindow:true});
-    if(!tab || tab.id===undefined)throw new Error("No active page");
-    const res=await api.tabs.sendMessage(tab.id,{type:"hideOverlay"});
-    status((res && res.ok)?"Overlay hidden on this page.":"Nothing to hide on this page.");
-  } catch(e) { status("Reload this page, then try again.", "bad"); }
-};
 // 🗑 Clear: drop what was found (the sniffer's list and the cards the page
 // itself reports) until ⟳ Rescan.
 $("clearBtn").onclick = async () => {
@@ -805,5 +828,6 @@ $("clearBtn").onclick = async () => {
 };
 
 loadVideos();
+readOverlayVisibility();
 updateDlCount();
 showTab(prefs.tab === "downloads" || prefs.tab === "settings" ? prefs.tab : "videos");

@@ -1,6 +1,10 @@
-// Overlay style (classic bar | modern round mark), idle fade and the
-// double-click reset. The content script is evaluated in slices, exactly
-// like overlay.test.js does, so the code under test must not need a browser.
+// The overlay on a page: the idle fade, the double-click reset and the
+// per-page visibility switch. The content script is evaluated in slices,
+// exactly like classic-bar.test.js does, so the code under test must not
+// need a browser.
+//
+// There is ONE overlay now - the bar. The old round "modern" mark and the
+// Modern/Classic picker are gone, so nothing here chooses a style.
 const {test}=require('node:test');
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const source=fs.readFileSync(__dirname+'/content.js','utf8');
@@ -25,87 +29,7 @@ function el(tag) {
 }
 const dom={createElement:(t)=>el(t),createElementNS:(ns,t)=>el(t)};
 
-// The overlay style block: style state, the modern button and the bar.
-const STYLE_SLICE=source.slice(
-  source.indexOf('  // ---- overlay style'),source.indexOf('  // Theme: tokens'));
-
-function barHarness() {
-  const context={
-    document:dom,
-    svgIcon:()=>el('svg'),
-    installBarDrag(){},
-    ICON_DOWN:'',ICON_CLOSE:'',
-    ensureUniversalButtons(){},
-    chrome:{runtime:{lastError:null,sendMessage(){}}},
-  };
-  vm.createContext(context);
-  vm.runInContext(STYLE_SLICE,context);
-  return context;
-}
-
-test('the modern style renders a round mark with an accessible name and no dismiss button',()=>{
-  const ctx=barHarness();
-  ctx.setOverlayStyle("modern");
-  const bar=ctx.videoDownloadBar("Download this video with Download Craft","video");
-  assert.equal(bar.__dcStyle,"modern");
-  // No X button at all: the modern overlay has no dismiss control.
-  assert.equal(bar.__dcClose,null);
-  assert.equal(bar.__dcMain.attributes["data-dc-dismiss"],undefined);
-  // Accessible name and tooltip.
-  assert.equal(bar.__dcMain.attributes["aria-label"],"Download this video");
-  assert.ok(bar.__dcMain.title);
-  // No text label: the mark is the whole button.
-  assert.equal(bar.__dcMain.children.length,1);
-  // The DownloadCraft mark, inline: blue ring + blue arrow.
-  const svg=bar.__dcMain.children[0];
-  assert.equal(svg.getAttribute("viewBox"),"0 0 64 64");
-  const ring=svg.children[0],arrow=svg.children[1];
-  assert.equal(ring.getAttribute("cx"),"32");
-  assert.equal(ring.getAttribute("cy"),"32");
-  assert.equal(ring.getAttribute("r"),"26");
-  assert.equal(ring.getAttribute("fill"),"none");
-  assert.equal(ring.getAttribute("stroke"),"#3b82f6");
-  assert.equal(ring.getAttribute("stroke-width"),"8");
-  assert.equal(arrow.getAttribute("d"),"M32 16V44M20 33l12 12 12-12");
-  assert.equal(arrow.getAttribute("stroke"),"#3b82f6");
-  assert.equal(arrow.getAttribute("stroke-linecap"),"round");
-});
-
-test('the modern style names an audio overlay "Download this audio"',()=>{
-  const ctx=barHarness();
-  ctx.setOverlayStyle("modern");
-  const bar=ctx.videoDownloadBar("Download audio","audio");
-  assert.equal(bar.__dcMain.attributes["aria-label"],"Download this audio");
-  assert.equal(bar.__dcClose,null);
-});
-
-test('the classic style renders the bar with its label and its X button',()=>{
-  const ctx=barHarness();
-  ctx.setOverlayStyle("classic");
-  const bar=ctx.videoDownloadBar("Download this video with Download Craft","video");
-  assert.equal(bar.__dcStyle,"classic");
-  assert.equal(bar.__dcMain.attributes["aria-label"],"Download this video");
-  assert.equal(bar.__dcMain.children[1].textContent,"Download this video");
-  assert.ok(bar.__dcClose);
-  assert.equal(bar.__dcClose.attributes["aria-label"],"Hide download bar for this video");
-  assert.equal(bar.__dcClose.attributes["data-dc-dismiss"],"1");
-});
-
-test('an unknown or missing style falls back to the classic bar',()=>{
-  const ctx=barHarness();
-  ctx.setOverlayStyle("neon");
-  assert.equal(ctx.currentOverlayStyle(),"classic");
-  const bar=ctx.videoDownloadBar("Download this video","video");
-  assert.equal(bar.__dcStyle,"classic");
-  assert.ok(bar.__dcClose);
-  // A page that never heard of the setting keeps the classic bar too.
-  const fresh=barHarness();
-  assert.equal(fresh.currentOverlayStyle(),"classic");
-  assert.equal(fresh.videoDownloadBar("Download this video","video").__dcStyle,"classic");
-});
-
-// ---- the overlay on a page: idle fade and double click ----
-
+// The page-level block: the universal buttons, the idle fade and the click.
 const PILL_SLICE=source.slice(
   source.indexOf('  function currentSite()'),source.indexOf('  function isFacebookPage('));
 
@@ -184,20 +108,6 @@ test('the overlay fades to 30 % after the idle interval and wakes up on interact
   h.tick.advance(10000);
   assert.equal(pill.style.opacity,"0.3");
   pill.listeners["pointerdown"][0]();
-  assert.equal(pill.style.opacity,"1");
-});
-
-test('the modern round overlay fades the same way',()=>{
-  const h=pageHarness([player()]);
-  h.context.setOverlayStyle("modern");
-  h.context.ensureUniversalButtons();
-  const pill=h.pills()[0];
-  assert.ok(pill);
-  assert.equal(pill.__dcStyle,"modern");
-  assert.equal(pill.style.opacity,"1");
-  h.tick.advance(10000);
-  assert.equal(pill.style.opacity,"0.3");
-  pill.listeners["mouseover"][0]();
   assert.equal(pill.style.opacity,"1");
 });
 

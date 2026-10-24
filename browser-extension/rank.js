@@ -106,7 +106,10 @@
     const mediaPath = /\.(?:mp4|webm|mkv|mov|avi|m4v|mp3|m4a|aac|flac|ogg|opus|wav|m4s|ts|cmfv|cmfa)$/i.test(parsed.pathname);
     const strongMime = /^(?:video|audio)\//i.test(mime) || mime === "application/mp4" || manifestMime;
     const neutralMime = !mime || mime === "application/octet-stream" || (playlist && mime === "text/plain");
-    if (!strongMime && !(neutralMime && (playlist || mediaPath))) return null;
+    // Bandcamp's own stream names its format in the path and answers with a
+    // neutral MIME, so the path is the evidence there.
+    const bandcamp = isBandcampStream(details.url);
+    if (!strongMime && !(neutralMime && (playlist || mediaPath || bandcamp))) return null;
     // Explicit HTML/JSON/image errors win over a misleading .mp4 filename.
     const number = text => /^\d+$/.test(text || "") && Number.isSafeInteger(Number(text)) ? Number(text) : 0;
     let size = number(headers.get("content-length"));
@@ -116,7 +119,15 @@
     const threshold = Number(minSizeKB);
     const minBytes = (Number.isFinite(threshold) && threshold >= 0 ? threshold : 100) * 1024;
     if (kind === "file" && size > 0 && size < minBytes) return null;
-    return {url:details.url, mime, size, kind};
+    // A Bandcamp stream answers with a neutral MIME; its path names the
+    // format, so the file is what it says it is.
+    let outMime = mime;
+    if (bandcamp && !/^audio\//i.test(outMime)) {
+      const fmt = bandcampFormat(details.url);
+      const bm = fmt === "mp3" ? "audio/mpeg" : fmt ? "audio/" + fmt : "";
+      if (bm) outMime = bm;
+    }
+    return {url:details.url, mime: outMime, size, kind};
   }
 
   // Manifests and adaptive MP4 legs must resolve together with audio.
@@ -811,6 +822,168 @@
     try { return new URL(String(u)).pathname; } catch (e) { return ""; }
   }
 
+  // ---- Bandcamp ----
+  // Bandcamp's player is its own widget: no <audio controls>, no <video>.
+  // The track is fetched by XHR and played from a blob, so the DOM can only
+  // say "there is a player", never "here is the file". The file is the
+  // network response, and the name comes from the page's own player
+  // metadata.
+  //
+  // The stream URLs name their format in the path
+  // (/stream/<hash>/mp3-128/<track id>) and carry a fresh token in the
+  // query, so the PATH is what identifies a track.
+  const BANDCAMP_HOST = /(^|\.)(?:bcbits\.com|bandcamp\.com)$/i;
+  const BANDCAMP_FORMAT = /\/(?:mp3-128|mp3-64|mp3-v0|mp3|m4a|flac|aac|ogg|opus|wav)(?:\/|$)/i;
+
+  function isBandcampHost(u) {
+    try { return BANDCAMP_HOST.test(new URL(String(u)).hostname); }
+    catch (e) { return false; }
+  }
+
+  // Is this URL one of Bandcamp's own media streams?
+  function isBandcampStream(u) {
+    try {
+      const x = new URL(String(u));
+      if (!BANDCAMP_HOST.test(x.hostname)) return false;
+      return BANDCAMP_FORMAT.test(x.pathname);
+    } catch (e) { return false; }
+  }
+
+  // The format a stream carries, read from its path: "mp3", "flac", ...
+  function bandcampFormat(u) {
+    try {
+      const m = BANDCAMP_FORMAT.exec(new URL(String(u)).pathname);
+      if (!m) return "";
+      let f = m[0].replace(/^\//, "").replace(/\/$/, "").toLowerCase();
+      // "mp3-128" and friends are the mp3 format at a given bitrate.
+      if (f.indexOf("mp3") === 0) f = "mp3";
+      return f;
+    } catch (e) { return ""; }
+  }
+
+  // The page's player metadata.
+  //
+  // It arrives as JSON: either in a data- attribute (HTML-escaped) or as an
+  // assigned JS object. Both shapes are accepted, and a blob that cannot be
+  // read is simply no metadata - never a guessed title.
+  function bandcampParse(text) {
+    const s = String(text || "").trim();
+    if (!s) return null;
+    // The attribute form is HTML-escaped.
+    const unescaped = s.replace(/&quot;/g, '"')
+      .replace(/&#0*39;/g, "'").replace(/&apos;/g, "'")
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&");
+    let data = null;
+    for (const candidate of [s, unescaped]) {
+      try { data = JSON.parse(candidate); } catch (e) { data = null; }
+      if (data && typeof data === "object") break;
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      // The older page assigns the object: TralbumData = {...};
+      const m = /TralbumData\s*=\s*(\{[\s\S]*\})\s*;?\s*$/.exec(unescaped);
+      if (!m) return null;
+      try { data = JSON.parse(m[1]); } catch (e) { return null; }
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+    const artist = String(data.artist || "").trim();
+    const out = {
+      artist,
+      album: String(data.album_title || "").trim(),
+      tracks: [],
+      currentId: 0,
+      currentTitle: "",
+    };
+    const info = Array.isArray(data.trackinfo) ? data.trackinfo : [];
+    for (const t of info) {
+      if (!t || typeof t !== "object") continue;
+      const title = String(t.title || "").trim();
+      if (!title) continue;
+      const files = (t.file && typeof t.file === "object") ? t.file : {};
+      const urls = [];
+      for (const k of Object.keys(files)) {
+        const v = files[k];
+        if (typeof v === "string" && /^https?:\/\//i.test(v)) urls.push({ format: k, url: v });
+      }
+      out.tracks.push({
+        title,
+        artist: String(t.artist || artist || "").trim(),
+        id: Number(t.id) || 0,
+        trackNum: Number(t.track_num) || 0,
+        duration: Number(t.duration) || 0,
+        urls,
+      });
+    }
+    // The track the player is on right now.
+    const cur = (data.current && typeof data.current === "object") ? data.current : null;
+    if (cur) {
+      out.currentId = Number(cur.id) || 0;
+      out.currentTitle = String(cur.title || "").trim();
+    }
+    return out;
+  }
+
+  // The track this stream URL is. The path is compared, not the query
+  // string: Bandcamp re-issues the stream with a fresh token.
+  function bandcampTrackFor(url, bc) {
+    if (!url || !bc || !Array.isArray(bc.tracks)) return null;
+    let path = "";
+    try { path = new URL(String(url)).pathname; } catch (e) { return null; }
+    if (!path) return null;
+    for (const t of bc.tracks) {
+      for (const f of (t.urls || [])) {
+        let p = "";
+        try { p = new URL(f.url).pathname; } catch (e) { continue; }
+        if (p && p === path) return t;
+      }
+    }
+    return null;
+  }
+
+  // The track the player is on. Used when the stream's own track is not
+  // known, so the name follows what is playing rather than the album.
+  function bandcampCurrentTrack(bc) {
+    if (!bc || !Array.isArray(bc.tracks) || !bc.tracks.length) return null;
+    if (bc.currentId) {
+      const byId = bc.tracks.find((t) => t.id === bc.currentId);
+      if (byId) return byId;
+    }
+    if (bc.currentTitle) {
+      const byTitle = bc.tracks.find((t) => t.title === bc.currentTitle);
+      if (byTitle) return byTitle;
+    }
+    return null;
+  }
+
+  // The name of the file: "Artist - Track.mp3" when both are known,
+  // "Track.mp3" when only the track is. Nothing is invented - an unknown
+  // track yields an empty name and the caller keeps the original.
+  function bandcampFilename(track, ext) {
+    if (!track || !track.title) return "";
+    let e = String(ext || "").trim().toLowerCase();
+    if (e && e.charAt(0) !== ".") e = "." + e;
+    const artist = String(track.artist || "").trim();
+    const title = String(track.title || "").trim();
+    if (!title) return "";
+    return (artist ? artist + " - " + title : title) + e;
+  }
+
+  // The extension an audio MIME really is. "audio/mpeg" is an mp3, not the
+  // m4a every audio download used to be called.
+  function audioExtForMime(mime) {
+    const m = String(mime || "").toLowerCase().split(";")[0].trim();
+    if (!m) return "";
+    if (m === "audio/mpeg" || m === "audio/mp3") return ".mp3";
+    if (m === "audio/mp4" || m === "audio/x-m4a") return ".m4a";
+    if (m === "audio/aac" || m === "audio/aacp") return ".aac";
+    if (m === "audio/flac" || m === "audio/x-flac") return ".flac";
+    if (m === "audio/ogg") return ".ogg";
+    if (m === "audio/opus") return ".opus";
+    if (m === "audio/wav" || m === "audio/x-wav" || m === "audio/wave") return ".wav";
+    if (m === "audio/webm") return ".weba";
+    return "";
+  }
+
   const DCRank = {
     // ours: the CHIRP response classifier, the manifest URL validator and
     // the Google Drive helpers
@@ -821,7 +994,10 @@
     attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence,
     playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment,
     vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia,
-    collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel
+    collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel,
+    // Bandcamp
+    isBandcampHost, isBandcampStream, bandcampFormat, bandcampParse, bandcampTrackFor,
+    bandcampCurrentTrack, bandcampFilename, audioExtForMime
   };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;

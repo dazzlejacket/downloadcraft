@@ -144,12 +144,16 @@ label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
     <button class="ib" id="filterBtn" title="Show: all, videos, streams or other files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M4 7h16M7 12h10M10 17h4"/></svg></button>
     <label class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="q" name="q" placeholder="Filter by title"></label>
     <button class="ib" id="autoBtn" title="Send the browser's downloads to the app automatically"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg></button>
-    <button class="ib" id="detectBtn" title="Video detection on/off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0"/></svg></button>
+    <button class="ib" id="detectBtn" title="Show download buttons on this page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0"/></svg></button>
     <button class="ib" id="pauseBtn" title="Pause all downloads in the app"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></button>
     <button class="ib" id="refreshBtn" title="Look for videos on this page again"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
     <button class="ib" id="clearBtn" title="Clear what was found on this page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>
   </div>
   <div class="view" id="videosView">
+    <div class="opt">
+      <div class="txt"><b>Show download buttons on this page</b><span>The download bars over the players on this page.</span></div>
+      <label class="sw"><input type="checkbox" id="showButtons" checked><i></i></label>
+    </div>
     <div id="videos"></div>
     <div class="manual">
       <input type="text" id="url" placeholder="Paste a link to download…">
@@ -165,8 +169,6 @@ label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
 <div class="view" id="viewSettings" hidden>
   <div class="opt"><div class="txt"><b>Capture browser downloads</b><span>Hand every download to Download Craft.</span></div>
     <label class="sw"><input type="checkbox" id="auto"><i></i></label></div>
-  <div class="opt"><div class="txt"><b>Video detection</b><span>Find videos on pages and show the download bar on players.</span></div>
-    <label class="sw"><input type="checkbox" id="detect"><i></i></label></div>
   <div class="opt"><div class="txt"><b>Deep video detection</b><span>Reads the first 4 KB of unlabeled responses to find hidden streams.</span></div>
     <label class="sw"><input type="checkbox" id="deep"><i></i></label></div>
   <div class="opt"><div class="txt"><b>Hide browser download bubble</b><span>While capture is on and the app is connected.</span></div>
@@ -178,16 +180,10 @@ label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
     <input type="text" id="block" placeholder="example.com, other.org">
     <div class="row" style="margin-top:8px;justify-content:flex-end"><button class="btn primary" id="saveFilters">Save filters</button></div>
   </div>
-  <div class="row">
-    <label for="overlayStyle">Overlay style</label>
-    <select id="overlayStyle">
-      <option value="modern">Modern (round icon)</option>
-      <option value="classic" selected>Classic (download bar)</option>
-    </select>
-  </div>
-  <div class="row"><button class="btn" id="restoreVideoButtons">Show hidden video buttons again</button></div>
+  <div class="sec">Advanced</div>
+  <div class="opt"><div class="txt"><b>Find media on pages</b><span>Search every page for videos and audio. Turning this off stops the search everywhere — it is not the same as hiding the buttons on one page.</span></div>
+    <label class="sw"><input type="checkbox" id="detect"><i></i></label></div>
 </div>
-<div class="row"><button class="btn" id="hideOverlay">Hide the overlay on this page</button></div>
 <div id="status"></div>
 <script src="rank.js"></script>
 <script src="popup.js"></script>

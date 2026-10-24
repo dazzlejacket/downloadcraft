@@ -1,16 +1,19 @@
-// The classic overlay bar: the IDM-inspired segments (action, help, close),
-// the fit-to-width label and the in-shadow help popover. The content script
-// is evaluated in slices, exactly like overlay-style.test.js does, so the
-// code under test must not need a browser.
+// The download bar: the two segments (action and dismiss), the fit-to-width
+// label and the one width rule. The content script is evaluated in slices,
+// exactly like overlay-idle.test.js does, so the code under test must not
+// need a browser.
+//
+// There is ONE overlay: the bar. The round "modern" mark, the
+// Modern/Classic picker and the "?" help segment are all gone.
 const {test}=require('node:test');
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const source=fs.readFileSync(__dirname+'/content.js','utf8');
 
 const SLICES={
-  // The real icons and svgIcon(), so the "?" glyph is a real inline SVG.
-  icons:source.slice(source.indexOf('  const SVG_NS ='),source.indexOf('  // ---- overlay style')),
-  // The overlay style block: the modern mark and the classic bar.
-  bar:source.slice(source.indexOf('  // ---- overlay style'),source.indexOf('  // Theme: tokens')),
+  // The real icons and svgIcon(), so the arrow and the X are real inline SVGs.
+  icons:source.slice(source.indexOf('  const SVG_NS ='),source.indexOf('  function videoDownloadBar(')),
+  // The bar itself.
+  bar:source.slice(source.indexOf('  function videoDownloadBar('),source.indexOf('  // Theme: tokens')),
   // The shared panel registry and the click-away / Escape closer.
   panels:source.slice(source.indexOf('  function pagePanels()'),source.indexOf('  // A plain styled div')),
   // The saved position and the drag handling.
@@ -117,25 +120,25 @@ function barHarness(opts) {
     page:el('div'),measure};
 }
 
-test('the classic bar is an action, a help segment and a close segment - no grip',()=>{
+test('the bar is an action and a dismiss segment - no grip, no help',()=>{
   const h=barHarness();
   const bar=h.context.videoDownloadBar("Download this video with Download Craft","video");
-  assert.equal(bar.__dcStyle,"classic");
   assert.ok(bar.__dcMain,"the action button");
-  assert.ok(bar.__dcHelp,"the help button");
   assert.ok(bar.__dcClose,"the close button");
-  // The three segments, in order, and nothing else in the bar.
+  // The two segments, in order, and nothing else in the bar.
   const row=walk(bar.shadow).find(n=>n.className==='bar');
-  assert.deepEqual(row.children.map(c=>c.className),["download","help","close"]);
+  assert.deepEqual(row.children.map(c=>c.className),["download","close"]);
   // The old grip is gone: no node and no rule for it.
   assert.equal(walk(bar.shadow).filter(n=>n.className==='grip').length,0);
   const css=walk(bar.shadow).filter(n=>n.tagName==='STYLE').map(n=>n.textContent).join("\n");
   assert.ok(!/\.grip/.test(css),"the grip CSS is gone");
-  // The help segment is a real button with an inline SVG, not a web font.
-  assert.equal(bar.__dcHelp.tagName,"BUTTON");
-  assert.equal(bar.__dcHelp.children.length,1);
-  assert.equal(bar.__dcHelp.children[0].tagName,"SVG");
-  assert.ok(bar.__dcHelp.children[0].children[0].getAttribute("d").length>0,"the ? glyph is a path");
+  // The "?" is gone too: no help segment, no help button, no help CSS.
+  assert.equal(bar.__dcHelp,undefined,"the bar has no help segment");
+  assert.equal(bar.__dcHelpPanel,undefined,"the bar has no help popover");
+  assert.equal(walk(bar.shadow).filter(n=>n.className==='help'||n.className==='help-panel').length,0);
+  assert.ok(!/\.help/.test(css),"the help CSS is gone");
+  // No help popover is mounted in the shadow root either.
+  assert.equal(bar.shadow.children.filter(n=>n.getAttribute&&n.getAttribute("data-dc-panel")==="help").length,0);
 });
 
 test('the bar says what it downloads: video and audio have their own copy',()=>{
@@ -151,7 +154,7 @@ test('the bar says what it downloads: video and audio have their own copy',()=>{
 test('the quality-menu button keeps its own label and never the download wording',()=>{
   const h=barHarness();
   const bar=h.context.videoDownloadBar("Choose video quality in Download Craft","video",
-    {style:"classic",label:"Choose video quality in Download Craft"});
+    {label:"Choose video quality in Download Craft"});
   assert.equal(bar.__dcMain.children[1].textContent,"Choose video quality in Download Craft");
   assert.equal(bar.__dcMain.getAttribute("aria-label"),"Choose video quality in Download Craft");
   assert.ok(!/download this/i.test(bar.__dcMain.children[1].textContent));
@@ -171,7 +174,7 @@ test('the width helper clamps to 240..460 and to the viewport',()=>{
   // A short label still gets the floor.
   assert.equal(h.context.classicBarWidth("Download this video"),240);
   // A longer label is measured, not ellipsised.
-  assert.equal(h.context.classicBarWidth("Download audio from this page"),291);
+  assert.equal(h.context.classicBarWidth("Download audio from this page"),266);
   // A very long label stops at the ceiling.
   assert.equal(h.context.classicBarWidth("x".repeat(200)),460);
   // The viewport is the hard limit.
@@ -186,7 +189,7 @@ test('the bar, the drag maths and the automatic placement share one width',()=>{
   // A label that needs more than the floor, so a hard-coded 240 would show.
   const bar=h.context.videoDownloadBar("Download this audio with Download Craft","audio");
   const width=h.context.classicBarWidth(bar.__dcLabelText);
-  assert.equal(width,291);
+  assert.equal(width,266);
   assert.notEqual(width,240);
   assert.equal(bar.style.width,width+"px","the bar is built with the shared width");
   // The automatic placement reads the same number.
@@ -205,67 +208,18 @@ test('the bar, the drag maths and the automatic placement share one width',()=>{
   assert.equal(bar.style.width,width+"px","the width survives the drag");
 });
 
-test('the help popover explains the capture and never links out',()=>{
+test('there is one overlay: the bar, with no style to choose',()=>{
   const h=barHarness();
+  // The style machinery is gone: no function can switch the overlay, and
+  // the bar is always the bar.
+  assert.equal(h.context.setOverlayStyle,undefined);
+  assert.equal(h.context.currentOverlayStyle,undefined);
+  assert.equal(h.context.modernDownloadButton,undefined);
   const bar=h.context.videoDownloadBar("Download this video with Download Craft","video");
-  const panel=bar.__dcHelpPanel;
-  assert.ok(panel,"the popover");
-  assert.equal(panel.getAttribute("data-dc-panel"),"help");
-  assert.equal(panel.style.display,"none","it starts closed");
-  // It lives in the bar's own shadow root.
-  assert.ok(bar.shadow.children.includes(panel));
-  assert.equal(bar.__dcHelp.getAttribute("aria-label"),"What this button downloads");
-  assert.ok(bar.__dcHelp.title);
-  // The three bullets.
-  const items=walk(panel).filter(n=>n.tagName==="LI");
-  assert.equal(items.length,3);
-  assert.match(items[0].textContent,/cookies and User-Agent/);
-  assert.match(items[1].textContent,/quality is chosen in Download Craft/);
-  assert.match(items[2].textContent,/reports it and stops/);
-  // No external address anywhere in the popover.
-  const everything=walk(panel).map(n=>textOf(n)+" "+JSON.stringify(n.attributes)).join(" ");
-  assert.ok(!/https?:\/\//i.test(everything),"the popover never points outside");
-  assert.ok(!/<a\b/i.test(everything),"the popover has no link");
-});
-
-test('the popover opens under the bar and closes on Escape and on a click away',()=>{
-  const h=barHarness();
-  const bar=h.context.videoDownloadBar("Download this video with Download Craft","video");
-  const panel=bar.__dcHelpPanel;
-  // The "?" opens it, and that click never reaches the page.
-  h.dispatch(bar.__dcHelp,"click");
-  assert.equal(panel.style.display,"block");
-  assert.equal(bar.__dcHelp.getAttribute("aria-expanded"),"true");
-  assert.equal(h.fired.click,0,"the opening click does not reach the document");
-  // A click inside the popover does not reach the page either.
-  h.dispatch(panel,"click");
-  assert.equal(h.fired.click,0);
-  assert.equal(panel.style.display,"block");
-  // A click away closes it (the shared closer hides every panel).
-  h.dispatch(h.page,"click");
-  assert.equal(h.fired.click,1);
-  assert.equal(panel.style.display,"none");
-  // Escape closes it too.
-  h.dispatch(bar.__dcHelp,"click");
-  assert.equal(panel.style.display,"block");
-  h.dispatch(bar.__dcHelp,"keydown",{key:"Escape"});
-  assert.equal(panel.style.display,"none");
-});
-
-test('the modern overlay is untouched: its own mark, no help and no close',()=>{
-  const h=barHarness();
-  h.context.setOverlayStyle("modern");
-  const bar=h.context.videoDownloadBar("Download this video with Download Craft","video");
-  assert.equal(bar.__dcStyle,"modern");
-  assert.equal(bar.__dcClose,null,"the modern overlay has no dismiss button");
-  assert.equal(bar.__dcHelp,undefined,"the modern overlay has no help segment");
-  assert.equal(bar.__dcHelpPanel,undefined);
-  // Only the mark is in the button.
-  assert.equal(bar.__dcMain.children.length,1);
-  const svg=bar.__dcMain.children[0];
-  assert.equal(svg.getAttribute("viewBox"),"0 0 64 64");
-  assert.equal(svg.children[0].getAttribute("stroke"),"#3b82f6");
-  // The modern overlay keeps its own wording.
+  assert.equal(bar.__dcStyle,undefined,"the bar carries no style marker");
+  assert.ok(bar.__dcMain);
+  assert.ok(bar.__dcClose);
+  // The audio bar keeps its own wording.
   const audio=h.context.videoDownloadBar("Download this audio with Download Craft","audio");
-  assert.equal(audio.__dcMain.getAttribute("aria-label"),"Download this audio");
+  assert.equal(audio.__dcMain.getAttribute("aria-label"),"Download audio from this page");
 });

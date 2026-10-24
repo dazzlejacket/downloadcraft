@@ -6,6 +6,9 @@ function harness(media) {
   const pills=[],sends=[];
   const element=()=>({isConnected:true,dataset:{},style:{},setAttribute(){},remove(){this.isConnected=false;}});
   const context={alive:()=>true,syncDismissControls(){},ytVideoId:()=>null,GEN:1,dismissedVideos:new Set(),
+    // The per-page visibility switch. It lives above this slice, so the
+    // harness stands in for it: the bars are shown.
+    overlaysVisible:true,
     dismissalKey:v=>v.src,window:{getComputedStyle:v=>({visibility:v.visibility || 'visible'})},
     document:{querySelectorAll:s=>s==='[data-dc-pill]'?pills:media,documentElement:{appendChild(){}}},
     videoDownloadBar:(title,kind)=>{const p=element();p.kind=kind;p.title=title;pills.push(p);return p;},

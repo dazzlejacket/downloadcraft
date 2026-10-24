@@ -1,5 +1,5 @@
-// Background worker: per-website overlay positions and the overlay style
-// shared with the desktop app.
+// Background worker: per-website overlay positions and the one-time
+// migration of the removed overlay-style setting.
 const {test}=require('node:test');
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const source=fs.readFileSync(__dirname+'/background.js','utf8');
@@ -11,6 +11,11 @@ function worker(local,session,native,extra) {
   // keys that are not stored yet.
   const area=data=>({
     get:async (key)=>{
+      if(Array.isArray(key)){
+        const out={};
+        for(const k of key) if(data[k]!==undefined) out[k]=data[k];
+        return out;
+      }
       if(key && typeof key==="object"){
         const out={...key};
         for(const k of Object.keys(key)) if(data[k]!==undefined) out[k]=data[k];
@@ -18,7 +23,10 @@ function worker(local,session,native,extra) {
       }
       return {[key]:data[key]};
     },
-    set:async patch=>Object.assign(data,patch)});
+    set:async patch=>Object.assign(data,patch),
+    remove:async (keys)=>{
+      for(const k of (Array.isArray(keys)?keys:[keys])) delete data[k];
+    }});
   const api={storage:{local:area(local),...(session?{session:area(session)}:{})},
     runtime:{sendNativeMessage:native||(async()=>{throw new Error("no native host");})}};
   const context={chrome,api,Number,HOST:"com.download_craft",
@@ -30,7 +38,7 @@ function worker(local,session,native,extra) {
     ...(extra||{})};
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('// ---- popup / content-script messages ----')),context);
-  return msg=>new Promise(resolve=>listener(msg,{},resolve));
+  return Object.assign(msg=>new Promise(resolve=>listener(msg,{},resolve)),{context});
 }
 const tick=()=>new Promise(r=>setTimeout(r,0));
 // Values that cross the vm realm boundary are compared as plain data.
@@ -91,68 +99,40 @@ test('invalid positions never overwrite a stored position',async()=>{
   assert.deepEqual(plain(local.videoBarPosition),{x:0.5,y:0.5});
 });
 
-test('the overlay style falls back to the classic bar',async()=>{
+test('there is one overlay, so there is no style to ask for',async()=>{
   const local={};const send=worker(local);
-  assert.deepEqual(plain(await send({type:'getOverlayStyle'})),{ok:true,style:'classic'});
-  assert.equal((await send({type:'setOverlayStyle',value:'neon'})).ok,false);
+  // The style messages are gone: the worker does not know them any more.
+  assert.deepEqual(plain(await send({type:'getOverlayStyle'})),{ok:false});
+  assert.deepEqual(plain(await send({type:'setOverlayStyle',value:'modern'})),{ok:false});
   assert.equal(local.overlayStyle,undefined);
-});
-
-test('the extension choice is stored, owns the value and is pushed to the app',async()=>{
-  const local={},calls=[];
-  const send=worker(local,null,async(host,msg)=>{calls.push(msg);return {type:'ok'};});
-  assert.equal((await send({type:'setOverlayStyle',value:'modern'})).ok,true);
-  assert.equal(local.overlayStyle,'modern');
-  assert.equal(local.overlayStyleSource,'extension');
-  assert.deepEqual(plain(calls.filter(c=>c.type==='setOverlayStyle')),[{type:'setOverlayStyle',style:'modern'}]);
-  assert.equal((await send({type:'getOverlayStyle'})).style,'modern');
-});
-
-test('the app value wins while the app owns the setting',async()=>{
-  const local={overlayStyle:'classic',overlayStyleSource:'app'};
-  const send=worker(local,null,async(host,msg)=>{
-    if(msg.type==='prefs')return {type:'prefs',overlayStyle:'modern',overlayStyleSource:'app'};
-    return {type:'ok'};
-  });
-  await send({type:'getOverlayStyle'});
-  await tick();
-  assert.equal(local.overlayStyle,'modern');
-  assert.equal(local.overlayStyleSource,'app');
-});
-
-test('a choice made in the extension is never clobbered by the app',async()=>{
-  const local={overlayStyle:'modern',overlayStyleSource:'extension'};
-  const send=worker(local,null,async(host,msg)=>{
-    if(msg.type==='prefs')return {type:'prefs',overlayStyle:'classic',overlayStyleSource:'app'};
-    return {type:'ok'};
-  });
-  await send({type:'getOverlayStyle'});
-  await tick();
-  assert.equal(local.overlayStyle,'modern');
-  assert.equal(local.overlayStyleSource,'extension');
-});
-
-test('an invalid app answer changes nothing',async()=>{
-  const local={overlayStyle:'classic',overlayStyleSource:'app'};
-  const send=worker(local,null,async(host,msg)=>{
-    if(msg.type==='prefs')return {type:'prefs',overlayStyle:'neon'};
-    return {type:'ok'};
-  });
-  await send({type:'getOverlayStyle'});
-  await tick();
-  assert.equal(local.overlayStyle,'classic');
-});
-
-test('a missing desktop app never breaks the extension',async()=>{
-  const local={};const send=worker(local,null,async()=>{throw new Error('no such native application');});
-  assert.equal((await send({type:'getOverlayStyle'})).style,'classic');
-  assert.equal((await send({type:'setOverlayStyle',value:'modern'})).ok,true);
-  assert.equal(local.overlayStyle,'modern');
-});
-
-test('the popup state carries the overlay style',async()=>{
-  const local={overlayStyle:'modern',overlayStyleSource:'app'};
-  const send=worker(local,null,async()=>({type:'pong'}));
+  // And the popup state does not carry one either.
   const res=await send({type:'getState'});
-  assert.equal(res.overlayStyle,'modern');
+  assert.equal(res.overlayStyle,undefined);
+});
+
+test('an older install\'s style keys are cleared once',async()=>{
+  const local={overlayStyle:'modern',overlayStyleSource:'extension'};
+  const {context}=worker(local);
+  // The migration removes the two keys an old install may still hold, so the
+  // old choice cannot linger and the bar is what every page shows.
+  assert.equal(await vm.runInContext('migrateLegacyOverlayStyle()',context),true);
+  assert.equal(local.overlayStyle,undefined);
+  assert.equal(local.overlayStyleSource,undefined);
+  // A second run has nothing left to do.
+  assert.equal(await vm.runInContext('migrateLegacyOverlayStyle()',context),false);
+});
+
+test('a clean install has nothing to migrate',async()=>{
+  const local={};const {context}=worker(local);
+  assert.equal(await vm.runInContext('migrateLegacyOverlayStyle()',context),false);
+  assert.equal(local.overlayStyle,undefined);
+  assert.equal(local.overlayStyleSource,undefined);
+});
+
+test('the migration never touches anything else',async()=>{
+  const local={overlayStyle:'classic',videoBarPosition:{x:0.5,y:0.5},appTheme:'dark'};
+  const {context}=worker(local);
+  assert.equal(await vm.runInContext('migrateLegacyOverlayStyle()',context),true);
+  assert.deepEqual(plain(local.videoBarPosition),{x:0.5,y:0.5});
+  assert.equal(local.appTheme,'dark');
 });
