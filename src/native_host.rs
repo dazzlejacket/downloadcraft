@@ -13,10 +13,10 @@
 //! server with the same voice the browser used. `headers` carries the
 //! Origin / Authorization / x-* headers the player sent with the media.
 //!
-//! Besides `ping`, `query` and `download` the host answers `prefs` and
-//! `setOverlayStyle` (the overlay style and who owns it) and `list`,
-//! `record`, `control` and `links` (the app's downloads, a browser download
-//! record, a queue control request and the links of a page).
+//! Besides `ping`, `query` and `download` the host answers `prefs` (the
+//! app's theme) and `list`, `record`, `control` and `links` (the app's
+//! downloads, a browser download record, a queue control request and the
+//! links of a page).
 //!
 //! Download requests are appended to an inbox file that the GUI polls and
 //! imports as queued (auto-started) downloads.
@@ -73,11 +73,6 @@ struct Incoming {
     pub dur: Option<u64>,
     #[serde(default, alias = "audioExpected")]
     pub audio_expected: bool,
-    /// Video overlay the extension should draw (`"modern"` or `"classic"`).
-    /// The extension sends this when the user picks a style in its popup;
-    /// the app adopts it so both places agree.
-    #[serde(default, alias = "style")]
-    pub overlay_style: Option<String>,
     /// "Download all links" (`{"type":"links"}`): every link on a page.
     #[serde(default)]
     pub links: Option<Vec<PageLink>>,
@@ -217,13 +212,6 @@ struct Reply {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     urls: Option<Vec<String>>,
-    /// Video overlay style, answered to a `prefs` request.
-    #[serde(rename = "overlayStyle", skip_serializing_if = "Option::is_none")]
-    overlay_style: Option<String>,
-    /// Who owns the overlay style: the app ("app") or the extension
-    /// ("extension"). The side that owns it wins.
-    #[serde(rename = "overlayStyleSource", skip_serializing_if = "Option::is_none")]
-    overlay_style_source: Option<String>,
     /// The app's theme ("light" | "dark" | "system") on pong, so the
     /// extension's in-page controls match it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -235,10 +223,10 @@ struct Reply {
 
 impl Reply {
     fn ok() -> Self {
-        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, overlay_style: None, overlay_style_source: None, theme: None, items: None }
+        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, theme: None, items: None }
     }
     fn err(e: impl Into<String>) -> Self {
-        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, overlay_style: None, overlay_style_source: None, theme: None, items: None }
+        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, theme: None, items: None }
     }
 }
 
@@ -664,38 +652,21 @@ pub fn run() -> eframe::Result<()> {
                 queued: None,
                 error: None,
                 urls: None,
-                overlay_style: None,
-                overlay_style_source: None,
                 theme: Some(app_theme()),
                 items: None,
             }),
             "prefs" => {
-                // What the app currently wants the extension to draw. The
-                // extension asks for this so a style chosen in the desktop
-                // settings reaches the browser.
+                // What the app wants the extension to look like. There is one
+                // overlay now, so only the theme is left to hand over.
                 write_message(&Reply {
                     kind: "prefs".into(),
                     version: None,
                     queued: None,
                     error: None,
                     urls: None,
-                    overlay_style: Some(crate::model::overlay_style()),
-                    overlay_style_source: Some(crate::model::overlay_style_source()),
                     theme: Some(app_theme()),
                     items: None,
                 });
-            }
-            "setOverlayStyle" => {
-                // The extension tells the app what the user picked in its
-                // popup; from now on the extension owns that choice.
-                match msg.overlay_style.as_deref() {
-                    Some(v @ ("modern" | "classic")) => {
-                        crate::model::set_overlay_style(v, "extension");
-                        write_message(&Reply::ok());
-                    }
-                    Some(_) => write_message(&Reply::err("unknown overlay style")),
-                    None => write_message(&Reply::err("no overlay style given")),
-                }
             }
             "query" => {
                 // Presence check only: no queueing, no dialogs, no locks held
@@ -708,8 +679,6 @@ pub fn run() -> eframe::Result<()> {
                     queued: None,
                     error: None,
                     urls: Some(hits),
-                    overlay_style: None,
-                    overlay_style_source: None,
                     theme: None,
                     items: None,
                 });
@@ -749,8 +718,6 @@ pub fn run() -> eframe::Result<()> {
                 queued: None,
                 error: None,
                 urls: None,
-                overlay_style: None,
-                overlay_style_source: None,
                 theme: None,
                 items: Some(app_downloads()),
             }),

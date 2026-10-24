@@ -68,10 +68,6 @@ struct Settings {
     ffmpeg_custom_path: String,
     /// Max simultaneous connections per host across all downloads (0 = off).
     per_host_conns: usize,
-    /// Video overlay the browser extension draws over a player: "classic"
-    /// (the floating "Download this video" bar) or "modern" (a small round
-    /// Download Craft button).
-    overlay_style: String,
     // Archives
     /// Unpack a finished download when it is an archive (ZIP / RAR / 7z).
     auto_extract: bool,
@@ -120,7 +116,6 @@ impl Default for Settings {
             ffmpeg_source: "managed".to_string(),
             ffmpeg_custom_path: String::new(),
             per_host_conns: 0,
-            overlay_style: "classic".to_string(),
             auto_extract: false,
             extract_keep_original: true,
             extract_target: "subfolder".to_string(),
@@ -136,11 +131,19 @@ fn ui_path() -> Option<std::path::PathBuf> {
 }
 
 fn load() -> Settings {
-    let mut s = Settings::default();
     let v: serde_json::Value = ui_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null);
+    load_from(&v)
+}
+
+/// Read the settings out of a parsed `ui.json`.
+///
+/// Split out of `load` so an older file can be replayed in a test without
+/// touching the file this machine really uses.
+fn load_from(v: &serde_json::Value) -> Settings {
+    let mut s = Settings::default();
     let g = |k: &str| v.get(k);
     let str_in = |k: &str, dst: &mut String| {
         if let Some(x) = g(k).and_then(|x| x.as_str()) {
@@ -156,12 +159,6 @@ fn load() -> Settings {
     str_in("antivirus_cmd", &mut s.antivirus_cmd);
     str_in("finish_action", &mut s.finish_action);
     str_in("rename_template", &mut s.rename_template);
-    // The overlay style is a closed set: an unknown value keeps the default
-    // rather than leaving the extension without a button.
-    match g("overlay_style").and_then(|x| x.as_str()) {
-        Some(v @ ("modern" | "classic")) => s.overlay_style = v.to_string(),
-        _ => {}
-    }
     match g("extract_target").and_then(|x| x.as_str()) {
         Some(v @ ("same" | "subfolder" | "custom")) => s.extract_target = v.to_string(),
         _ => {}
@@ -322,7 +319,10 @@ fn apply_settings(obj: &mut serde_json::Map<String, serde_json::Value>, s: &Sett
     set(obj, "ffmpeg_source", s.ffmpeg_source.clone().into());
     set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "per_host_conns", (s.per_host_conns as u64).into());
-    set(obj, "overlay_style", s.overlay_style.clone().into());
+    // There is one overlay now, so the style and the side that owned it are
+    // gone. The save merges onto the file that is already on disk, so the
+    // old keys have to be dropped here or they would survive every save.
+    crate::model::drop_obsolete_ui_keys(obj);
     set(obj, "auto_extract", s.auto_extract.into());
     set(obj, "extract_keep_original", s.extract_keep_original.into());
     set(obj, "extract_target", s.extract_target.clone().into());
@@ -3279,34 +3279,6 @@ impl SettingsApp {
         self.browser_card(ui, 0);
         ui.add_space(10.0);
         self.browser_card(ui, 1);
-
-        // ---- Video overlay ----
-        h2(ui, "Video overlay");
-        hint(
-            ui,
-            "How the extension draws its button over a video or audio player.",
-        );
-        ui.add_space(8.0);
-        let mut c = field_row(ui, "overlay_style", "Overlay style", None, None);
-        segmented(
-            &mut c,
-            "overlay_style",
-            &["modern", "classic"],
-            &mut self.s.overlay_style,
-        );
-        ui.add_space(6.0);
-        hint(
-            ui,
-            match self.s.overlay_style.as_str() {
-                "modern" => "Modern: a small round Download Craft button. Drag it, click it to download, double-click it to put it back.",
-                _ => "Classic: the floating \"Download this video\" bar with a close button.",
-            },
-        );
-        ui.add_space(4.0);
-        hint(
-            ui,
-            "Both styles remember their place per website, fade out when idle and come back when you move over them.",
-        );
         ui.add_space(16.0);
 
         // ---- Set up the extension ----
@@ -3702,16 +3674,56 @@ mod settings_file_tests {
     #[test]
     fn what_is_written_is_what_is_read_back() {
         let mut s = Settings::default();
-        s.overlay_style = "modern".into();
         s.auto_extract = true;
         s.extract_target = "custom".into();
         let mut obj = serde_json::Map::new();
         apply_settings(&mut obj, &s);
-        assert_eq!(obj.get("overlay_style").and_then(|v| v.as_str()), Some("modern"));
         assert_eq!(obj.get("auto_extract").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(
             obj.get("extract_target").and_then(|v| v.as_str()),
             Some("custom")
         );
+        // And the loader reads those keys back.
+        let back = load_from(&serde_json::Value::Object(obj));
+        assert!(back.auto_extract);
+        assert_eq!(back.extract_target, "custom");
+    }
+
+    /// An older install still carries the overlay style in its settings
+    /// file. Loading it must not fail, and the next save must leave the
+    /// obsolete keys out so that no later reader mistakes them for a live
+    /// setting.
+    #[test]
+    fn an_old_settings_file_loads_and_loses_the_overlay_keys() {
+        let old = serde_json::json!({
+            "theme": "dark",
+            "save_dir": "C:/downloads",
+            "auto_extract": true,
+            "extract_target": "custom",
+            "columns": ["Name", "Size"],
+            "overlay_style": "modern",
+            "overlay_style_source": "extension",
+        });
+        // Loading an old file must not fail.
+        let s = load_from(&old);
+        assert_eq!(s.theme, "dark");
+        assert_eq!(s.save_dir, "C:/downloads");
+        assert!(s.auto_extract);
+        assert_eq!(s.extract_target, "custom");
+
+        // The save merges onto the file that is already on disk.
+        let mut obj = old.as_object().unwrap().clone();
+        apply_settings(&mut obj, &s);
+        assert!(!obj.contains_key("overlay_style"));
+        assert!(!obj.contains_key("overlay_style_source"));
+        // Nothing else broke: the other settings and the keys the app does
+        // not own are still there.
+        assert_eq!(obj.get("theme").and_then(|v| v.as_str()), Some("dark"));
+        assert_eq!(obj.get("auto_extract").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            obj.get("extract_target").and_then(|v| v.as_str()),
+            Some("custom")
+        );
+        assert!(obj.contains_key("columns"));
     }
 }

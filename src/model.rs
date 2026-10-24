@@ -664,59 +664,6 @@ pub fn ui_pref_set_str(key: &str, value: &str) {
     }
 }
 
-/// The video overlay the browser extension draws: "modern" (a small round
-/// button) or "classic" (the floating bar). An unknown value keeps the
-/// classic bar, which is what the app has always shown.
-pub fn overlay_style() -> String {
-    match ui_pref_str("overlay_style", "classic").as_str() {
-        "modern" => "modern".to_string(),
-        _ => "classic".to_string(),
-    }
-}
-
-/// Who owns the overlay style: "app" (the desktop setting wins) or
-/// "extension" (the choice made in the browser popup wins).
-pub fn overlay_style_source() -> String {
-    match ui_pref_str("overlay_style_source", "app").as_str() {
-        "extension" => "extension".to_string(),
-        _ => "app".to_string(),
-    }
-}
-
-/// Record the overlay style and who chose it. The source decides which side
-/// wins the next time the two talk, so a choice made in the browser is not
-/// silently overwritten by the app (and the other way round).
-pub fn set_overlay_style(value: &str, source: &str) {
-    let value = if value == "modern" { "modern" } else { "classic" };
-    let source = if source == "extension" {
-        "extension"
-    } else {
-        "app"
-    };
-    let _guard = fs_lock("ui-settings");
-    if !_guard.owned() {
-        return;
-    }
-    let Some(p) = config_dir().map(|d| d.join("ui.json")) else {
-        return;
-    };
-    let mut v: serde_json::Value = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let Some(obj) = v.as_object_mut() else {
-        return;
-    };
-    obj.insert("overlay_style".into(), serde_json::Value::String(value.into()));
-    obj.insert(
-        "overlay_style_source".into(),
-        serde_json::Value::String(source.into()),
-    );
-    if let Ok(json) = serde_json::to_string_pretty(&v) {
-        let _ = atomic_write(&p, json.as_bytes());
-    }
-}
-
 /// One-time migration from the legacy `idm_rust` config dir: moves
 /// queue/settings/inbox files so existing installs keep their history.
 /// Safe to call on every startup (no-op once migrated).
@@ -823,9 +770,46 @@ pub fn conflict_free_dest(dest: &std::path::Path) -> std::path::PathBuf {
     dest.to_path_buf()
 }
 
+/// The keys an older install may still carry in `ui.json` that no longer
+/// mean anything: there is one overlay now, so the style and the side that
+/// owned it are gone.
+pub const OBSOLETE_UI_KEYS: [&str; 2] = ["overlay_style", "overlay_style_source"];
+
+/// Drop the obsolete overlay-style keys from a `ui.json` object.
+pub fn drop_obsolete_ui_keys(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for k in OBSOLETE_UI_KEYS {
+        obj.remove(k);
+    }
+}
+
+/// Drop the obsolete overlay-style keys from a `ui.json` payload.
+///
+/// `ui.json` is shared by the main window, the Settings window and the
+/// helper preferences, and each of them merges its own keys into the file
+/// instead of rewriting it. An old key would survive every save that way,
+/// so it is removed here, on the way out, where every writer passes.
+fn without_obsolete_ui_keys(path: &std::path::Path, data: &[u8]) -> std::io::Result<Vec<u8>> {
+    if path.file_name().and_then(|n| n.to_str()) != Some("ui.json") {
+        return Ok(data.to_vec());
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return Ok(data.to_vec());
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return Ok(data.to_vec());
+    };
+    if !OBSOLETE_UI_KEYS.iter().any(|k| obj.contains_key(*k)) {
+        return Ok(data.to_vec());
+    }
+    drop_obsolete_ui_keys(obj);
+    serde_json::to_vec_pretty(&v)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Atomically write `data` to `path` (temp file + rename) so a crash or
 /// power loss never leaves a half-written queue/settings file.
 pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let data = without_obsolete_ui_keys(path, data)?;
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
     static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
     struct Temp(std::path::PathBuf);
@@ -842,7 +826,7 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
         match options.open(&temp) {
             Ok(mut file) => {
                 let cleanup=Temp(temp);
-                std::io::Write::write_all(&mut file,data)?;
+                std::io::Write::write_all(&mut file,&data)?;
                 drop(file);
                 std::fs::rename(&cleanup.0,path)?;
                 return Ok(());
@@ -1855,6 +1839,69 @@ mod preference_merge_tests {
     #[test]fn main_window_save_keeps_helper_locations(){
         let saved=super::merge_ui_values(serde_json::json!({"ytdlp_source":"custom","ytdlp_custom_path":"/home/user/yt-dlp","ffmpeg_custom_path":"/home/user/ffmpeg","theme":"dark"}),serde_json::json!({"columns":["name"],"theme":"light"}));
         assert_eq!(saved["ytdlp_source"],"custom");assert_eq!(saved["ffmpeg_custom_path"],"/home/user/ffmpeg");assert_eq!(saved["theme"],"light");
+    }
+}
+
+/// An older install still carries the overlay style in `ui.json`. The file
+/// must still load, and the next save must leave the obsolete keys out so
+/// that no later reader mistakes them for a live setting.
+#[cfg(test)]
+mod overlay_migration_tests {
+    use super::*;
+
+    #[test]
+    fn an_old_ui_state_file_loses_the_overlay_keys_on_save() {
+        let dir = std::env::temp_dir().join("dc_ui_overlay_migration_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui.json");
+        // The file as an older install left it.
+        let old = serde_json::json!({
+            "columns": ["Name", "Size"],
+            "theme": "dark",
+            "overlay_style": "modern",
+            "overlay_style_source": "extension",
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+
+        // Loading the old file must not fail.
+        let current: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(current.get("theme").and_then(|x| x.as_str()), Some("dark"));
+
+        // The UI-state save path: overlay the window's own keys onto the
+        // file and write it back.
+        let merged = merge_ui_values(
+            current,
+            serde_json::json!({"columns": ["Name"], "show_complete": true}),
+        );
+        atomic_write(
+            &path,
+            serde_json::to_string_pretty(&merged).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let obj = written.as_object().unwrap();
+        // The obsolete keys are gone.
+        for k in OBSOLETE_UI_KEYS {
+            assert!(!obj.contains_key(k), "{k} survived the save");
+        }
+        // Nothing else broke: the window's own keys are there, and the keys
+        // the app does not own are still there.
+        assert_eq!(obj.get("theme").and_then(|x| x.as_str()), Some("dark"));
+        assert_eq!(
+            obj.get("columns")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            obj.get("show_complete").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
