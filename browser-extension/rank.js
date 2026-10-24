@@ -101,17 +101,109 @@
       || !!(a.pageUrl && b.pageUrl && a.pageUrl === b.pageUrl);
   }
 
+  // ---- Manifest/segment URL sanitisation (HS-06) ------------------------
+  // A manifest is untrusted input: the page that served it decides which
+  // URLs the downloader will fetch. Every manifest-derived URL is validated
+  // here before it can reach the queue, the native host or a muxing tool.
+  //
+  // Policy:
+  //  - only http/https survive (file:, data:, blob:, javascript:, ftp: die);
+  //  - control characters (NUL, CR/LF, ESC, DEL) and raw spaces are refused;
+  //  - backslashes are refused — the URL parser folds them into "/", so
+  //    "\\host\x" silently becomes an authority and "..\..\" traverses;
+  //  - percent-encoded separators and dot-dot in the PATH are refused (a
+  //    server that decodes before routing would still see the traversal);
+  //  - a relative reference may climb to the origin root, never above it;
+  //  - credentials in the URL are refused;
+  //  - the result is the resolved absolute URL, so signed query strings
+  //    survive byte-for-byte.
+  const MAX_MANIFEST_BYTES = 1024 * 1024;
+  const MAX_MANIFEST_REFS = 512;
+  const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+  // Encoded dot-dot (%2e%2e, .%2e, %2e.) and encoded separators (%2f, %5c).
+  const ENCODED_DOTDOT = /(?:%2e%2e|%2e\.|\.%2e)/i;
+  const ENCODED_SEPARATOR = /%(?:2f|5c)/i;
+  const ABSOLUTE_REF = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+
+  function decodeOnce(s) {
+    try { return decodeURIComponent(s); } catch (e) { return s; }
+  }
+
+  // How many ".." levels a relative reference may climb. The base
+  // manifest's own directory plus the origin root is the ceiling; deeper
+  // is an escape attempt rather than a relative path.
+  function baseClimbLimit(baseUrl) {
+    const parts = baseUrl.pathname.split("/").filter(Boolean);
+    // The last segment is the manifest file, not a directory.
+    return Math.max(0, parts.length - 1) + 1;
+  }
+
+  // Resolve one manifest-derived reference against the manifest URL.
+  // Returns the absolute URL, or null when the reference is unsafe.
+  function manifestUrl(raw, base) {
+    if (typeof raw !== "string") return null;
+    const ref = raw.trim();
+    if (!ref) return null;
+    if (CONTROL_CHARS.test(ref)) return null;
+    if (ref.includes(" ") || ref.includes("\\")) return null;
+    let baseUrl;
+    try { baseUrl = new URL(String(base || "")); } catch (e) { return null; }
+    if (!/^https?:$/.test(baseUrl.protocol)) return null;
+    // Traversal risk lives in the path only: signed query strings
+    // legitimately carry %2F and %2E.
+    let pathPart;
+    if (ABSOLUTE_REF.test(ref)) {
+      let abs;
+      try { abs = new URL(ref); } catch (e) { return null; }
+      pathPart = abs.pathname;
+    } else {
+      const cut = ref.search(/[?#]/);
+      pathPart = cut >= 0 ? ref.slice(0, cut) : ref;
+      let climbs = 0;
+      for (const seg of pathPart.split("/")) if (seg === "..") climbs++;
+      if (climbs > baseClimbLimit(baseUrl)) return null;
+    }
+    if (ENCODED_DOTDOT.test(pathPart) || ENCODED_SEPARATOR.test(pathPart)) return null;
+    let u;
+    try { u = new URL(ref, baseUrl); } catch (e) { return null; }
+    if (!/^https?:$/.test(u.protocol)) return null;
+    if (u.username || u.password) return null;
+    if (!u.hostname) return null;
+    // The resolved path is checked while decoding: a double-encoded
+    // traversal (%252e%252e) only shows up then.
+    let decoded = u.pathname;
+    for (let i = 0; i < 3; i++) {
+      if (CONTROL_CHARS.test(decoded) || decoded.includes("\\")) return null;
+      if (decoded.split("/").some(seg => seg === "..")) return null;
+      const next = decodeOnce(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    }
+    return u.href;
+  }
+
+  function manifestBytes(text) {
+    // UTF-8 needs at most 4 bytes per code unit, so a short manifest can
+    // never reach the cap and never needs to be encoded.
+    if (text.length * 4 <= MAX_MANIFEST_BYTES) return text.length;
+    if (typeof TextEncoder === "undefined") return text.length;
+    return new TextEncoder().encode(text).length;
+  }
+
   function playlistReferences(text, base) {
-    if (!/^\s*#EXTM3U(?:\s|$)/.test(String(text || ""))) return [];
+    const src = String(text || "");
+    if (!/^\s*#EXTM3U(?:\s|$)/.test(src)) return [];
+    if (src.length > MAX_MANIFEST_BYTES || manifestBytes(src) > MAX_MANIFEST_BYTES) return [];
     const refs = [];
-    for (const line of String(text || "").split(/\r?\n/)) {
+    for (const line of src.split(/\r?\n/)) {
       const t = line.trim();
       const raw = t && !t.startsWith("#") ? [t]
         : /^#EXT-X-(?:MEDIA|I-FRAME-STREAM-INF|MAP):/.test(t)
           ? [...t.matchAll(/(?:^|[,:])URI="([^"]+)"/g)].map(m => m[1]) : [];
       for (const r of raw) {
-        try { const u = new URL(r, base); if (/^https?:$/.test(u.protocol) && !u.username && !u.password && !refs.includes(u.href)) refs.push(u.href); } catch (e) {}
-        if(refs.length>=512)return refs;
+        const u = manifestUrl(r, base);
+        if (u && !refs.includes(u)) refs.push(u);
+        if(refs.length>=MAX_MANIFEST_REFS)return refs;
       }
     }
     return refs;
@@ -372,7 +464,7 @@
     } catch (e) {}
   }
 
-  const DCRank = { mediaResponse, attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  const DCRank = { mediaResponse, attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, manifestUrl, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);
