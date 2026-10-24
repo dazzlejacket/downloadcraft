@@ -1120,8 +1120,9 @@
     const fullscreen=document.fullscreenElement;
     const parent=fullscreen || document.documentElement;
     if(host.parentNode!==parent)parent.appendChild(host);
-    // The modern round button is a fixed 36 px circle, the classic bar 240 px.
-    const width=(host && host.__dcStyle==="modern")?36:Math.max(0,Math.min(240,window.innerWidth-16));
+    // The modern round button is a fixed 36 px circle, the classic bar the
+    // width its label needs (one reader for every placement path).
+    const width=barHostWidth(host);
     host.style.position="fixed";host.style.width=width+"px";
     host.style.right="auto";host.style.bottom="auto";
     host.style.left=(8+barPosition.x*Math.max(0,window.innerWidth-width-16))+"px";
@@ -1175,7 +1176,9 @@
       if(suppressClick){suppressClick=false;ev.preventDefault();ev.stopImmediatePropagation();}
     },true);
     const update=(left,top)=>{
-      const width=(host && host.__dcStyle==="modern")?36:Math.min(240,window.innerWidth-16);
+      // The very width the bar has right now: another number would make it
+      // jump while it is dragged.
+      const width=barHostWidth(host);
       barPosition={x:Math.max(0,Math.min(1,(left-8)/Math.max(1,window.innerWidth-width-16))),
         y:Math.max(0,Math.min(1,(top-8)/Math.max(1,window.innerHeight-44)))};
       positionRevision++;applySavedBarPosition(host);
@@ -1215,7 +1218,7 @@
       control.addEventListener("pointercancel",ev=>finish(ev,true));
       control.addEventListener("lostpointercapture",ev=>finish(ev,true));
     }
-    // The modern round button has no grip: the button itself is the handle
+    // There is no grip any more: the action button itself is the handle
     // and carries the arrow-key nudge.
     if (grip) grip.addEventListener("click",ev=>{ev.preventDefault();ev.stopPropagation();});
     const keyTarget = grip || main;
@@ -1502,8 +1505,9 @@
     return host;
   }
 
-  // One isolated toolbar: the primary action and dismiss button never overlap.
-  // Shadow DOM keeps player/site button and SVG rules out of these controls.
+  // One isolated toolbar: the primary action, the help segment and the
+  // dismiss button never overlap. Shadow DOM keeps player/site button and
+  // SVG rules out of these controls.
   function videoDownloadBar(title, kind = "video", opts) {
     // The style decides how the overlay looks; an explicit "classic" wins
     // (the quality-menu button keeps its label).
@@ -1515,7 +1519,19 @@
     const host = document.createElement("div");
     host.title = title;
     host.__dcStyle = "classic";
-    host.style.cssText = "all:initial;display:block;width:240px;height:28px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
+    // The action owns the copy: a download says what it downloads, the
+    // quality menu keeps its own label.
+    const action = (opts && typeof opts.label === "string" && opts.label.trim())
+      ? opts.label.trim() : classicActionLabel(kind);
+    host.__dcLabelText = action;
+    // One source of truth for the width: the drag maths, the saved position
+    // and the auto placement all read it, so the bar never jumps.
+    Object.defineProperty(host, "__dcWidth", {
+      configurable: true,
+      get: () => classicBarWidth(host.__dcLabelText || ""),
+    });
+    host.style.cssText = "all:initial;display:block;position:relative;height:28px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
+    host.style.width = host.__dcWidth + "px";
     const root = host.attachShadow({mode:"open"});
     const style = document.createElement("style");
     style.textContent = `
@@ -1527,10 +1543,10 @@
         color:#243444;background:#f8fafc;font:600 12px/1.2 system-ui,sans-serif; }
       button:hover { background:#e7eff7; }
       button:focus-visible { outline:2px solid #2563eb;outline-offset:-3px; }
-      .grip { flex:0 0 18px;width:18px;cursor:grab;color:#7b8794;touch-action:none; }
-      .grip:active { cursor:grabbing; }
       .download { touch-action:none;flex:1;min-width:0;gap:6px;padding:0 8px; }
       .label { white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
+      .help { flex:0 0 25px;width:25px;border-left:1px solid #d5dee7; }
+      .help[aria-expanded="true"] { background:#e7eff7; }
       .close { flex:0 0 25px;width:25px;border-left:1px solid #d5dee7; }
       .close:hover { color:#a91d2b;background:#ffe9ec; }
       [hidden] { display:none !important; }
@@ -1538,25 +1554,138 @@
     `;
     const bar = document.createElement("div");bar.className="bar";
     const main = document.createElement("button");main.type="button";main.className="download";
-    const action = "Download this " + kind;
-    main.title=title;main.setAttribute("aria-label",action);
+    main.title=title+" - drag to move, arrow keys move when focused";
     const arrow=svgIcon(14,ICON_DOWN,2.5);arrow.style.color="#168047";
     main.appendChild(arrow);
-    const label=document.createElement("span");label.className="label";label.textContent=action;
+    const label=document.createElement("span");label.className="label";
     main.appendChild(label);
-    const close=document.createElement("button");close.type="button";close.className="close";close.hidden=true;
+    // The help segment: a "?" that opens the explanation under the bar.
+    const help=document.createElement("button");help.type="button";help.className="help";
+    help.setAttribute("aria-label","What this button downloads");
+    help.setAttribute("aria-expanded","false");
+    help.title="What this button downloads";
+    help.appendChild(svgIcon(12,ICON_HELP,2));
+    const close=document.createElement("button");close.type="button";close.className="close";close.hidden=false;
     close.setAttribute("data-dc-dismiss","1");
     close.setAttribute("aria-label","Hide download bar for this " + kind);
     close.title="Hide for this " + kind + " — restore from the extension toolbar";
     close.appendChild(svgIcon(12,ICON_CLOSE,2));
-    const grip=document.createElement("button");grip.type="button";grip.className="grip";
-    grip.title="Drag to move · arrow keys move when focused";
-    grip.setAttribute("aria-label","Move " + kind + " download bar");
-    grip.appendChild(svgIcon(12,"M8 5h.01M8 12h.01M8 19h.01M16 5h.01M16 12h.01M16 19h.01",3));
-    bar.append(grip,main,close);root.append(style,bar);
-    installBarDrag(host,main,grip);
-    host.__dcMain=main;host.__dcClose=close;
+    bar.append(main,help,close);
+    const panel=classicHelpPanel();
+    root.append(style,bar,panel);
+    // The whole action button is the drag handle (the old grip is gone).
+    installBarDrag(host,main,null);
+    host.__dcMain=main;host.__dcClose=close;host.__dcHelp=help;host.__dcHelpPanel=panel;host.__dcLabel=label;
+    // The label (and with it the measured width) is set in one place.
+    setClassicBarLabel(host,action);
+    // The popover opens under the bar and closes on Escape or on a click
+    // away (the shared closer hides every panel).
+    help.onclick=(ev)=>{
+      if (ev) { if (ev.stopPropagation) ev.stopPropagation(); if (ev.preventDefault) ev.preventDefault(); }
+      const open=panel.style.display==="none";
+      if (typeof hidePanels === "function") hidePanels();
+      panel.style.display=open?"block":"none";
+      help.setAttribute("aria-expanded",open?"true":"false");
+      if (open) {
+        // Keep it on screen when the bar sits close to the right edge.
+        try {
+          const r=host.getBoundingClientRect?host.getBoundingClientRect():null;
+          const vw=(typeof window!=="undefined"&&window.innerWidth)?window.innerWidth:0;
+          if (r&&vw&&r.left+300>vw-8){panel.style.left="auto";panel.style.right="0px";}
+          else {panel.style.left="0px";panel.style.right="auto";}
+        } catch (e) {}
+      }
+    };
+    if (typeof installDcCloser === "function") installDcCloser();
     return host;
+  }
+
+  // The classic bar's width: the label decides, the window is the limit.
+  // 240 px is the floor (icon, help and close always fit), 460 px the
+  // ceiling (a long label still fits on a normal screen).
+  const CLASSIC_BAR_MIN = 240;
+  const CLASSIC_BAR_MAX = 460;
+  const CLASSIC_BAR_CHROME = 88; // arrow + gap + padding + help + close + borders
+  // The "?" glyph, drawn inline: no web font, no remote asset.
+  const ICON_HELP = "M9.2 9a3 3 0 1 1 4.4 2.5c-.9.5-1.6 1.1-1.6 2.1v.4M12 17.6h.01";
+  let dcMeasureCtx = null, dcMeasuredText = null, dcMeasuredWidth = 0;
+  // How wide the label really is, in the bar's own font.
+  function classicLabelWidth(text) {
+    const s = String(text || "");
+    if (!s) return 0;
+    if (s === dcMeasuredText) return dcMeasuredWidth;
+    let w = 0;
+    try {
+      if (!dcMeasureCtx) {
+        const c = document.createElement("canvas");
+        dcMeasureCtx = (c && c.getContext) ? c.getContext("2d") : null;
+      }
+      if (dcMeasureCtx) {
+        dcMeasureCtx.font = "600 12px system-ui, sans-serif";
+        const m = dcMeasureCtx.measureText(s).width;
+        if (Number.isFinite(m) && m > 0) w = m;
+      }
+    } catch (e) { /* no canvas: estimate below */ }
+    if (!w) w = s.length * 6.4; // an average 12 px bold glyph
+    dcMeasuredText = s; dcMeasuredWidth = w;
+    return w;
+  }
+  // The one width rule: the label decides, [240, 460] and the viewport clamp
+  // it. Every placement path reads this number, so the bar never jumps.
+  function classicBarWidth(labelText, viewportWidth) {
+    const vw = Number.isFinite(viewportWidth) ? viewportWidth
+      : (typeof window !== "undefined" && Number.isFinite(window.innerWidth)
+        ? window.innerWidth : CLASSIC_BAR_MAX + 16);
+    let w = Math.round(classicLabelWidth(labelText) + CLASSIC_BAR_CHROME);
+    if (!Number.isFinite(w) || w <= 0) w = CLASSIC_BAR_MIN;
+    w = Math.max(CLASSIC_BAR_MIN, Math.min(CLASSIC_BAR_MAX, w));
+    return Math.max(0, Math.min(w, Math.max(0, vw - 16)));
+  }
+  // The copy of the action button. A quality menu is not a download and
+  // keeps its own label.
+  function classicActionLabel(kind) {
+    return kind === "audio" ? "Download audio from this page" : "Download this " + kind;
+  }
+  // Panels that live inside a shadow root are invisible to the page's own
+  // querySelectorAll, so they are tracked here and closed with the rest.
+  const dcShadowPanels = new Set();
+  // The "?" popover: an in-product explanation inside the bar's own shadow
+  // root. It never navigates anywhere.
+  function classicHelpPanel() {
+    const panel = document.createElement("div");
+    panel.className = "help-panel";
+    panel.setAttribute("data-dc-panel", "help");
+    panel.setAttribute("role", "note");
+    panel.style.display = "none";
+    // Clicks inside the popover never reach the page.
+    panel.onclick = (ev) => { if (ev && ev.stopPropagation) ev.stopPropagation(); };
+    const head = document.createElement("div");
+    head.className = "help-title";
+    head.textContent = "What this captures";
+    panel.appendChild(head);
+    const list = document.createElement("ul");
+    for (const line of [
+      "The direct media file for this element, with the page's cookies and User-Agent, so the download speaks with the same voice as your browser.",
+      "The quality is chosen in Download Craft, not here.",
+      "If a browser check appears, Download Craft reports it and stops - it does not try to get around it.",
+    ]) {
+      const li = document.createElement("li");
+      li.textContent = line;
+      list.appendChild(li);
+    }
+    panel.appendChild(list);
+    dcShadowPanels.add(panel);
+    return panel;
+  }
+  // A changed label is re-measured: the bar follows its text.
+  function setClassicBarLabel(host, text) {
+    if (!host) return "";
+    const s = String(text || "");
+    host.__dcLabelText = s;
+    if (host.__dcLabel) host.__dcLabel.textContent = s;
+    if (host.__dcMain) host.__dcMain.setAttribute("aria-label", s);
+    try { if (host.style) host.style.width = host.__dcWidth + "px"; } catch (e) {}
+    return s;
   }
 
   // Theme: tokens + painter live in rank.js (node-tested); these wrappers
@@ -1573,7 +1702,10 @@
   function dcSetTheme(mode) { if (DCUI) DCUI.dcSetTheme(mode); }
   function dcPanelTokens() { return (DCUI && DCUI.panelTokens(dcThemeMode())) || DC_FALLBACK; }
   function paintDcPanel(root) { if (root && DCUI) DCUI.paintDcPanel(root); }
-  function allPanels() { try { return [...document.querySelectorAll("[data-dc-panel]")]; } catch (e) { return []; } }
+  function pagePanels() { try { return [...document.querySelectorAll("[data-dc-panel]")]; } catch (e) { return []; } }
+  // Panels inside a shadow root are invisible to the page's querySelectorAll:
+  // they are tracked separately, but they open and close with the rest.
+  function allPanels() { return [...pagePanels(), ...dcShadowPanels]; }
   function hidePanels() { allPanels().forEach((p) => { p.style.display = "none"; }); }
   // Click-away / Escape closes any open panel. One listener per page (a
   // per-rebuild listener leaked and stale closures fought the new panel);
@@ -1608,7 +1740,7 @@
     b.onclick = (ev) => {
       if (ev && ev.stopPropagation) ev.stopPropagation();
       dcSetTheme(dcThemeMode() === "light" ? "dark" : "light");
-      try { allPanels().forEach(paintDcPanel); } catch (e) { /* theme is best-effort */ }
+      try { pagePanels().forEach(paintDcPanel); } catch (e) { /* theme is best-effort */ }
     };
     return b;
   }
@@ -2048,6 +2180,19 @@
   function dismissalKey(video, id) {
     return DCRank.videoDismissKey(location.href, video && (video.currentSrc || video.src), id);
   }
+  // One reader for the overlay width: the modern round button is a fixed
+  // 36 px circle, the classic bar the width its label needs. The drag maths,
+  // the saved position and the auto placement all use it, so the bar never
+  // jumps while it is dragged.
+  function barHostWidth(host) {
+    if (!host) return 0;
+    if (host.__dcStyle === "modern") return 36;
+    const w = host.__dcWidth;
+    if (Number.isFinite(w)) return Math.max(0, w);
+    // A bar from an older generation has no measured width: keep its own.
+    const own = parseFloat(host.style && host.style.width);
+    return Number.isFinite(own) ? own : 0;
+  }
   function syncDismissControls() {
     // Remove the separate X buttons left by an older injected extension.
     document.querySelectorAll("button[data-dc-dismiss]").forEach(el=>el.remove());
@@ -2063,9 +2208,8 @@
       const r=video.getBoundingClientRect();
       const vw=window.innerWidth, vh=window.innerHeight;
       // The modern round button keeps its own 36 px box; the classic bar
-      // spans the player width.
-      const compact=host.__dcStyle==="modern";
-      const width = compact ? 36 : Math.min(240,r.width-16,vw-16);
+      // is as wide as its label needs (one rule, one number).
+      const width = barHostWidth(host);
       const audio=video.tagName === "AUDIO";
       if(audio && !video.controls){host.remove();return;}
       const visible=(!window.getComputedStyle || !["hidden","collapse"].includes(window.getComputedStyle(video).visibility));
@@ -2188,7 +2332,8 @@
     }
     // The quality-menu button is not a download button: it keeps its label
     // in both overlay styles.
-    const btn = videoDownloadBar("Choose video quality in Download Craft", "video", {style:"classic"});
+    const btn = videoDownloadBar("Choose video quality in Download Craft", "video",
+      {style:"classic", label:"Choose video quality in Download Craft"});
     btn.id = "dc-yt-btn";
     btn.dataset.vid = info.videoId;
     btn.dataset.gen = String(GEN);

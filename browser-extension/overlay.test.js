@@ -62,8 +62,8 @@ test('toolbar action, close control and accessible labels identify audio',()=>{
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('  function videoDownloadBar('),source.indexOf('  // Theme: tokens')),context);
   const bar=context.videoDownloadBar('Download audio','audio');
-  assert.equal(bar.__dcMain.attributes['aria-label'],'Download this audio');
-  assert.equal(bar.__dcMain.children[1].textContent,'Download this audio');
+  assert.equal(bar.__dcMain.attributes['aria-label'],'Download audio from this page');
+  assert.equal(bar.__dcMain.children[1].textContent,'Download audio from this page');
   assert.equal(bar.__dcClose.attributes['aria-label'],'Hide download bar for this audio');
 });
 
