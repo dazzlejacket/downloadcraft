@@ -845,6 +845,41 @@ fn cache_hint(state: crate::debrid::CacheState) -> &'static str {
     }
 }
 
+/// The provider's link expiry as a local time, when it is known.
+///
+/// The provider's links are temporary: the user is told when the address
+/// they queued stops working.
+fn link_expiry_text(at: Option<u64>) -> String {
+    let Some(at) = at else {
+        return String::new();
+    };
+    match chrono::DateTime::from_timestamp(at as i64, 0) {
+        Some(t) => format!(
+            " The link expires at {}.",
+            t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+        ),
+        None => String::new(),
+    }
+}
+
+/// The queue row settings for one cloud file.
+///
+/// The provider's own connection limit wins over the app default, so a
+/// row never opens more sockets to the provider than the provider allows.
+/// A size the provider did not report stays unknown, exactly as it does
+/// for every other capture.
+fn cloud_row_settings(
+    target: &crate::debrid::QueueTarget,
+    default_conns: usize,
+) -> (usize, Option<u64>) {
+    let conns = match target.connections {
+        Some(n) => n.clamp(1, 16),
+        None => default_conns.clamp(1, 16),
+    };
+    let size = if target.size > 0 { Some(target.size) } else { None };
+    (conns, size)
+}
+
 /// Checkbox identity for manual routing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CheckId {
@@ -3165,25 +3200,36 @@ impl CraftApp {
     /// They go through the same dedupe + destination-clash path as every
     /// other capture, so a cloud file never bypasses the queue rules.
     /// The provider's own connection limit is kept for the row.
-    fn queue_cloud_targets(&mut self, targets: Vec<crate::debrid::QueueTarget>) -> usize {
+    ///
+    /// Returns how many files were queued and when the earliest provider
+    /// link stops working.
+    fn queue_cloud_targets(
+        &mut self,
+        targets: Vec<crate::debrid::QueueTarget>,
+    ) -> (usize, Option<u64>) {
         let mut n = 0;
+        let mut expires: Option<u64> = None;
         for t in targets {
             let url = t.url.clone();
-            let size = if t.size > 0 { Some(t.size) } else { None };
+            let (conns, size) = cloud_row_settings(&t, self.connections_default);
             if !self.queue_url(url.clone(), Some(t.filename.clone()), false, size) {
                 continue;
             }
-            if let Some(limit) = t.connections {
-                if let Some(row) = self.downloads.iter_mut().find(|d| d.url == url) {
-                    row.connections = limit.clamp(1, 16);
-                }
+            if let Some(row) = self.downloads.iter_mut().find(|d| d.url == url) {
+                row.connections = conns;
+            }
+            if let Some(at) = t.expires_at {
+                expires = Some(match expires {
+                    Some(seen) => seen.min(at),
+                    None => at,
+                });
             }
             n += 1;
         }
         if self.queue_running {
             self.fill_next();
         }
-        n
+        (n, expires)
     }
 
     /// Recompute the live scheduler cap from speed windows (P3.4).
@@ -6525,10 +6571,14 @@ impl eframe::App for CraftApp {
                         self.debrid_session = Some(s);
                     }
                     DebridOutcome::Targets(targets, session) => {
-                        let n = self.queue_cloud_targets(targets);
+                        let (n, expires) = self.queue_cloud_targets(targets);
                         self.debrid_session = Some(session);
-                        self.debrid_notice = format!("Queued {n} cloud file(s).");
-                        self.push_log(format!("Debrid queued {n} cloud file(s)."));
+                        self.debrid_notice =
+                            format!("Queued {n} cloud file(s).{}", link_expiry_text(expires));
+                        self.push_log(format!(
+                            "Debrid queued {n} cloud file(s).{}",
+                            link_expiry_text(expires)
+                        ));
                     }
                     DebridOutcome::Cancelled => {
                         self.debrid_session = None;
@@ -8463,6 +8513,7 @@ impl CraftApp {
         let modal_open = self.show_add
             || self.show_queues
             || self.show_about
+            || self.show_debrid
             || self.details_id.is_some();
         let mut hover_dbg = "-".to_string();
         let mut fired_any = false;
@@ -8843,5 +8894,35 @@ mod audit_completion_tests {
         assert!(!task_can_complete(&success,false));
         success.cancelled.store(true,Ordering::SeqCst);
         assert!(!task_can_complete(&success,true));
+    }
+}
+
+#[cfg(test)]
+mod cloud_queue_tests {
+    use super::*;
+
+    fn target(conns: Option<usize>, size: u64) -> crate::debrid::QueueTarget {
+        crate::debrid::QueueTarget {
+            url: "https://cdn.example.test/file.bin".to_string(),
+            filename: "file.bin".to_string(),
+            size,
+            connections: conns,
+            expires_at: None,
+        }
+    }
+
+    /// A cloud row keeps the provider's own connection limit, so the
+    /// download never opens more sockets than the provider allows.
+    #[test]
+    fn a_cloud_row_keeps_the_provider_connection_limit() {
+        // The provider's limit wins over the app default.
+        assert_eq!(cloud_row_settings(&target(Some(4), 10), 12), (4, Some(10)));
+        // No limit from the provider: the app default stands.
+        assert_eq!(cloud_row_settings(&target(None, 10), 12), (12, Some(10)));
+        // A limit outside the usable range is brought back into it.
+        assert_eq!(cloud_row_settings(&target(Some(0), 10), 12), (1, Some(10)));
+        assert_eq!(cloud_row_settings(&target(Some(99), 10), 12), (16, Some(10)));
+        // A size the provider did not report stays unknown.
+        assert_eq!(cloud_row_settings(&target(Some(4), 0), 12), (4, None));
     }
 }

@@ -1106,6 +1106,8 @@ pub struct QueueTarget {
     pub size: u64,
     /// The provider's connection limit for this file, when it sent one.
     pub connections: Option<usize>,
+    /// Unix seconds when the provider says the link stops working.
+    pub expires_at: Option<u64>,
 }
 
 /// A cloud task the user is working with.
@@ -1299,6 +1301,7 @@ impl CloudSession {
                     filename: file.name.clone(),
                     size: file.bytes,
                     connections: link.connections,
+                    expires_at: link.expires_at,
                 });
             }
             return Ok(out);
@@ -1313,6 +1316,7 @@ impl CloudSession {
                 filename: hosted.name.clone(),
                 size: 0,
                 connections: hosted.connections,
+                expires_at: None,
             });
         }
         Ok(out)
@@ -1661,11 +1665,49 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        mock_with(provider, limits, Vec::new()).await
+    }
+
+    /// The same fixture, but one route answers with the provider's own
+    /// error body instead of the normal answer.
+    ///
+    /// The route is matched on the request line, so a fragment like
+    /// `"addMagnet"` picks the torrent submission.
+    async fn mock_refusing(
+        provider: Provider,
+        route: &str,
+        status: &str,
+        body: &str,
+    ) -> (
+        Api,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        mock_with(
+            provider,
+            0,
+            vec![(route.to_string(), status.to_string(), body.to_string())],
+        )
+        .await
+    }
+
+    /// The fixture itself: a provider answer for every request, with
+    /// optional overrides for specific routes.
+    async fn mock_with(
+        provider: Provider,
+        limits: usize,
+        overrides: Vec<(String, String, String)>,
+    ) -> (
+        Api,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = requests.clone();
         let limits = std::sync::Arc::new(std::sync::Mutex::new(limits));
+        let overrides = std::sync::Arc::new(overrides);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -1673,6 +1715,7 @@ mod tests {
                 };
                 let record = record.clone();
                 let limits = limits.clone();
+                let overrides = overrides.clone();
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
                     let mut b = [0; 1];
@@ -1721,6 +1764,16 @@ mod tests {
                     // Real-Debrid answers a delete with 204 and no body.
                     if headers.lines().next().unwrap_or("").starts_with("DELETE ") {
                         let reply = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                        return;
+                    }
+                    // A route the test wants to answer differently.
+                    let override_answer = overrides
+                        .iter()
+                        .find(|(route, _, _)| path.contains(route))
+                        .map(|(_, status, body)| (status.to_string(), body.clone()));
+                    if let Some((status, body)) = override_answer {
+                        let reply = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                         let _ = socket.write_all(reply.as_bytes()).await;
                         return;
                     }
@@ -2397,6 +2450,165 @@ mod tests {
             .await
             .expect_err("nothing selected means nothing to resolve");
         assert!(err.to_string().contains("at least one"));
+        task.abort();
+    }
+
+    /// A resolved cloud file must be something the queue accepts.
+    ///
+    /// The queue refuses anything that is not a download URL, so the
+    /// provider's link has to pass that same gate — and it must never
+    /// carry the provider credential.
+    #[tokio::test]
+    async fn resolved_cloud_targets_can_go_into_the_queue() {
+        let (api, _requests, task) = mock(Provider::RealDebrid).await;
+        let session = CloudSession::submit_torrent(api, MAGNET).await.unwrap();
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        for t in &targets {
+            assert!(
+                crate::model::is_download_url(&t.url),
+                "the queue would refuse this link: {t:?}"
+            );
+            assert!(!t.url.contains("private-api-token"));
+            assert!(!t.filename.is_empty());
+        }
+        task.abort();
+
+        // A hosting link that the provider resolved right away is queued
+        // the same way.
+        let (api, _requests, task) = mock(Provider::RealDebrid).await;
+        let session = CloudSession::submit_hosting(api, "https://mega.nz/file/abc#key", "pw")
+            .await
+            .unwrap();
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert!(crate::model::is_download_url(&targets[0].url));
+        assert!(!targets[0].url.contains("private-api-token"));
+        task.abort();
+    }
+
+    /// A link's lifetime has to reach the queue row, so the user can see
+    /// that the address is temporary.
+    #[tokio::test]
+    async fn a_link_carries_its_expiry_to_the_queue() {
+        let expiry = now_seconds() + 3600;
+        let body = format!(
+            r#"{{"download":"https://cdn.example.test/file.bin","filename":"file.bin","expires":{expiry}}}"#
+        );
+        let (api, _requests, task) =
+            mock_refusing(Provider::RealDebrid, "unrestrict/link", "200 OK", &body).await;
+        let session = CloudSession::submit_torrent(api, MAGNET).await.unwrap();
+        let targets = session.resolve().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].expires_at, Some(expiry));
+        task.abort();
+    }
+
+    /// A rate-limited answer must not lose the submission: the request is
+    /// sent again, and the second attempt carries a fresh body.
+    #[tokio::test]
+    async fn a_rate_limited_submission_still_reaches_the_provider() {
+        // The first request is answered with 429; the retry is served.
+        let (api, requests, task) = mock_serving(Provider::RealDebrid, 1).await;
+        let session = CloudSession::submit_torrent(api, MAGNET)
+            .await
+            .expect("the submission must survive a rate limit");
+        assert_eq!(session.state(), CloudStatus::Ready);
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|r| r.contains("addMagnet")),
+            "the torrent must still be submitted: {requests:?}"
+        );
+        task.abort();
+    }
+
+    /// A refusal must reach the user with the provider's own code, and
+    /// without the credential or the request address.
+    #[tokio::test]
+    async fn a_refused_submission_names_the_provider_code() {
+        let (api, _requests, task) = mock_refusing(
+            Provider::RealDebrid,
+            "addMagnet",
+            "400 Bad Request",
+            r#"{"error":"torrent too big","error_code":29}"#,
+        )
+        .await;
+        let err = match CloudSession::submit_torrent(api, MAGNET).await {
+            Ok(_) => panic!("the refusal must surface"),
+            Err(e) => e,
+        };
+        assert_eq!(provider_code(&err), Some("29"));
+        let text = err.to_string();
+        assert!(text.contains("torrent too big"));
+        assert!(!text.contains("private-api-token"));
+        assert!(!text.contains("127.0.0.1"));
+        task.abort();
+    }
+
+    /// A wrong token must be refused before anything is submitted.
+    #[tokio::test]
+    async fn a_wrong_token_is_refused_before_any_torrent_is_submitted() {
+        let (api, requests, task) = mock_refusing(
+            Provider::RealDebrid,
+            "GET /user ",
+            "401 Unauthorized",
+            r#"{"error":"bad token","error_code":8}"#,
+        )
+        .await;
+        let err = api
+            .account()
+            .await
+            .expect_err("a wrong token must be refused");
+        assert_eq!(provider_code(&err), Some("8"));
+        let requests = requests.lock().unwrap();
+        assert!(
+            !requests.iter().any(|r| r.contains("addMagnet")),
+            "nothing may be submitted with a refused token: {requests:?}"
+        );
+        task.abort();
+    }
+
+    /// The provider's answer about a torrent decides what the panel says.
+    #[tokio::test]
+    async fn cache_states_are_read_from_the_provider_answer() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        // The provider holds it: an instant download.
+        let cached = format!(
+            r#"{{"{hash}":{{"rd":[{{"1":{{"filename":"file.bin","filesize":123}}}}]}}}}"#
+        );
+        let (api, _requests, task) =
+            mock_refusing(Provider::RealDebrid, "instantAvailability", "200 OK", &cached).await;
+        let status = api.cache_status(hash, None).await.unwrap();
+        assert_eq!(status.state, CacheState::Cached);
+        assert_eq!(status.files.len(), 1);
+        assert_eq!(status.bytes, 123);
+        task.abort();
+
+        // The provider does not list it: it has to fetch it first.
+        let (api, _requests, task) =
+            mock_refusing(Provider::RealDebrid, "instantAvailability", "200 OK", "{}").await;
+        let status = api.cache_status(hash, None).await.unwrap();
+        assert_eq!(status.state, CacheState::Uncached);
+        task.abort();
+
+        // The provider lists it but does not say what it holds: unusable.
+        let listed = format!(r#"{{"{hash}":{{}}}}"#);
+        let (api, _requests, task) =
+            mock_refusing(Provider::RealDebrid, "instantAvailability", "200 OK", &listed).await;
+        let status = api.cache_status(hash, None).await.unwrap();
+        assert_eq!(status.state, CacheState::Unknown);
+        task.abort();
+
+        // TorBox says it holds the files but not the whole torrent.
+        let (api, _requests, task) = mock_refusing(
+            Provider::TorBox,
+            "checkcached",
+            "200 OK",
+            r#"{"success":true,"data":{"cached":false,"files":[{"id":3,"name":"file.bin","size":123}]}}"#,
+        )
+        .await;
+        let status = api.cache_status(hash, None).await.unwrap();
+        assert_eq!(status.state, CacheState::Partial);
         task.abort();
     }
 }
