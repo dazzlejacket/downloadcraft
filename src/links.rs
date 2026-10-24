@@ -241,9 +241,12 @@ struct LinksApp {
     probes_left: usize,
     _rt: std::sync::Arc<tokio::runtime::Runtime>,
     notice: String,
-    centered: bool,
     done: bool,
     exited: bool,
+    /// Where this window sits in the cascade of open dialogs.
+    slot: crate::window::CascadeSlot,
+    /// Our own window handle, for the activation rule.
+    hwnd: Option<isize>,
 }
 
 impl LinksApp {
@@ -463,7 +466,7 @@ impl LinksApp {
             let wl = crate::shaped::width(p, label, &reg(11.5));
             let w = wn + wl + 18.0;
             let r = Rect::from_min_size(Pos2::new(right - w, rect.center().y - 12.0), Vec2::new(w, 24.0));
-            p.rect(r, 6.0, t.surface, Stroke::new(1.0, t.card_bd), egui::StrokeKind::Inside);
+            p.rect(r, 6.0, t.surface, Stroke::new(1.0_f32, t.card_bd), egui::StrokeKind::Inside);
             p.text(Pos2::new(r.min.x + 9.0, r.center().y), Align2::LEFT_CENTER, &n, semi(11.5), t.txt);
             p.text(Pos2::new(r.min.x + 9.0 + wn, r.center().y), Align2::LEFT_CENTER, label, reg(11.5), t.dim);
             right = r.min.x - 6.0;
@@ -488,7 +491,7 @@ impl LinksApp {
             // Search field.
             let (r, _) = ui.allocate_exact_size(Vec2::new(250.0, 30.0), Sense::hover());
             let focused = ui.memory(|m| m.focused() == Some(egui::Id::new("links-q")));
-            ui.painter().rect(r, 6.0, t.bg, Stroke::new(1.0, if focused { t.primary } else { t.card_bd }), egui::StrokeKind::Inside);
+            ui.painter().rect(r, 6.0, t.bg, Stroke::new(1.0_f32, if focused { t.primary } else { t.card_bd }), egui::StrokeKind::Inside);
             ui.painter().text(Pos2::new(r.min.x + 16.0, r.center().y), Align2::CENTER_CENTER, crate::app::MI_SEARCH, icon(15.0), t.dim);
             ui.put(
                 Rect::from_min_max(Pos2::new(r.min.x + 28.0, r.min.y + 4.0), Pos2::new(r.max.x - 6.0, r.max.y - 4.0)),
@@ -533,7 +536,7 @@ impl LinksApp {
                             } else {
                                 (t.surface, t.card_bd, t.dim)
                             };
-                            p.rect(r, 14.0, fill, Stroke::new(1.0, bd), egui::StrokeKind::Inside);
+                            p.rect(r, 14.0, fill, Stroke::new(1.0_f32, bd), egui::StrokeKind::Inside);
                             let mut x = r.min.x + 10.0;
                             if let Some(k) = k {
                                 p.circle_filled(Pos2::new(x + 3.5, r.center().y), 3.5, k.color(dark));
@@ -571,7 +574,7 @@ impl LinksApp {
         let dark = ui.visuals().dark_mode;
         let shown = self.shown();
         let card = ui.available_rect_before_wrap();
-        ui.painter().rect(card, 8.0, t.bg, Stroke::new(1.0, t.card_bd), egui::StrokeKind::Inside);
+        ui.painter().rect(card, 8.0, t.bg, Stroke::new(1.0_f32, t.card_bd), egui::StrokeKind::Inside);
         let inner = card.shrink(1.0);
         let widths = col_widths(&self.cols, inner.width() - CB_W - 10.0);
         let xs = {
@@ -587,7 +590,7 @@ impl LinksApp {
         let hdr = Rect::from_min_size(inner.min, Vec2::new(inner.width(), HDR_H));
         let p = ui.painter().clone();
         p.rect_filled(hdr, CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, t.surface);
-        p.hline(hdr.x_range(), hdr.max.y, Stroke::new(1.0, t.card_bd));
+        p.hline(hdr.x_range(), hdr.max.y, Stroke::new(1.0_f32, t.card_bd));
         // Tri-state check over what is shown.
         let n_on = shown.iter().filter(|&&i| self.rows[i].checked).count();
         let cbr = Rect::from_center_size(Pos2::new(inner.min.x + CB_W / 2.0, hdr.center().y), Vec2::splat(15.0));
@@ -665,7 +668,7 @@ impl LinksApp {
                     } else if resp.hovered() {
                         p.rect_filled(r, 0.0, t.hover_bg);
                     }
-                    p.hline(r.x_range(), r.max.y - 0.5, Stroke::new(1.0, t.card_bd.gamma_multiply(0.5)));
+                    p.hline(r.x_range(), r.max.y - 0.5, Stroke::new(1.0_f32, t.card_bd.gamma_multiply(0.5)));
                     let dim = if row.kind == Kind::Page { 0.6 } else { 1.0 };
                     let cy = r.center().y;
                     paint_check(p, Rect::from_center_size(Pos2::new(r.min.x + CB_W / 2.0, cy), Vec2::splat(15.0)), row.checked, false, resp.hovered());
@@ -770,7 +773,7 @@ impl LinksApp {
         let row_y = area.max.y - 18.0;
         p.text(Pos2::new(area.min.x, row_y), Align2::LEFT_CENTER, "Save to", reg(11.5), t.dim);
         let seg = Rect::from_min_size(Pos2::new(area.min.x + 50.0, row_y - 15.0), Vec2::new(214.0, 30.0));
-        p.rect(seg, 6.0, t.surface, Stroke::new(1.0, t.card_bd), egui::StrokeKind::Inside);
+        p.rect(seg, 6.0, t.surface, Stroke::new(1.0_f32, t.card_bd), egui::StrokeKind::Inside);
         for (k, (label, val)) in [("Category folders", true), ("One folder", false)].into_iter().enumerate() {
             let r = Rect::from_min_size(Pos2::new(seg.min.x + 3.0 + k as f32 * 117.0, seg.min.y + 3.0), Vec2::new(if k == 0 { 114.0 } else { 91.0 }, 24.0));
             let resp = ui.interact(r, egui::Id::new(("links-seg", k)), Sense::click());
@@ -791,7 +794,7 @@ impl LinksApp {
             }
         }
         let path = Rect::from_min_size(Pos2::new(seg.max.x + 8.0, row_y - 15.0), Vec2::new(330.0, 30.0));
-        p.rect(path, 6.0, t.bg, Stroke::new(1.0, t.card_bd), egui::StrokeKind::Inside);
+        p.rect(path, 6.0, t.bg, Stroke::new(1.0_f32, t.card_bd), egui::StrokeKind::Inside);
         let browse = Rect::from_min_size(Pos2::new(path.max.x - 70.0, path.min.y + 4.0), Vec2::new(66.0, 22.0));
         if self.by_category {
             // What "category folders" means, spelled out.
@@ -804,7 +807,7 @@ impl LinksApp {
                 egui::TextEdit::singleline(&mut self.one_dir).frame(false).font(reg(11.0)).vertical_align(egui::Align::Center),
             );
             let resp = ui.interact(browse, egui::Id::new("links-browse"), Sense::click());
-            p.rect(browse, 4.0, if resp.hovered() { t.surface_lt } else { t.surface }, Stroke::new(1.0, t.card_bd), egui::StrokeKind::Inside);
+            p.rect(browse, 4.0, if resp.hovered() { t.surface_lt } else { t.surface }, Stroke::new(1.0_f32, t.card_bd), egui::StrokeKind::Inside);
             p.text(Pos2::new(browse.min.x + 8.0, browse.center().y), Align2::LEFT_CENTER, MI_FOLDER, icon(12.0), t.dim);
             p.text(Pos2::new(browse.min.x + 24.0, browse.center().y), Align2::LEFT_CENTER, "Browse", reg(10.5), t.txt);
             if resp.clicked() {
@@ -833,7 +836,7 @@ impl LinksApp {
                 (if resp.hovered() && enabled { t.surface_lt } else { t.surface }, t.card_bd, t.txt)
             };
             let a = if enabled { 1.0 } else { 0.45 };
-            p.rect(r, 6.0, fill.gamma_multiply(a), Stroke::new(1.0, bd.gamma_multiply(a)), egui::StrokeKind::Inside);
+            p.rect(r, 6.0, fill.gamma_multiply(a), Stroke::new(1.0_f32, bd.gamma_multiply(a)), egui::StrokeKind::Inside);
             let mut x = r.min.x + 16.0;
             if let Some(g) = glyph {
                 p.text(Pos2::new(x + 7.0, r.center().y), Align2::CENTER_CENTER, g, icon(15.0), fg.gamma_multiply(a));
@@ -866,7 +869,7 @@ fn paint_check(p: &egui::Painter, r: Rect, on: bool, mixed: bool, hover: bool) {
             p.rect_filled(Rect::from_center_size(r.center(), Vec2::new(7.0, 2.0)), 1.0, Color32::WHITE);
         }
     } else {
-        p.rect(r, 4.0, t.bg, Stroke::new(1.5, if hover { t.primary } else { t.card_bd }), egui::StrokeKind::Inside);
+        p.rect(r, 4.0, t.bg, Stroke::new(1.5_f32, if hover { t.primary } else { t.card_bd }), egui::StrokeKind::Inside);
     }
 }
 
@@ -980,6 +983,9 @@ pub fn run() -> eframe::Result<()> {
         }
     };
     let prefs = crate::confirm::load_prefs();
+    // Take the next slot of the cascade before the window is built: the
+    // position depends on it.
+    let slot = crate::window::take_cascade_slot();
     let rows = batch
         .links
         .into_iter()
@@ -1005,7 +1011,8 @@ pub fn run() -> eframe::Result<()> {
     let mut app = LinksApp {
         page_url: batch.page_url,
         title: batch.title,
-        cookie: batch.cookie,
+        // The cookie came with the process, not through the file on disk.
+        cookie: std::env::var(crate::native_host::LINKS_COOKIE_ENV).unwrap_or_default(),
         rows,
         filter: String::new(),
         chip: None,
@@ -1020,16 +1027,23 @@ pub fn run() -> eframe::Result<()> {
         probes_left: 0,
         _rt: rt,
         notice: String::new(),
-        centered: false,
         done: false,
         exited: false,
+        slot,
+        hwnd: None,
     };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Download all links — Download Craft")
         .with_inner_size([LINKS_W, LINKS_H])
         .with_min_inner_size([760.0, 420.0])
         .with_resizable(true)
-        .with_always_on_top();
+        // Normal Z-order: this is an ordinary window, not a layer that
+        // floats above everything else. It takes a place in the cascade
+        // with the other open dialogs instead.
+        .with_window_level(egui::WindowLevel::Normal);
+    // Take the next slot of the cascade, on the monitor the pointer is on.
+    let (cx, cy) = crate::window::cascade_position((LINKS_W, LINKS_H), slot.index);
+    viewport = viewport.with_position(egui::pos2(cx, cy));
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
@@ -1042,7 +1056,10 @@ pub fn run() -> eframe::Result<()> {
             app.start_probes(cc.egui_ctx.clone());
             Ok(Box::new(app))
         }),
-    )
+    )?;
+    // The window is gone: free its place in the cascade.
+    crate::window::release_cascade_slot();
+    Ok(())
 }
 
 const LINKS_W: f32 = 1000.0;
@@ -1062,9 +1079,26 @@ impl eframe::App for LinksApp {
             }
             return;
         }
-        if !self.centered && crate::model::center_window(ctx, egui::vec2(LINKS_W, LINKS_H)) {
-            self.centered = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // The window must not take the keyboard away from the user: only
+        // the first dialog of a cascade may take focus on appearance. The
+        // others wait until the user clicks them.
+        match self.hwnd {
+            None => {
+                if let Some(h) = crate::window::own_window_handle("Download all links") {
+                    self.hwnd = Some(h);
+                    if !self.slot.may_activate() {
+                        crate::window::suppress_activation(h);
+                    }
+                }
+            }
+            Some(h) => {
+                if crate::window::activation_suppressed(h)
+                    && ctx.input(|i| i.pointer.any_pressed())
+                    && crate::window::pointer_inside(h)
+                {
+                    crate::window::allow_activation(h);
+                }
+            }
         }
         self.collect_probes();
         let frame = egui::Frame::new().fill(pl().bg).inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 12 });
