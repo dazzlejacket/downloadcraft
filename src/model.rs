@@ -385,11 +385,39 @@ pub fn filename_from_url(raw: &str) -> String {
                 if is_hash {
                     continue;
                 }
-                return percent_decode(clean);
+                let name = safe_segment(&percent_decode(clean));
+                if name.is_empty() {
+                    // Not a name (it was only dots): try an earlier segment.
+                    continue;
+                }
+                return name;
             }
         }
     }
     format!("download_{}.bin", chrono::Local::now().timestamp())
+}
+
+/// A URL path segment, once decoded, must not become a path of its own.
+///
+/// "..%2f..%2fboot.ini" is one path segment that decodes to
+/// "../../boot.ini". A name like that is not a file name: joined onto the
+/// download folder it would point somewhere else entirely. Separators and
+/// control characters become "_", and a segment that is nothing but dots
+/// ("." and "..") is not a name at all.
+fn safe_segment(decoded: &str) -> String {
+    let out: String = decoded
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => '_',
+            c if (c as u32) < 32 => '_',
+            c => c,
+        })
+        .collect();
+    let out = out.trim().to_string();
+    if out.is_empty() || out.chars().all(|c| c == '.') {
+        return String::new();
+    }
+    out
 }
 
 /// Extension for a `Content-Type` (with parameters tolerated): the correct
@@ -1663,6 +1691,35 @@ mod tests {
             filename_from_url("https://scontent.xx.fbcdn.net/o1/v/t2/AQabc123.mp4?oh=1&oe=2"),
             "AQabc123.mp4"
         );
+    }
+
+    #[test]
+    fn a_url_name_cannot_escape_the_download_folder() {
+        // One percent-encoded path segment must not turn into a path of its
+        // own when the name is joined onto the download folder.
+        let name = filename_from_url("https://h/x/..%2f..%2fboot.ini");
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains('\\'), "{name}");
+        assert!(!name.is_empty(), "{name}");
+        // A literal dot-dot segment is resolved by the URL parser itself.
+        assert_eq!(filename_from_url("https://h/x/../../boot.ini"), "boot.ini");
+        // A segment that is nothing but dots is not a name: an earlier one wins.
+        assert_eq!(filename_from_url("https://h/x/%2e%2e/file.mp4"), "file.mp4");
+        // A backslash separator is neutralised too.
+        assert_eq!(filename_from_url("https://h/x/a%5cb.mp4"), "a_b.mp4");
+        // The name is a single file name, never a nested path.
+        for raw in [
+            "https://h/x/..%2f..%2fboot.ini",
+            "https://h/x/%2e%2e%2f%2e%2e%2fsecret.txt",
+            "https://h/x/a%5cb.mp4",
+        ] {
+            let n = filename_from_url(raw);
+            assert!(!n.contains('/') && !n.contains('\\'), "{raw} -> {n}");
+            assert!(
+                std::path::Path::new(&n).file_name().map(|f| f.to_string_lossy() == n).unwrap_or(false),
+                "{raw} -> {n}"
+            );
+        }
     }
 
     #[test]

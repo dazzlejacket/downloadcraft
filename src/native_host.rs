@@ -111,6 +111,36 @@ pub struct LinksBatch {
 /// window. It lives only as long as that process.
 pub const LINKS_COOKIE_ENV: &str = "DOWNLOADCRAFT_LINKS_COOKIE";
 
+/// The environment variable that carries the captured request headers
+/// (`Authorization`, `x-*`) to the Download File Info dialog.
+///
+/// A bearer token is a credential: `queue.json` deliberately never holds one
+/// (`DownloadItem::extra_headers` is `#[serde(skip)]`), and the inbox must
+/// not hold one either. The dialog is a child of this process, so the
+/// headers ride in its inherited environment and never touch the disk. The
+/// dialog removes the variable before it starts anything of its own, so the
+/// token does not outlive the window that needed it.
+pub const CAPTURE_HEADERS_ENV: &str = "DOWNLOADCRAFT_CAPTURE_HEADERS";
+
+/// The captured headers, ready for the environment.
+fn encode_capture_headers(
+    headers: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<String> {
+    let headers = headers?;
+    if headers.is_empty() {
+        return None;
+    }
+    serde_json::to_string(headers).ok()
+}
+
+/// The captured headers, read back from the environment.
+pub(crate) fn decode_capture_headers(
+    raw: Option<&str>,
+) -> std::collections::BTreeMap<String, String> {
+    let Some(raw) = raw else { return Default::default() };
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
 /// Validate a page's links and keep the downloadable ones (http/https,
 /// sane lengths, no duplicates), capped like the extension's collector.
 pub fn links_batch(page_url: &str, title: &str, links: &[PageLink]) -> LinksBatch {
@@ -167,12 +197,17 @@ fn spawn_links(msg: &Incoming) -> Result<(), String> {
             cmd.env(LINKS_COOKIE_ENV, cookie);
         }
     }
-    spawn_detached(cmd);
+    let _ = spawn_detached(cmd);
     Ok(())
 }
 
 /// Spawn a window that outlives this short-lived host.
-fn spawn_detached(mut cmd: std::process::Command) {
+///
+/// True when the window actually started. The caller needs to know: if the
+/// Download File Info dialog never opens, the main window's fallback prompt
+/// is the only consumer left, and the capture's credentials have to reach it
+/// some other way.
+fn spawn_detached(mut cmd: std::process::Command) -> bool {
     // Never hand our stdio to the window: an inherited stdout keeps the
     // browser's pipe open after this host exits.
     cmd.stdin(std::process::Stdio::null())
@@ -193,11 +228,11 @@ fn spawn_detached(mut cmd: std::process::Command) {
         // still beats none at all.
         cmd.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
         if cmd.spawn().is_ok() {
-            return;
+            return true;
         }
         cmd.creation_flags(DETACHED_PROCESS);
     }
-    let _ = cmd.spawn();
+    cmd.spawn().is_ok()
 }
 
 #[derive(Debug, Serialize)]
@@ -304,19 +339,51 @@ fn allowed_download_roots() -> Vec<std::path::PathBuf> {
     roots
 }
 
+/// Resolve a path for comparison.
+///
+/// The real path when it exists, and the real path of its parent with the
+/// last name joined on when the folder itself does not exist yet - a
+/// download folder that has not been created is still a valid root.
+fn resolved_for_compare(p: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        if let Ok(c) = std::fs::canonicalize(parent) {
+            return c.join(name);
+        }
+    }
+    p.to_path_buf()
+}
+
+/// The path as the two sides are compared: lower case, backslashes, and
+/// without Windows's "\\?\" prefix on a resolved path.
+fn comparable(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    let s = s.strip_prefix("\\\\?\\").unwrap_or(&s).to_string();
+    s.replace('/', "\\").to_lowercase()
+}
+
 /// Is `path` inside `root`? A prefix match on the whole path is not enough:
-/// "C:\Users\x\Downloads Evil" must not pass as "C:\Users\x\Downloads".
+/// "C:\Users\x\Downloads Evil" must not pass as "C:\Users\x\Downloads" -
+/// and neither must "C:\Users\x\Downloads\..\..\Windows", which starts with
+/// the same characters and is somewhere else entirely.
+///
+/// Both sides are resolved first, so ".." is gone before the comparison. A
+/// path that cannot be resolved at all is refused: it cannot be shown to be
+/// inside anything.
 fn path_is_under(path: &std::path::Path, root: &std::path::Path) -> bool {
-    let p = path.to_string_lossy().replace('/', "\\").to_lowercase();
-    let r = root
-        .to_string_lossy()
-        .replace('/', "\\")
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let p = comparable(&resolved);
+    let r = comparable(&resolved_for_compare(root))
         .trim_end_matches('\\')
-        .to_lowercase();
+        .to_string();
     if r.is_empty() {
         return false;
     }
-    p.starts_with(&format!("{r}\\"))
+    p.starts_with(&format!("{r}\\")) || p.starts_with(&format!("{r}/"))
 }
 
 /// A file the extension saved itself ("Download in browser"): list it in the
@@ -416,8 +483,15 @@ pub struct InboxItem {
     /// speak with the same voice (optional: older extensions omit it).
     #[serde(default, alias = "userAgent")]
     pub user_agent: Option<String>,
-    /// Captured request headers (credentials: kept in the private inbox,
-    /// never on a command line).
+    /// Captured request headers (credentials).
+    ///
+    /// Empty in the file as long as the Download File Info dialog can be
+    /// started: an `Authorization` header is a bearer token, and a file in
+    /// the user's data folder is a file another program on the machine can
+    /// read. Those headers travel to the dialog through the inherited
+    /// environment instead (`CAPTURE_HEADERS_ENV`). They are written here
+    /// only when that dialog could not be started at all and the main
+    /// window's fallback prompt is the only consumer left.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -521,6 +595,39 @@ fn replayable_headers(
     (!kept.is_empty()).then_some(kept)
 }
 
+/// The inbox entry for one capture.
+///
+/// The captured request headers are deliberately absent. An `Authorization`
+/// header is a bearer token: it travels to the Download File Info dialog
+/// through the inherited environment, never through this file. Only a
+/// capture whose dialog could not be started at all gets them written back
+/// (see `attach_inbox_headers`).
+fn inbox_item(msg: &Incoming, url: &str) -> InboxItem {
+    let referer = msg
+        .referer
+        .clone()
+        .or_else(|| msg.page_url.clone())
+        .filter(|s| !s.trim().is_empty());
+    InboxItem {
+        url: url.to_string(),
+        filename: msg.filename.clone(),
+        received_at: chrono::Local::now().to_rfc3339(),
+        page_url: msg.page_url.clone(),
+        referer,
+        cookie: msg.cookie.clone().filter(|s| !s.trim().is_empty()),
+        user_agent: msg.user_agent.clone().filter(|s| !s.trim().is_empty()),
+        headers: None,
+        mime: msg.mime.clone().filter(|s| !s.trim().is_empty()),
+        size: msg.size.filter(|s| *s > 0),
+        pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
+        pair_mime: msg.pair_mime.clone().filter(|s| !s.trim().is_empty()),
+        urls: None,
+        quality: msg.quality.clone().filter(|s| !s.trim().is_empty()),
+        dur: msg.dur.filter(|s| *s > 0),
+        audio_expected: msg.audio_expected,
+    }
+}
+
 fn queue_download(msg: &Incoming) -> Result<bool, String> {
     const MAX_INBOX: usize = 200;
     let url = msg.url.clone().unwrap_or_default();
@@ -537,29 +644,7 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         Some(s) => serde_json::from_str(&s)
             .map_err(|_| "inbox unreadable — kept for the next poll".to_string())?,
     };
-    let referer = msg
-        .referer
-        .clone()
-        .or_else(|| msg.page_url.clone())
-        .filter(|s| !s.trim().is_empty());
-    let fresh = InboxItem {
-        url: url.clone(),
-        filename: msg.filename.clone(),
-        received_at: chrono::Local::now().to_rfc3339(),
-        page_url: msg.page_url.clone(),
-        referer,
-        cookie: msg.cookie.clone().filter(|s| !s.trim().is_empty()),
-        user_agent: msg.user_agent.clone().filter(|s| !s.trim().is_empty()),
-        headers: replayable_headers(msg.headers.as_ref()),
-        mime: msg.mime.clone().filter(|s| !s.trim().is_empty()),
-        size: msg.size.filter(|s| *s > 0),
-        pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
-        pair_mime: msg.pair_mime.clone().filter(|s| !s.trim().is_empty()),
-        urls: None,
-        quality: msg.quality.clone().filter(|s| !s.trim().is_empty()),
-        dur: msg.dur.filter(|s| *s > 0),
-        audio_expected: msg.audio_expected,
-    };
+    let fresh = inbox_item(msg, &url);
     // Same URL re-captured: refresh metadata instead of ignoring it (the
     // filename/referer/cookie may be corrected this time).
     let is_new = match items.iter_mut().find(|i| i.url == url) {
@@ -581,19 +666,66 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
     Ok(is_new)
 }
 
+/// A filename that may safely travel on a command line.
+///
+/// The name comes from the page (an anchor's `download` attribute, or the
+/// browser's own saved name), so it is untrusted: it must be a single file
+/// name, with no path separator and no control character. A name that does
+/// not fit is not passed on at all - the dialog then derives one from the
+/// URL, which it already knows how to do.
+fn safe_capture_filename(name: &str) -> Option<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 255 {
+        return None;
+    }
+    if name.contains(['/', '\\']) || name.chars().any(|c| (c as u32) < 32) {
+        return None;
+    }
+    Some(name)
+}
+
+/// Put the captured headers back into a pending inbox entry.
+///
+/// Only used when the Download File Info dialog could not be started: the
+/// main window's fallback prompt is then the only consumer left, and it
+/// reads the headers from this file. In every other case the headers travel
+/// through the environment and the file never holds a bearer token.
+fn attach_inbox_headers(url: &str, headers: Option<&std::collections::BTreeMap<String, String>>) {
+    let Some(headers) = replayable_headers(headers) else { return; };
+    let Some(path) = inbox_path() else { return; };
+    let _ = attach_inbox_headers_at(&path, url, &headers);
+}
+
+fn attach_inbox_headers_at(
+    path: &std::path::Path,
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let _guard = crate::model::fs_lock("inbox");
+    if !_guard.owned() { return false; }
+    let Ok(data) = std::fs::read_to_string(path) else { return false; };
+    let Ok(mut items) = serde_json::from_str::<Vec<InboxItem>>(&data) else { return false; };
+    let Some(item) = items.iter_mut().find(|i| i.url == url) else { return false; };
+    item.headers = Some(headers.clone());
+    let Ok(json) = serde_json::to_string_pretty(&items) else { return false; };
+    crate::model::atomic_write(path, json.as_bytes()).is_ok()
+}
+
 /// Fire-and-forget the standalone Download File Info dialog (detached, so
 /// it outlives this short-lived native-host process).
-fn spawn_confirm(msg: &Incoming) {
+///
+/// True when the dialog actually started.
+fn spawn_confirm(msg: &Incoming) -> bool {
     let url = msg.url.clone().unwrap_or_default();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return;
+        return false;
     }
     let Ok(exe) = crate::platform::launch_path() else {
-        return;
+        return false;
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--confirm-download").arg("--url").arg(&url);
-    if let Some(f) = msg.filename.clone().filter(|s| !s.trim().is_empty()) {
+    if let Some(f) = msg.filename.as_deref().and_then(safe_capture_filename) {
         cmd.arg("--filename").arg(f);
     }
     // The engine reads this as both the Referer and "the page the media came
@@ -628,11 +760,19 @@ fn spawn_confirm(msg: &Incoming) {
     if let Some(q) = msg.quality.clone().filter(|s| !s.trim().is_empty()) {
         cmd.arg("--quality").arg(q);
     }
+    // The captured bearer token rides in the child's environment, never on
+    // the disk: the inbox entry holds no headers, so a capture that is still
+    // waiting to be claimed leaves no credential behind. Only the headers
+    // that may be replayed travel - the same set the engine would send.
+    let replayable = replayable_headers(msg.headers.as_ref());
+    if let Some(raw) = encode_capture_headers(replayable.as_ref()) {
+        cmd.env(CAPTURE_HEADERS_ENV, raw);
+    }
     if msg.audio_expected { cmd.arg("--expect-audio"); }
     if let Some(d) = msg.dur.filter(|s| *s > 0) {
         cmd.arg("--dur").arg(d.to_string());
     }
-    spawn_detached(cmd);
+    spawn_detached(cmd)
 }
 
 /// Entry point when launched with `--native-host`. Never returns normally.
@@ -707,7 +847,12 @@ pub fn run() -> eframe::Result<()> {
                         // fallback — the dialog claims it on open, and the
                         // main window only prompts for entries the dialog
                         // never claimed (see poll_inbox age gate).
-                        spawn_confirm(&msg);
+                        if !spawn_confirm(&msg) {
+                            // The dialog never opened: the main window's
+                            // fallback prompt is the only consumer left, so
+                            // the captured headers go to the inbox after all.
+                            attach_inbox_headers(&url, msg.headers.as_ref());
+                        }
                     }
                     Err(e) => write_message(&Reply::err(e)),
                 }
@@ -798,30 +943,133 @@ mod media_tests {
         assert!(!json.contains("cookie"), "the batch file still has a cookie field: {json}");
     }
 
-    /// A path that arrives from the browser is only accepted when it really
-    /// is inside a download folder. A folder that merely starts with the
-    /// same characters is not one.
+    /// A captured `Authorization` header is a bearer token. It must not be
+    /// written to the inbox file: it travels to the Download File Info
+    /// dialog through the inherited environment instead.
     #[test]
-    fn a_browser_path_must_sit_inside_a_download_folder() {
-        let root = std::path::Path::new(r"C:\Users\tester\Downloads");
-        assert!(path_is_under(
-            std::path::Path::new(r"C:\Users\tester\Downloads\clip.mp4"),
-            root
-        ));
-        assert!(path_is_under(
-            std::path::Path::new(r"C:\Users\tester\Downloads\tv\clip.mp4"),
-            root
-        ));
-        // "Downloads Evil" is a different folder.
-        assert!(!path_is_under(
-            std::path::Path::new(r"C:\Users\tester\Downloads Evil\clip.mp4"),
-            root
-        ));
-        assert!(!path_is_under(std::path::Path::new(r"C:\Windows\System32\clip.mp4"), root));
-        // The root itself is not a file inside it.
-        assert!(!path_is_under(root, root));
+    fn a_pending_capture_leaves_no_bearer_token_on_disk() {
+        let msg: Incoming = serde_json::from_str(
+            r#"{"type":"download","url":"https://cdn.example.org/v.mp4",
+                "headers":{"authorization":"Bearer SENTINEL_TOKEN","x-token":"SENTINEL_X",
+                           "cookie":"SENTINEL_COOKIE","sec-ch-ua":"SENTINEL_UA"}}"#,
+        )
+        .unwrap();
+        let item = inbox_item(&msg, "https://cdn.example.org/v.mp4");
+        assert!(item.headers.is_none(), "the entry kept the headers in memory");
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("SENTINEL_TOKEN"), "the token reached the inbox: {json}");
+        assert!(!json.contains("SENTINEL_X"), "the token reached the inbox: {json}");
+        assert!(!json.contains("authorization"), "the inbox still has a headers field: {json}");
+        // The headers themselves are still available for the environment.
+        let kept = replayable_headers(msg.headers.as_ref()).unwrap();
+        let raw = encode_capture_headers(Some(&kept)).unwrap();
+        assert!(raw.contains("SENTINEL_TOKEN"));
+        // ...and they survive the round trip to the dialog.
+        let back = decode_capture_headers(Some(&raw));
+        assert_eq!(back.get("authorization").map(|s| s.as_str()), Some("Bearer SENTINEL_TOKEN"));
+        assert_eq!(back.get("x-token").map(|s| s.as_str()), Some("SENTINEL_X"));
+        // Only the headers that may be replayed travel: a cookie or a
+        // browser fingerprint is not one of them.
+        assert!(!raw.contains("SENTINEL_COOKIE"), "the cookie travelled: {raw}");
+        assert!(!raw.contains("SENTINEL_UA"), "a browser fingerprint travelled: {raw}");
     }
 
+    /// When the dialog could not be started, the main window's fallback
+    /// prompt is the only consumer left, so the headers go to the inbox
+    /// after all - and only to that one capture.
+    #[test]
+    fn the_inbox_keeps_the_headers_only_when_the_dialog_cannot_start() {
+        let base = std::env::temp_dir().join("dc_inbox_headers_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("native_inbox.json");
+        let item = InboxItem {
+            url: "https://cdn.example.org/v.mp4".to_string(),
+            filename: None,
+            received_at: "now".to_string(),
+            page_url: None,
+            referer: None,
+            cookie: Some("session=abc".to_string()),
+            user_agent: None,
+            headers: None,
+            mime: None,
+            size: None,
+            pair_url: None,
+            pair_mime: None,
+            urls: None,
+            quality: None,
+            dur: None,
+            audio_expected: false,
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&vec![item]).unwrap()).unwrap();
+        let headers = std::collections::BTreeMap::from([
+            ("authorization".to_string(), "Bearer SENTINEL_TOKEN".to_string()),
+        ]);
+        assert!(attach_inbox_headers_at(&path, "https://cdn.example.org/v.mp4", &headers));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("SENTINEL_TOKEN"), "the fallback lost the token: {text}");
+        // A capture that is not in the inbox is not invented.
+        assert!(!attach_inbox_headers_at(
+            &path,
+            "https://cdn.example.org/other.mp4",
+            &headers
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A name from the page travels on the command line, where another local
+    /// user could read it. It must be a plain file name.
+    #[test]
+    fn a_hostile_capture_filename_never_reaches_the_command_line() {
+        assert_eq!(safe_capture_filename("clip.mp4"), Some("clip.mp4"));
+        assert_eq!(safe_capture_filename("  clip.mp4  "), Some("clip.mp4"));
+        assert_eq!(safe_capture_filename("..\\..\\Startup\\evil.exe"), None);
+        assert_eq!(safe_capture_filename("/etc/passwd"), None);
+        assert_eq!(safe_capture_filename("bad\u{0}name.mp4"), None);
+        assert_eq!(safe_capture_filename("line\nbreak.mp4"), None);
+        assert_eq!(safe_capture_filename(""), None);
+        assert_eq!(safe_capture_filename(&"x".repeat(256)), None);
+    }
+
+    /// A path that arrives from the browser is only accepted when it really
+    /// is inside a download folder. A folder that merely starts with the
+    /// same characters is not one - and neither is a path that walks out of
+    /// the folder with "..".
+    #[test]
+    fn a_browser_path_must_sit_inside_a_download_folder() {
+        // Real folders and real files: the check resolves the path before
+        // it compares, so it needs something that exists.
+        let base = std::env::temp_dir().join("dc_record_path_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("Downloads");
+        let evil = base.join("Downloads Evil");
+        let outside = base.join("outside");
+        for d in [&root, &evil, &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let inside = root.join("clip.mp4");
+        let nested = root.join("tv").join("clip.mp4");
+        std::fs::create_dir_all(root.join("tv")).unwrap();
+        let sibling = evil.join("clip.mp4");
+        let elsewhere = outside.join("clip.mp4");
+        for f in [&inside, &nested, &sibling, &elsewhere] {
+            std::fs::write(f, b"x").unwrap();
+        }
+
+        assert!(path_is_under(&inside, &root));
+        assert!(path_is_under(&nested, &root));
+        // "Downloads Evil" is a different folder.
+        assert!(!path_is_under(&sibling, &root));
+        assert!(!path_is_under(&elsewhere, &root));
+        // The root itself is not a file inside it.
+        assert!(!path_is_under(&root, &root));
+        // A path that walks out of the folder with ".." starts with the
+        // same characters and is somewhere else entirely.
+        let escape = root.join("..").join("outside").join("clip.mp4");
+        assert!(escape.exists(), "the escaping path must point at a real file");
+        assert!(!path_is_under(&escape, &root));
+        let _ = std::fs::remove_dir_all(&base);
+    }
     /// The capture carries the browser's own User-Agent: the extension sends
     /// `userAgent` (camelCase, like `pageUrl`), and the inbox keeps it so
     /// the engine can speak with the same voice the browser used.

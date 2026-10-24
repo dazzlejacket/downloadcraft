@@ -835,17 +835,35 @@ pub fn run() -> eframe::Result<()> {
         .filter(|s| *s > 0 && *s < 86400)
         .unwrap_or(0);
 
+    // The captured request headers (an `Authorization` bearer token and
+    // `x-*` tokens) travel here through the inherited environment, never on
+    // the disk and never on the command line where another local user could
+    // read them. The variable is taken out of this process' environment
+    // right away, so the main window this dialog may start does not inherit
+    // the token.
+    let env_headers = {
+        let raw = std::env::var(crate::native_host::CAPTURE_HEADERS_ENV).ok();
+        std::env::remove_var(crate::native_host::CAPTURE_HEADERS_ENV);
+        raw
+    };
+    let mut env_headers = crate::native_host::decode_capture_headers(env_headers.as_deref());
+
     // Claim the inbox entry first so the main window won't prompt too.
     let mut browser_user_agent = String::new();
     let mut headers = std::collections::BTreeMap::new();
     if let Some(item)=claim_inbox(url.trim()) {
-        // The native host leaves credentials in the private inbox, not the
-        // process command line where other local users can inspect them.
+        // The native host leaves the session cookie in the private inbox, not
+        // in the process command line where other local users can inspect it.
         if cookie.is_empty() {cookie=item.cookie.unwrap_or_default();}
         // The browser's own agent comes with the capture: a site that
         // checks the browser only answers that browser.
         browser_user_agent = item.user_agent.unwrap_or_default();
+        // The inbox holds the headers only when this dialog could not be
+        // started the first time; otherwise the environment is the source.
         headers = item.headers.unwrap_or_default();
+    }
+    if headers.is_empty() {
+        headers = std::mem::take(&mut env_headers);
     }
 
     let prefs = load_prefs();

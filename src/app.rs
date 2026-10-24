@@ -9415,7 +9415,11 @@ impl CraftApp {
         let mut item = DownloadItem::new(
             id,
             self.add_url.trim().to_string(),
-            self.add_file.trim().to_string(),
+            // The last gate before a name becomes a path. Whatever the
+            // dialog holds - a capture's own name, a name taken from the
+            // URL, or something the user typed - has to be a file name and
+            // not a path, or the download would land outside the folder.
+            crate::engine::sanitize_filename(self.add_file.trim()),
             final_dir,
             self.add_conns,
         );

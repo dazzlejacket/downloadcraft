@@ -259,7 +259,7 @@ async function sendToHost(url, filename, extra) {
     const res = await api.runtime.sendNativeMessage(HOST, {
       type: "download",
       url,
-      filename: filename || null,
+      filename: safeCaptureFilename(filename) || null,
       pageUrl: (extra && extra.pageUrl) || null,
       referer: (seenAuth && seenAuth.referer) || (extra && extra.referer) || (extra && extra.pageUrl) || null,
       cookie,
@@ -288,6 +288,22 @@ async function sendToHost(url, filename, extra) {
     console.error("[download-craft] native host '" + HOST + "' failed:", lastHostError);
     return false;
   }
+}
+
+// A file name that comes from a page is untrusted: it is handed to the app
+// and, on the way, can end up on a command line other local users can read.
+// Only a plain single file name is passed on; anything else is dropped and
+// the app derives a name from the URL instead.
+//
+// It lives next to `sendToHost`, which is the only caller, and inside the
+// region the node tests slice out of this file.
+function safeCaptureFilename(name) {
+  if (typeof name !== "string") return null;
+  const n = name.trim();
+  if (!n || n.length > 255) return null;
+  if (/[\/\\]/.test(n)) return null;
+  if (/[\u0000-\u001f]/.test(n)) return null;
+  return n;
 }
 
 // ---- IDM-style network sniffer ----
