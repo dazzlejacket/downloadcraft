@@ -1,6 +1,13 @@
 # UI Redesign Plan — IDM-informed, DownloadCraft-native
 
-**Status:** proposal only. Nothing in this document has been implemented.
+**Status:** implemented on `feature/ui-redesign` (2026-10-24). What actually
+landed, what the plan got wrong, and what was **not** verified are in
+`validation/ui-redesign/RESULTS.md` in the workspace root. This document is
+the proposal as written; where the two differ, the results file is the
+truth.
+
+**Original status:** proposal only. Nothing in this document has been
+implemented.
 **Date:** 2026-10-24
 **Scope:** desktop UI (`src/`), browser-extension overlay (`browser-extension/`).
 
