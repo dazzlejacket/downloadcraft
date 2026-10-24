@@ -8,8 +8,10 @@
 //!
 //! Layout follows `redesign/download_all_links.html`: a page header with
 //! counts, a toolbar (search, type chips, "Hide web pages"), a painted table
-//! (type icons, two-line names, type pills, sortable and resizable columns,
-//! Shift-click ranges) and a footer (selection, Save to, actions).
+//! (type icons, two-line names with the extension, a category pill, sortable
+//! and resizable columns, Shift-click ranges) and a footer (selection, Save to,
+//! actions). A right-click on a row opens a small menu of its own: "Copy URL"
+//! and "Download".
 
 use crate::app::pl;
 use crate::engine::{self, EngineOpts};
@@ -60,9 +62,14 @@ impl Kind {
         if image {
             return Kind::Image;
         }
-        match category_of(name) {
+        Kind::of_category(category_of(name))
+    }
+    /// The kind a category name stands for. The audio category is called
+    /// "Audio"; "Music" is what an older build says, and still counts.
+    fn of_category(cat: &str) -> Kind {
+        match cat {
             "Video" => Kind::Video,
-            "Music" => Kind::Audio,
+            "Audio" | "Music" => Kind::Audio,
             "Image" => Kind::Image,
             "Document" => Kind::Doc,
             "Compressed" => Kind::Zip,
@@ -70,7 +77,7 @@ impl Kind {
             _ => Kind::Other,
         }
     }
-    /// Chip label (plural) and pill label (singular).
+    /// Chip label (plural) and category label (singular).
     fn labels(self) -> (&'static str, &'static str) {
         match self {
             Kind::Video => ("Video", "Video"),
@@ -80,8 +87,13 @@ impl Kind {
             Kind::Zip => ("Archives", "Archive"),
             Kind::App => ("Programs", "Program"),
             Kind::Page => ("Web pages", "Page"),
-            Kind::Other => ("Other", "File"),
+            Kind::Other => ("Other", "Other"),
         }
+    }
+    /// Where this kind sits in `Kind::ALL`: the order the chips are in, and
+    /// the order the Category column sorts by.
+    fn rank(self) -> usize {
+        Kind::ALL.iter().position(|k| *k == self).unwrap_or(Kind::ALL.len())
     }
     fn glyph(self) -> &'static str {
         match self {
@@ -210,12 +222,37 @@ fn read_batch(path: &std::path::Path) -> Result<LinksBatch, String> {
 }
 
 /// Sortable columns.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SortBy {
     Name,
-    Type,
     Size,
+    Category,
     From,
+}
+
+/// The row menu a right-click opens: which row, and where.
+#[derive(Clone, Copy)]
+struct RowMenu {
+    row: usize,
+    pos: Pos2,
+}
+
+/// The name without its extension, and the extension itself.
+///
+/// Only a short trailing word counts as an extension, so "A.Knight.of.the.
+/// Seven.Kingdoms" keeps its name while "track.mp3" gives up its ".mp3".
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rsplit_once('.') {
+        Some((base, ext))
+            if !base.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 6
+                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            (base, ext)
+        }
+        _ => (name, ""),
+    }
 }
 
 struct LinksApp {
@@ -237,6 +274,8 @@ struct LinksApp {
     prefs: crate::confirm::UiPrefs,
     /// Widths of the sized columns (see `COLS`), dragged by their dividers.
     cols: [f32; 3],
+    /// The row menu a right-click opened, if it is open.
+    menu: Option<RowMenu>,
     probe_rx: Option<Receiver<(usize, Option<u64>, Option<String>, Option<String>)>>,
     probes_left: usize,
     _rt: std::sync::Arc<tokio::runtime::Runtime>,
@@ -274,8 +313,9 @@ impl LinksApp {
             v.sort_by(|&a, &b| {
                 let o = match by {
                     SortBy::Name => r[a].name.to_lowercase().cmp(&r[b].name.to_lowercase()),
-                    SortBy::Type => r[a].kind.labels().0.cmp(r[b].kind.labels().0),
                     SortBy::Size => r[a].size.unwrap_or(0).cmp(&r[b].size.unwrap_or(0)),
+                    // The category sorts in the order the chips are in.
+                    SortBy::Category => r[a].kind.rank().cmp(&r[b].kind.rank()),
                     SortBy::From => r[a].url.cmp(&r[b].url),
                 };
                 if asc { o } else { o.reverse() }
@@ -377,6 +417,30 @@ impl LinksApp {
         p.to_string_lossy().to_string()
     }
 
+    /// The queue entry for one row: the rename template, the folder rule and
+    /// the cookies of the page, all applied.
+    fn item_for(&self, r: &Row) -> DownloadItem {
+        let name = crate::model::apply_rename_template(
+            &self.prefs.rename_template,
+            &engine::sanitize_filename(r.name.trim()),
+            &r.url,
+        );
+        let mut item = DownloadItem::new(
+            0,
+            r.url.clone(),
+            engine::sanitize_filename(&name),
+            self.dir_for(&name),
+            self.prefs.connections,
+        );
+        item.referer = self.page_url.clone();
+        if same_host(&r.url, &self.page_url) {
+            item.cookie = self.cookie.clone();
+        }
+        item.description = r.text.clone();
+        item.total_bytes = r.size;
+        item
+    }
+
     /// Queue the checked, visible rows; `start` also starts them.
     fn commit(&mut self, start: bool) {
         let picked: Vec<usize> = (0..self.rows.len())
@@ -388,25 +452,7 @@ impl LinksApp {
         }
         let (mut added, mut already, mut failed) = (Vec::new(), 0usize, None);
         for i in picked {
-            let r = &self.rows[i];
-            let name = crate::model::apply_rename_template(
-                &self.prefs.rename_template,
-                &engine::sanitize_filename(r.name.trim()),
-                &r.url,
-            );
-            let mut item = DownloadItem::new(
-                0,
-                r.url.clone(),
-                engine::sanitize_filename(&name),
-                self.dir_for(&name),
-                self.prefs.connections,
-            );
-            item.referer = self.page_url.clone();
-            if same_host(&r.url, &self.page_url) {
-                item.cookie = self.cookie.clone();
-            }
-            item.description = r.text.clone();
-            item.total_bytes = r.size;
+            let mut item = self.item_for(&self.rows[i]);
             match crate::model::append_to_queue(&mut item) {
                 crate::model::AppendResult::Added(id) => added.push(id),
                 crate::model::AppendResult::AlreadyQueued(_) => already += 1,
@@ -425,6 +471,41 @@ impl LinksApp {
             return;
         }
         self.done = true;
+    }
+
+    /// Queue one row and start it (the row menu's "Download").
+    ///
+    /// The window stays open: the links file has been read already, so the
+    /// user may well want another row from the same page.
+    fn download_row(&mut self, i: usize) {
+        let Some(r) = self.rows.get(i) else { return };
+        let name = r.name.clone();
+        let mut item = self.item_for(r);
+        match crate::model::append_to_queue(&mut item) {
+            crate::model::AppendResult::Added(id) => {
+                crate::confirm::wake_ids(&[id]);
+                self.notice = format!("Downloading {name}.");
+            }
+            crate::model::AppendResult::AlreadyQueued(_) => {
+                self.notice = "That link is already in the queue.".into();
+            }
+            crate::model::AppendResult::Error(e) => {
+                self.notice = format!("Could not update the queue: {e}");
+            }
+        }
+    }
+
+    /// Copy one row's URL to the clipboard.
+    fn copy_url(&mut self, i: usize) {
+        let Some(r) = self.rows.get(i) else { return };
+        let url = r.url.clone();
+        match arboard::Clipboard::new() {
+            Ok(mut cb) => {
+                let _ = cb.set_text(url);
+                self.notice = "URL copied to the clipboard.".into();
+            }
+            Err(_) => self.notice = "Could not reach the clipboard.".into(),
+        }
     }
 
     /// Click on a row: toggle it, or with Shift every row between it and the
@@ -612,7 +693,7 @@ impl LinksApp {
                 _ => "",
             };
             let text = format!("{}{arrow}", label.to_uppercase());
-            if k == 2 {
+            if *by == SortBy::Size {
                 p.text(Pos2::new(r.max.x - 10.0, r.center().y), Align2::RIGHT_CENTER, text, semi(10.5), fg);
             } else {
                 p.text(Pos2::new(r.min.x + 10.0, r.center().y), Align2::LEFT_CENTER, text, semi(10.5), fg);
@@ -679,20 +760,29 @@ impl LinksApp {
                     p.text(tile.center(), Align2::CENTER_CENTER, row.kind.glyph(), icon(15.0), col);
                     let nx = tile.max.x + 9.0;
                     let nw = (xs[0] + widths[0] - nx - 8.0).max(20.0);
-                    let name = crate::app::truncate_to_width(p, &row.name, semi(12.0), t.txt, nw);
+                    // The name, with its extension dimmed behind it: the old
+                    // "Type" column is gone, but .mp3 must still read as .mp3.
+                    let (base, ext) = split_ext(&row.name);
+                    let ext_w = if ext.is_empty() { 0.0 } else { crate::shaped::width(p, &format!(".{ext}"), &reg(11.0)) + 5.0 };
+                    let name = crate::app::truncate_to_width(p, base, semi(12.0), t.txt, (nw - ext_w).max(20.0));
                     crate::shaped::draw(p, Pos2::new(nx, cy - 1.0), Align2::LEFT_BOTTOM, &name, semi(12.0), t.txt.gamma_multiply(dim));
+                    if !ext.is_empty() {
+                        let ex = nx + crate::shaped::width(p, &name, &semi(12.0)) + 5.0;
+                        crate::shaped::draw(p, Pos2::new(ex, cy - 1.0), Align2::LEFT_BOTTOM, &format!(".{ext}"), reg(11.0), t.dim.gamma_multiply(dim));
+                    }
                     let sub = crate::app::truncate_to_width(p, &row.text, reg(10.5), t.dim, nw);
                     crate::shaped::draw(p, Pos2::new(nx, cy + 1.0), Align2::LEFT_TOP, &sub, reg(10.5), t.dim);
-                    // Type pill.
-                    let ext = row.name.rsplit_once('.').map(|(_, e)| e.to_ascii_uppercase()).filter(|e| e.len() <= 5).unwrap_or_default();
-                    let pill_txt = if ext.is_empty() { row.kind.labels().1.to_string() } else { format!("{ext} · {}", row.kind.labels().1) };
-                    let pw = crate::shaped::width(p, &pill_txt, &semi(10.5)) + 16.0;
-                    let pill = Rect::from_min_size(Pos2::new(xs[1] + 10.0, cy - 10.0), Vec2::new(pw.min(widths[1] - 16.0), 20.0));
+                    // Category: what the file is, in the colour of its kind.
+                    let cat = row.kind.labels().1;
+                    let gw = crate::shaped::width(p, row.kind.glyph(), &icon(13.0));
+                    let cw = crate::shaped::width(p, cat, &semi(10.5));
+                    let pill = Rect::from_min_size(Pos2::new(xs[2] + 10.0, cy - 10.0), Vec2::new((gw + cw + 26.0).min(widths[2] - 16.0), 20.0));
                     p.rect_filled(pill, 5.0, col.gamma_multiply(0.16));
-                    let pt = crate::app::truncate_to_width(p, &pill_txt, semi(10.5), col, pill.width() - 12.0);
-                    p.text(Pos2::new(pill.min.x + 8.0, cy), Align2::LEFT_CENTER, pt, semi(10.5), col);
+                    p.text(Pos2::new(pill.min.x + 8.0, cy), Align2::LEFT_CENTER, row.kind.glyph(), icon(13.0), col);
+                    let ct = crate::app::truncate_to_width(p, cat, semi(10.5), col, pill.width() - gw - 22.0);
+                    p.text(Pos2::new(pill.min.x + 8.0 + gw + 5.0, cy), Align2::LEFT_CENTER, ct, semi(10.5), col);
                     // Size, or a shimmer while it is being checked.
-                    let sx = xs[2] + widths[2] - 10.0;
+                    let sx = xs[1] + widths[1] - 10.0;
                     match (row.size, row.probe) {
                         (Some(s), _) => {
                             p.text(Pos2::new(sx, cy), Align2::RIGHT_CENTER, format_bytes(s), reg(12.0), t.txt.gamma_multiply(dim));
@@ -724,13 +814,26 @@ impl LinksApp {
                             crate::shaped::draw(p, Pos2::new(tag.min.x + 5.0, cy), Align2::LEFT_CENTER, &f, reg(9.5), t.dim);
                         }
                     }
+                    // A right-click opens the row menu on this row.
+                    let menu_pos = resp.secondary_clicked().then(|| {
+                        resp.interact_pointer_pos()
+                            .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+                            .unwrap_or(r.center())
+                    });
                     if resp.on_hover_text(&row.url).clicked() {
                         clicked = Some(i);
                     }
+                    if let Some(pos) = menu_pos {
+                        self.menu = Some(RowMenu { row: i, pos });
+                    }
                 }
             });
+        // While the menu is open it owns the pointer: the click that dismisses
+        // it must not tick the row underneath as well.
         if let Some(i) = clicked {
-            self.click_row(i, shift, &shown);
+            if self.menu.is_none() {
+                self.click_row(i, shift, &shown);
+            }
         }
         ui.allocate_rect(card, Sense::hover());
     }
@@ -745,6 +848,19 @@ impl LinksApp {
         let total: u64 = self.rows.iter().filter(|r| r.kind != Kind::Page).map(|r| r.size.unwrap_or(0)).sum();
         let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 74.0), Sense::hover());
         let p = ui.painter().clone();
+        // The actions, right-aligned on the bottom line. "Download selected"
+        // says plainly that only the ticked rows are taken, and how many.
+        let dl_label = if n > 0 { format!("Download selected ({n})") } else { "Download selected".to_string() };
+        let buttons: [(&str, String, bool, bool, &str); 3] = [
+            ("dl", dl_label, true, n > 0, "Download the checked files and start them"),
+            ("queue", "Add to queue".into(), false, n > 0, "Queue the checked files without starting them"),
+            ("cancel", "Cancel".into(), false, true, "Close without downloading"),
+        ];
+        let btn_w: Vec<f32> = buttons
+            .iter()
+            .map(|(id, label, _, _, _)| crate::shaped::width(&p, label, &semi(12.0)) + if *id == "cancel" { 32.0 } else { 48.0 })
+            .collect();
+        let btns_left = area.max.x - btn_w.iter().sum::<f32>() - 8.0 * (buttons.len() as f32 - 1.0);
         // Selection line + bar.
         let line_y = area.min.y + 10.0;
         if n > 0 {
@@ -768,6 +884,10 @@ impl LinksApp {
         }
         if self.probes_left > 0 {
             p.text(Pos2::new(bar.max.x + 12.0, bar.center().y), Align2::LEFT_CENTER, format!("checking {} …", self.probes_left), reg(10.5), t.dim);
+        }
+        // The notice has the top line to itself, on the right.
+        if !self.notice.is_empty() {
+            p.text(Pos2::new(area.max.x, line_y), Align2::RIGHT_CENTER, &self.notice, reg(11.0), t.warning);
         }
         // Save to: label, segmented choice, folder field + Browse.
         let row_y = area.max.y - 18.0;
@@ -793,7 +913,9 @@ impl LinksApp {
                 self.by_category = val;
             }
         }
-        let path = Rect::from_min_size(Pos2::new(seg.max.x + 8.0, row_y - 15.0), Vec2::new(330.0, 30.0));
+        // The folder field takes what the buttons leave, so the two never meet.
+        let path_w = (btns_left - 8.0 - (seg.max.x + 8.0)).clamp(120.0, 330.0);
+        let path = Rect::from_min_size(Pos2::new(seg.max.x + 8.0, row_y - 15.0), Vec2::new(path_w, 30.0));
         p.rect(path, 6.0, t.bg, Stroke::new(1.0_f32, t.card_bd), egui::StrokeKind::Inside);
         let browse = Rect::from_min_size(Pos2::new(path.max.x - 70.0, path.min.y + 4.0), Vec2::new(66.0, 22.0));
         if self.by_category {
@@ -818,15 +940,9 @@ impl LinksApp {
         }
         // Actions, right-aligned on the bottom line.
         let mut right = area.max.x;
-        let dl_label = if n > 0 { format!("Download ({n})") } else { "Download".to_string() };
-        let buttons: [(&str, String, bool, bool, &str); 3] = [
-            ("dl", dl_label, true, n > 0, "Queue the checked files and start them"),
-            ("queue", "Add to queue".into(), false, n > 0, "Queue the checked files without starting them"),
-            ("cancel", "Cancel".into(), false, true, "Close without downloading"),
-        ];
-        for (id, label, primary, enabled, tip) in buttons {
+        for (k, (id, label, primary, enabled, tip)) in buttons.into_iter().enumerate() {
             let glyph = match id { "dl" => Some(MI_DOWNLOAD), "queue" => Some(MI_QUEUE), _ => None };
-            let w = crate::shaped::width(&p, &label, &semi(12.0)) + if glyph.is_some() { 48.0 } else { 32.0 };
+            let w = btn_w[k];
             let r = Rect::from_min_size(Pos2::new(right - w, area.max.y - 34.0), Vec2::new(w, 32.0));
             right = r.min.x - 8.0;
             let resp = ui.interact(r, egui::Id::new(("links-btn", id)), if enabled { Sense::click() } else { Sense::hover() });
@@ -851,10 +967,71 @@ impl LinksApp {
                 }
             }
         }
-        if !self.notice.is_empty() {
-            p.text(Pos2::new(right, area.max.y - 18.0), Align2::RIGHT_CENTER, &self.notice, reg(11.0), t.warning);
-        }
     }
+
+    // ---------------------------------------------------------- row menu --
+
+    /// Where the row menu sits: at the pointer, kept inside the screen.
+    fn menu_rect(&self, ctx: &egui::Context) -> Rect {
+        let Some(menu) = self.menu else { return Rect::ZERO };
+        let scr = ctx.screen_rect();
+        let pos = Pos2::new(
+            menu.pos.x.min(scr.max.x - MENU_W - 8.0).max(8.0),
+            menu.pos.y.min(scr.max.y - MENU_H - 8.0).max(8.0),
+        );
+        Rect::from_min_size(pos, Vec2::new(MENU_W, MENU_H))
+    }
+
+    /// The row menu: "Copy URL" and "Download".
+    ///
+    /// It is drawn with the app's own tokens, like the manager's context menu,
+    /// so it does not look like a borrowed egui menu.
+    fn row_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.menu else { return };
+        let t = pl();
+        let rect = self.menu_rect(ctx);
+        let row = menu.row;
+        egui::Area::new(egui::Id::new("links-row-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(t.modal_bg)
+                    .stroke(Stroke::new(1.0_f32, t.modal_bd))
+                    .corner_radius(crate::app::RADIUS)
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for (k, (label, glyph)) in MENU_ITEMS.iter().enumerate() {
+                            let (r, _) = ui.allocate_exact_size(Vec2::new(MENU_W - 12.0, MENU_ITEM_H), Sense::hover());
+                            let resp = ui.interact(r, egui::Id::new(("links-menu-item", k)), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(r, 4.0, t.surface_lt);
+                            }
+                            ui.painter().text(Pos2::new(r.min.x + 10.0, r.center().y), Align2::LEFT_CENTER, *glyph, icon(14.0), t.dim);
+                            ui.painter().text(Pos2::new(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, *label, reg(12.5), t.txt);
+                            if resp.clicked() {
+                                self.menu = None;
+                                match k {
+                                    0 => self.copy_url(row),
+                                    _ => self.download_row(row),
+                                }
+                            }
+                        }
+                    });
+            });
+    }
+}
+
+/// The entries of the row menu, in the order they are shown.
+const MENU_ITEMS: [(&str, &str); 2] = [("Copy URL", crate::app::MI_COPY), ("Download", MI_DOWNLOAD)];
+const MENU_W: f32 = 168.0;
+const MENU_ITEM_H: f32 = 28.0;
+const MENU_H: f32 = 2.0 * MENU_ITEM_H + 12.0;
+
+/// The row menu closes on Escape, and on a click outside it.
+fn menu_dismissed(escape: bool, click: Option<Pos2>, menu: Rect) -> bool {
+    escape || click.map_or(false, |p| !menu.contains(p))
 }
 
 /// Checkbox in the mock-up's style: accent fill with a tick, a bar when only
@@ -879,21 +1056,26 @@ const ROW_H: f32 = 40.0;
 /// Column titles and what clicking them sorts by. "Download from" (last)
 /// takes whatever room the others leave.
 const COLS: [(&str, SortBy); 4] = [
-    ("File name", SortBy::Name),
-    ("Type", SortBy::Type),
+    ("Name", SortBy::Name),
     ("Size", SortBy::Size),
+    ("Category", SortBy::Category),
     ("Download from", SortBy::From),
 ];
 const COL_MIN: f32 = 60.0;
-/// Stored widths of the three sized columns (name, type, size).
-const COLS_DEFAULT: [f32; 3] = [340.0, 130.0, 96.0];
+/// Stored widths of the three sized columns (name, size, category).
+const COLS_DEFAULT: [f32; 3] = [340.0, 96.0, 130.0];
+/// Where the widths live in ui.json. The key is new with the new columns: an
+/// older ui.json holds the widths of the old ones (name, type, size) under
+/// "links_cols3", and those must not be read as the widths of name, size and
+/// category.
+const COLS_KEY: &str = "links_cols4";
 
 /// All four widths for a table `avail` wide: the stored three, and the rest
 /// for "Download from" (never under 140).
 fn col_widths(stored: &[f32; 3], avail: f32) -> [f32; 4] {
-    let [n, t, s] = *stored;
-    let flex = (avail - (n + t + s)).max(140.0);
-    [n, t, s, flex]
+    let [n, s, c] = *stored;
+    let flex = (avail - (n + s + c)).max(140.0);
+    [n, s, c, flex]
 }
 
 /// Drag the divider after column `i` by `dx`: it follows the pointer, so the
@@ -902,7 +1084,7 @@ fn col_widths(stored: &[f32; 3], avail: f32) -> [f32; 4] {
 fn drag_divider(stored: &[f32; 3], i: usize, dx: f32) -> [f32; 3] {
     let mut out = *stored;
     if i + 1 >= 3 {
-        // Size | Download from: Size grows, the flexible column gives way.
+        // Category | Download from: Category grows, the flexible column gives way.
         out[i] = (out[i] + dx).clamp(COL_MIN, 900.0);
         return out;
     }
@@ -912,14 +1094,11 @@ fn drag_divider(stored: &[f32; 3], i: usize, dx: f32) -> [f32; 3] {
     out
 }
 
-/// Column widths kept in ui.json (`links_cols3`), so the window reopens as left.
-fn load_cols() -> [f32; 3] {
-    let v: serde_json::Value = config_dir()
-        .and_then(|d| std::fs::read_to_string(d.join("ui.json")).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::Value::Null);
+/// The widths a ui.json holds for the sized columns, or the defaults when it
+/// holds none (an older file, or one written before the new columns).
+fn cols_from_json(v: &serde_json::Value) -> [f32; 3] {
     let mut out = COLS_DEFAULT;
-    if let Some(a) = v.get("links_cols3").and_then(|x| x.as_array()) {
+    if let Some(a) = v.get(COLS_KEY).and_then(|x| x.as_array()) {
         for (i, w) in a.iter().take(3).enumerate() {
             if let Some(w) = w.as_f64().filter(|w| w.is_finite()) {
                 out[i] = (w as f32).clamp(COL_MIN, 900.0);
@@ -929,6 +1108,15 @@ fn load_cols() -> [f32; 3] {
     out
 }
 
+/// Column widths kept in ui.json (`links_cols4`), so the window reopens as left.
+fn load_cols() -> [f32; 3] {
+    let v: serde_json::Value = config_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("ui.json")).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    cols_from_json(&v)
+}
+
 fn save_cols(cols: &[f32; 3]) {
     let Some(path) = config_dir().map(|d| d.join("ui.json")) else { return };
     let mut v: serde_json::Value = std::fs::read_to_string(&path)
@@ -936,7 +1124,7 @@ fn save_cols(cols: &[f32; 3]) {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(obj) = v.as_object_mut() {
-        obj.insert("links_cols3".into(), serde_json::json!(cols.iter().map(|w| w.round()).collect::<Vec<_>>()));
+        obj.insert(COLS_KEY.into(), serde_json::json!(cols.iter().map(|w| w.round()).collect::<Vec<_>>()));
         if let Ok(json) = serde_json::to_string_pretty(&v) {
             let _ = crate::model::atomic_write(&path, json.as_bytes());
         }
@@ -1022,6 +1210,7 @@ pub fn run() -> eframe::Result<()> {
         by_category: true,
         one_dir: prefs.save_dir.clone(),
         cols: load_cols(),
+        menu: None,
         prefs,
         probe_rx: None,
         probes_left: 0,
@@ -1035,7 +1224,7 @@ pub fn run() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Download all links — Download Craft")
         .with_inner_size([LINKS_W, LINKS_H])
-        .with_min_inner_size([760.0, 420.0])
+        .with_min_inner_size([840.0, 420.0])
         .with_resizable(true)
         // Normal Z-order: this is an ordinary window, not a layer that
         // floats above everything else. It takes a place in the cascade
@@ -1113,6 +1302,20 @@ impl eframe::App for LinksApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(pl().bg).inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 0 }))
             .show(ctx, |ui| self.table(ui));
+        // The row menu is drawn last, over everything: it closes on Escape
+        // and on a click outside it.
+        if self.menu.is_some() {
+            let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            let click = if ctx.input(|i| i.pointer.primary_pressed()) {
+                ctx.input(|i| i.pointer.latest_pos())
+            } else {
+                None
+            };
+            if menu_dismissed(escape, click, self.menu_rect(ctx)) {
+                self.menu = None;
+            }
+        }
+        self.row_menu(ctx);
     }
 }
 
@@ -1141,10 +1344,16 @@ mod tests {
     #[test]
     fn dividers_follow_the_pointer_and_name_pages() {
         let c = COLS_DEFAULT;
-        // Name | Type: both sized, sum kept.
+        // Name | Size: both sized, the sum kept.
+        let d = drag_divider(&c, 0, 20.0);
+        assert_eq!((d[0], d[1]), (c[0] + 20.0, c[1] - 20.0));
+        // A wider drag stops at the minimum of the column that gives way.
         let d = drag_divider(&c, 0, 40.0);
-        assert_eq!((d[0], d[1]), (c[0] + 40.0, c[1] - 40.0));
-        // Size | Download from: Size grows, the flexible column gives way.
+        assert_eq!(d[0] + d[1], c[0] + c[1]);
+        assert_eq!(d[1], COL_MIN);
+        // Size | Category: the one on the left grows, the one on the right gives way.
+        assert_eq!(drag_divider(&c, 1, 20.0), [c[0], c[1] + 20.0, c[2] - 20.0]);
+        // Category | Download from: Category grows, the flexible column gives way.
         assert_eq!(drag_divider(&c, 2, 30.0)[2], c[2] + 30.0);
         // Minimums hold.
         assert_eq!(drag_divider(&c, 0, 900.0)[1], COL_MIN);
@@ -1156,6 +1365,94 @@ mod tests {
         assert_eq!(page_name("https://d.example/?dir=Series/English/A", ""), "A.html");
         assert_eq!(page_name("https://d.example/", ".cls-1{fill:url(#g);}"), "d.example.html");
         assert!(type_of(&page_name("https://d.example/?dir=S01", "S01"), None).1);
+    }
+
+    #[test]
+    fn the_audio_category_is_called_audio() {
+        // The app calls the audio category "Audio"; an older build says
+        // "Music", and that still has to land on the audio kind.
+        assert_eq!(Kind::of_category("Audio"), Kind::Audio);
+        assert_eq!(Kind::of_category("Music"), Kind::Audio);
+        assert_eq!(Kind::of_category("Video"), Kind::Video);
+        assert_eq!(Kind::of_category("Image"), Kind::Image);
+        assert_eq!(Kind::of_category("Document"), Kind::Doc);
+        assert_eq!(Kind::of_category("Compressed"), Kind::Zip);
+        assert_eq!(Kind::of_category("Apps"), Kind::App);
+        assert_eq!(Kind::of_category("Other"), Kind::Other);
+        // A file of the category is of that kind.
+        assert_eq!(Kind::of("a.mp3", false, false), Kind::Audio);
+    }
+
+    #[test]
+    fn the_columns_are_name_size_category_and_download_from() {
+        assert_eq!(COLS.map(|c| c.0), ["Name", "Size", "Category", "Download from"]);
+        assert_eq!(COLS.map(|c| c.1), [SortBy::Name, SortBy::Size, SortBy::Category, SortBy::From]);
+        // "Download from" takes the rest and never goes under 140.
+        let w = col_widths(&COLS_DEFAULT, 1000.0);
+        assert_eq!(w[0], COLS_DEFAULT[0]);
+        assert_eq!(w[1], COLS_DEFAULT[1]);
+        assert_eq!(w[2], COLS_DEFAULT[2]);
+        assert_eq!(w[3], 1000.0 - COLS_DEFAULT.iter().sum::<f32>());
+        assert!(w[3] >= 140.0);
+    }
+
+    #[test]
+    fn the_category_sorts_in_the_order_the_chips_are_in() {
+        // The chips run in the order of Kind::ALL, and so does the column.
+        assert_eq!(Kind::Video.rank(), 0);
+        assert_eq!(Kind::Audio.rank(), 1);
+        assert_eq!(Kind::Other.rank(), Kind::ALL.len() - 1);
+        assert!(Kind::ALL.windows(2).all(|w| w[0].rank() < w[1].rank()));
+        // The category names the column shows.
+        assert_eq!(Kind::Video.labels().1, "Video");
+        assert_eq!(Kind::Audio.labels().1, "Audio");
+        assert_eq!(Kind::Image.labels().1, "Image");
+        assert_eq!(Kind::Doc.labels().1, "Document");
+        assert_eq!(Kind::Zip.labels().1, "Archive");
+        assert_eq!(Kind::App.labels().1, "Program");
+        assert_eq!(Kind::Page.labels().1, "Page");
+        assert_eq!(Kind::Other.labels().1, "Other");
+    }
+
+    #[test]
+    fn the_extension_stays_with_the_name() {
+        // The old "Type" column is gone, so the name carries its extension.
+        assert_eq!(split_ext("A.Knight.S01E01.mp4"), ("A.Knight.S01E01", "mp4"));
+        assert_eq!(split_ext("track.mp3"), ("track", "mp3"));
+        assert_eq!(split_ext("song.m4a"), ("song", "m4a"));
+        // A name that only ends in a full stop keeps all of it.
+        assert_eq!(split_ext("A.Knight.of.the.Seven.Kingdoms"), ("A.Knight.of.the.Seven.Kingdoms", ""));
+        assert_eq!(split_ext("noext"), ("noext", ""));
+        assert_eq!(split_ext(".mp3"), (".mp3", ""));
+    }
+
+    #[test]
+    fn old_column_widths_are_not_used_for_the_new_columns() {
+        // An older ui.json holds the widths of name, type and size under
+        // "links_cols3": they must not be read as name, size and category.
+        let old = serde_json::json!({ "links_cols3": [340.0, 130.0, 96.0] });
+        assert_eq!(cols_from_json(&old), COLS_DEFAULT);
+        // The new key is read.
+        let new = serde_json::json!({ "links_cols4": [300.0, 90.0, 120.0] });
+        assert_eq!(cols_from_json(&new), [300.0, 90.0, 120.0]);
+        // Out-of-range widths are clamped, as they always were.
+        let wild = serde_json::json!({ "links_cols4": [10.0, 5000.0, 120.0] });
+        assert_eq!(cols_from_json(&wild), [COL_MIN, 900.0, 120.0]);
+        // A file without them falls back to the defaults.
+        assert_eq!(cols_from_json(&serde_json::json!({})), COLS_DEFAULT);
+    }
+
+    #[test]
+    fn the_row_menu_closes_on_escape_and_on_a_click_outside_it() {
+        let menu = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(MENU_W, MENU_H));
+        assert!(menu_dismissed(true, Some(menu.center()), menu), "Escape closes it");
+        assert!(menu_dismissed(false, Some(Pos2::new(10.0, 10.0)), menu), "a click outside closes it");
+        assert!(!menu_dismissed(false, Some(menu.center()), menu), "a click on it keeps it open");
+        assert!(!menu_dismissed(false, None, menu), "nothing pressed keeps it open");
+        // It offers exactly the two entries.
+        assert_eq!(MENU_ITEMS.len(), 2);
+        assert_eq!(MENU_ITEMS[0].0, "Copy URL");
+        assert_eq!(MENU_ITEMS[1].0, "Download");
     }
 
     #[test]

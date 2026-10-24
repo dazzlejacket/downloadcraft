@@ -728,6 +728,13 @@ impl eframe::App for SettingsApp {
         if self.ytdlp_busy || self.ffmpeg_busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
+
+        // Escape closes the window, the way it closes the main window's
+        // dialogs. The settings that were saved stay saved; the ones that
+        // were not saved are not - the Save button is what writes them.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 }
 

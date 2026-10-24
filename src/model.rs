@@ -285,6 +285,17 @@ pub fn start_at_due(s: &str, now: DateTime<Local>) -> bool {
     }
 }
 
+/// The category a file belongs to, decided by its own extension.
+///
+/// Audio is a category of its own: MP3, M4A, AAC, FLAC, OGG, OPUS, WAV
+/// and the rest are "Audio", the same name the browser extension uses for
+/// the folder it saves into. The list is the same one in
+/// `browser-extension/rank.js` (`categoryOf`) - the two have to agree, or a
+/// file saved in the browser lands in a folder the app did not choose.
+///
+/// The category is computed from the NAME every time it is shown, never
+/// stored: an item that was downloaded before the category was called
+/// "Audio" shows the right category now, and nothing is moved on disk.
 pub fn category_of(filename: &str) -> &'static str {    let ext = filename
         .rsplit('.')
         .next()
@@ -292,7 +303,8 @@ pub fn category_of(filename: &str) -> &'static str {    let ext = filename
         .to_ascii_lowercase();
     match ext.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => "Image",
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" => "Music",
+        "mp3" | "m4a" | "aac" | "flac" | "ogg" | "oga" | "opus" | "wav" | "aif"
+        | "aiff" | "weba" | "mka" | "wma" | "amr" | "m4b" | "mpa" | "mp2" => "Audio",
         "mp4" | "mkv" | "avi" | "mov" | "webm" | "ts" | "m4s" => "Video",
         "pdf" | "doc" | "docx" | "txt" | "epub" => "Document",
         "zip" | "rar" | "7z" | "tar" | "gz" => "Compressed",
@@ -880,7 +892,13 @@ impl FolderRule {
 pub fn default_folder_rules() -> Vec<FolderRule> {
     vec![
         FolderRule { exts: "mp4,mkv,webm,mov,avi".into(), folder: "Video".into() },
-        FolderRule { exts: "mp3,m4a,flac,ogg,wav".into(), folder: "Music".into() },
+        // The audio folder carries the category's name, so a file saved in
+        // the browser and a file saved by the app land in the same place.
+        FolderRule {
+            exts: "mp3,m4a,aac,flac,ogg,oga,opus,wav,aif,aiff,weba,mka,wma,amr,m4b,mpa,mp2"
+                .into(),
+            folder: "Audio".into(),
+        },
         FolderRule { exts: "png,jpg,jpeg,gif,webp,svg".into(), folder: "Image".into() },
         FolderRule { exts: "pdf,doc,docx,txt,epub".into(), folder: "Document".into() },
         FolderRule { exts: "zip,rar,7z,tar,gz".into(), folder: "Compressed".into() },
@@ -1367,7 +1385,7 @@ mod tests {
 
     #[test]
     fn categories() {
-        assert_eq!(category_of("a.mp3"), "Music");
+        assert_eq!(category_of("a.mp3"), "Audio");
         assert_eq!(category_of("a.MP4"), "Video");
         assert_eq!(category_of("a.png"), "Image");
         assert_eq!(category_of("a.pdf"), "Document");
@@ -1375,6 +1393,14 @@ mod tests {
         assert_eq!(category_of("a.exe"), "Apps");
         assert_eq!(category_of("a.xyz"), "Other");
         assert_eq!(category_of("noext"), "Other");
+        // The whole audio family is Audio, not just the five the category
+        // used to know.
+        for n in [
+            "a.mp3", "a.m4a", "a.aac", "a.flac", "a.ogg", "a.oga", "a.opus", "a.wav", "a.aif",
+            "a.aiff", "a.weba", "a.mka", "a.wma", "a.amr", "a.m4b", "a.mpa", "a.mp2",
+        ] {
+            assert_eq!(category_of(n), "Audio", "{}", n);
+        }
     }
 
     #[test]

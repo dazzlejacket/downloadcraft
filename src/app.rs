@@ -462,7 +462,7 @@ pub fn setup_fonts(cc: &eframe::CreationContext<'_>) {
 fn file_icon(cat: &str) -> &'static str {
     match cat {
         "Image" => MI_IMAGE,
-        "Music" => MI_MUSIC,
+        "Audio" => MI_MUSIC,
         "Video" => MI_SLIDESHOW,
         "Apps" => MI_GRID,
         "Document" => MI_DOC,
@@ -473,13 +473,13 @@ fn file_icon(cat: &str) -> &'static str {
 
 /// Per-category tint for the list's name-cell marks, taken from the concept
 /// (`main_window.html`): blue video, amber archive, green picture, purple
-/// music, red document, cyan app. Light enough to read on both themes.
+/// audio, red document, cyan app. Light enough to read on both themes.
 fn cat_color(cat: &str) -> egui::Color32 {
     match cat {
         "Video" => egui::Color32::from_rgb(0x3b, 0x82, 0xf6),
         "Compressed" => egui::Color32::from_rgb(0xf5, 0x9e, 0x0b),
         "Image" => egui::Color32::from_rgb(0x22, 0xc5, 0x5e),
-        "Music" => egui::Color32::from_rgb(0xa8, 0x55, 0xf7),
+        "Audio" => egui::Color32::from_rgb(0xa8, 0x55, 0xf7),
         "Document" => egui::Color32::from_rgb(0xef, 0x44, 0x44),
         "Apps" => egui::Color32::from_rgb(0x06, 0xb6, 0xd4),
         _ => pl().dm_dim,
@@ -1396,7 +1396,7 @@ fn dp_type_label(filename: &str) -> String {
         .to_ascii_uppercase();
     let kind = match crate::model::category_of(filename) {
         "Image" => "Image File",
-        "Music" => "Audio File",
+        "Audio" => "Audio File",
         "Video" => "Video File",
         "Document" => "Document",
         "Compressed" => "Archive",
@@ -6695,7 +6695,7 @@ impl eframe::App for CraftApp {
                         let cats: [(&str, &str, &str); 6] = [
                             ("Image", MI_IMAGE, "Pictures"),
                             ("Video", MI_SLIDESHOW, "Videos"),
-                            ("Music", MI_MUSIC, "Music"),
+                            ("Audio", MI_MUSIC, "Audio"),
                             ("Document", MI_DOC, "Documents"),
                             ("Compressed", MI_ARCHIVE, "Compressed"),
                             ("Apps", MI_GRID, "Apps"),

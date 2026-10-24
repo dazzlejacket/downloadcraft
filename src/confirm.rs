@@ -241,7 +241,7 @@ enum DupPrompt {
 
 const CATEGORIES: &[&str] = &[
     "Video",
-    "Music",
+    "Audio",
     "Image",
     "Document",
     "Compressed",
