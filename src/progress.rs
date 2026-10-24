@@ -188,8 +188,38 @@ fn fmt_eta(left: u64, speed: f64) -> String {
     }
 }
 
-// ================= concept geometry =================
-// `Downloading gui concepts.html` (measured in Chrome, border-box), tightened:
+/// How many speed samples the graph keeps.
+///
+/// The window polls the live snapshot about six times a second, so this is
+/// roughly twenty seconds of history.
+const SPEED_SAMPLES: usize = 120;
+
+/// The points of the speed graph, oldest first.
+///
+/// The graph is scaled to the samples it actually holds: a transfer that
+/// has only just started does not get a flat line pinned to the bottom
+/// because of one slow first sample. A peak of zero is treated as one, so
+/// a graph of zeros is a line on the bottom edge and not a division by
+/// zero.
+fn spark_points(samples: &[f32], rect: egui::Rect) -> Vec<egui::Pos2> {
+    if samples.is_empty() || rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return Vec::new();
+    }
+    let peak = samples.iter().copied().fold(0.0f32, f32::max).max(1.0);
+    let n = samples.len();
+    let step = if n > 1 { rect.width() / (n - 1) as f32 } else { 0.0 };
+    samples
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let x = rect.min.x + step * i as f32;
+            let y = rect.max.y - (v / peak).clamp(0.0, 1.0) * rect.height();
+            egui::pos2(x, y)
+        })
+        .collect()
+}
+
+// ================= concept geometry =================// `Downloading gui concepts.html` (measured in Chrome, border-box), tightened:
 // the concept spaced its info rows 27 px apart and padded every block, which
 // left the card both wide and airy. Same layout, denser rhythm.
 //   card     470 wide (468 content + 2x1px border), 361 + 22n tall
@@ -352,6 +382,9 @@ struct ProgressApp {
     tab: u8,
     limit_input: String,
     limit_known: Option<u64>,
+    /// The live rate of the last few seconds, oldest first, for the Speed
+    /// tab's graph.
+    speed_samples: Vec<f32>,
     finish_sel: String,
     /// Last height sent to the OS, so the window is only resized on change.
     win_h: f32,
@@ -396,6 +429,12 @@ impl ProgressApp {
             }
         }
         self.last_poll = Instant::now();
+        // One sample per poll for the Speed tab's graph. A paused or a
+        // finished transfer samples zero, so the line says so.
+        self.speed_samples.push(self.snap.speed as f32);
+        if self.speed_samples.len() > SPEED_SAMPLES {
+            self.speed_samples.remove(0);
+        }
         // A finished transfer hands over to the standalone "Download complete"
         // dialog, so this window has done its job (IDM closes it the same way).
         // With that dialog switched off it stays put, which keeps its
@@ -455,6 +494,7 @@ pub fn run() -> eframe::Result<()> {
         tab: 0,
         limit_input,
         limit_known: None,
+        speed_samples: Vec::new(),
         finish_sel,
         win_h: 0.0,
         parts_open: true,
@@ -908,8 +948,38 @@ impl ProgressApp {
             pl().dm_txt,
             reg(12.0),
         );
+        // ---- the speed graph ----
+        // The last half-minute of the live rate, so a transfer that has
+        // stalled is visible as a shape and not only as a number.
+        let graph = at(o, PAD_X, 156.0, PROG_W, 38.0);
+        p.rect_filled(graph, 4.0, pl().dm_trough);
+        let pts = spark_points(&self.speed_samples, graph.shrink(2.0));
+        if pts.len() > 1 {
+            p.add(egui::Shape::line(
+                pts,
+                egui::Stroke::new(1.4_f32, DM_ACC),
+            ));
+        }
+        // The peak, so a graph that has just been scaled down still says
+        // what the transfer reached.
+        let peak = self.speed_samples.iter().copied().fold(0.0f32, f32::max);
+        p.text(
+            egui::pos2(o.x + PAD_X, o.y + 197.0),
+            egui::Align2::LEFT_TOP,
+            if peak > 0.0 {
+                format!(
+                    "Last {} s · peak {}/s",
+                    SPEED_SAMPLES * 150 / 1000,
+                    format_bytes(peak as u64)
+                )
+            } else {
+                "Waiting for the first sample…".to_string()
+            },
+            reg(9.0),
+            pl().dm_lbl,
+        );
         // ---- the cap row: a slim field and a slim accent button ----
-        let field = at(o, PAD_X, 168.0, 348.0, 30.0);
+        let field = at(o, PAD_X, 209.0, 348.0, 28.0);
         dm_field(
             ui,
             "pg_limit",
@@ -919,7 +989,7 @@ impl ProgressApp {
             "0 = unlimited (KB/s)",
             false,
         );
-        let apply = at(o, IN_R - 84.0, 168.0, 84.0, 30.0);
+        let apply = at(o, IN_R - 84.0, 209.0, 84.0, 28.0);
         let ab = ui.interact(apply, egui::Id::new("pg-apply"), egui::Sense::click());
         dm_gradient(&p, apply, DM_RAD, DM_ACC, DM_ACC2);
         p.text(
@@ -946,14 +1016,14 @@ impl ProgressApp {
             None => "Type a number in KB/s and press Apply — 0 means unlimited.".to_string(),
         };
         p.text(
-            egui::pos2(o.x + PAD_X, o.y + 212.0),
+            egui::pos2(o.x + PAD_X, o.y + 241.0),
             egui::Align2::LEFT_TOP,
             note,
             reg(10.0),
             pl().dm_dim,
         );
         p.text(
-            egui::pos2(o.x + PAD_X, o.y + 228.0),
+            egui::pos2(o.x + PAD_X, o.y + 252.0),
             egui::Align2::LEFT_TOP,
             "Tip: Settings → Speed windows automates caps by time of day.",
             reg(10.0),
@@ -1446,5 +1516,53 @@ impl ProgressApp {
                 pl().dm_box_bd,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The speed graph is scaled to the samples it actually holds, so a
+    /// transfer that has just started does not get a flat line pinned to
+    /// the bottom because of one slow first sample.
+    #[test]
+    fn the_speed_graph_is_scaled_to_its_own_samples() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 50.0));
+        let pts = spark_points(&[10.0, 20.0, 5.0], rect);
+        assert_eq!(pts.len(), 3);
+        // The oldest sample is on the left, the newest on the right.
+        assert!((pts[0].x - 0.0).abs() < 0.001);
+        assert!((pts[1].x - 50.0).abs() < 0.001);
+        assert!((pts[2].x - 100.0).abs() < 0.001);
+        // The peak sits on the top edge, the smallest sample above the
+        // bottom one but not on it.
+        assert!((pts[1].y - 0.0).abs() < 0.001);
+        assert!((pts[2].y - 37.5).abs() < 0.001);
+        // Nothing is drawn outside the block.
+        for p in &pts {
+            assert!(rect.contains(*p), "{p:?} is outside {rect:?}");
+        }
+    }
+
+    /// A graph with nothing to draw draws nothing, and a graph of zeros
+    /// does not divide by zero.
+    #[test]
+    fn an_empty_or_flat_speed_graph_is_safe() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 50.0));
+        assert!(spark_points(&[], rect).is_empty());
+        // A block with no size draws nothing either.
+        let empty = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(0.0, 0.0));
+        assert!(spark_points(&[1.0, 2.0], empty).is_empty());
+        // All zeros: the line lies on the bottom edge.
+        let flat = spark_points(&[0.0, 0.0], rect);
+        assert_eq!(flat.len(), 2);
+        for p in &flat {
+            assert!((p.y - 50.0).abs() < 0.001);
+        }
+        // One sample is one point, at the top of its own scale.
+        let one = spark_points(&[7.0], rect);
+        assert_eq!(one.len(), 1);
+        assert!((one[0].y - 0.0).abs() < 0.001);
     }
 }
