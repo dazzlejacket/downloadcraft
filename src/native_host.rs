@@ -4,11 +4,19 @@
 //!   -> {"type":"ping"}                                  <- {"type":"pong","version":1}
 //!   -> {"type":"download","url":"https://...","filename":"optional",
 //!       "pageUrl":"https://page...","referer":"...","cookie":"...","mime":"...",
-//!       "userAgent":"Mozilla/5.0 ..."}                  <- {"type":"ok","queued":true}
+//!       "userAgent":"Mozilla/5.0 ...","headers":{"origin":"...",
+//!       "authorization":"...","x-...":"..."}}
+//!                                                      <- {"type":"ok","queued":true}
 //!
 //! `userAgent` is optional (older extensions omit it): it carries the
 //! browser's own User-Agent for the capture, so the app can talk to the
-//! server with the same voice the browser used.
+//! server with the same voice the browser used. `headers` carries the
+//! Origin / Authorization / x-* headers the player sent with the media.
+//!
+//! Besides `ping`, `query` and `download` the host answers `prefs` and
+//! `setOverlayStyle` (the overlay style and who owns it) and `list`,
+//! `record`, `control` and `links` (the app's downloads, a browser download
+//! record, a queue control request and the links of a page).
 //!
 //! Download requests are appended to an inbox file that the GUI polls and
 //! imports as queued (auto-started) downloads.
@@ -33,6 +41,9 @@ struct Incoming {
     /// speak with the same voice (optional: older extensions omit it).
     #[serde(default, alias = "userAgent")]
     user_agent: Option<String>,
+    /// Origin / Authorization / x-* headers the player sent with this media.
+    #[serde(default)]
+    headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     mime: Option<String>,
     /// Browser-measured size bytes (HEAD/Range from the page session).
@@ -67,6 +78,131 @@ struct Incoming {
     /// the app adopts it so both places agree.
     #[serde(default, alias = "style")]
     pub overlay_style: Option<String>,
+    /// "Download all links" (`{"type":"links"}`): every link on a page.
+    #[serde(default)]
+    pub links: Option<Vec<PageLink>>,
+    /// Page title for the links window.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// `{"type":"control"}`: which queue row, and what to do with it.
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+/// One link from a page ("Download all links").
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PageLink {
+    pub url: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// What `--links <file>` reads: written by the host, deleted by the window.
+///
+/// The page's cookie is deliberately NOT in this file. It travels to the
+/// window through the inherited environment instead, so no session cookie
+/// is ever written to disk in plain text. See `LINKS_COOKIE_ENV`.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct LinksBatch {
+    pub page_url: String,
+    #[serde(default)]
+    pub title: String,
+    pub links: Vec<PageLink>,
+}
+
+/// The environment variable that carries the page's cookie to the Links
+/// window. It lives only as long as that process.
+pub const LINKS_COOKIE_ENV: &str = "DOWNLOADCRAFT_LINKS_COOKIE";
+
+/// Validate a page's links and keep the downloadable ones (http/https,
+/// sane lengths, no duplicates), capped like the extension's collector.
+pub fn links_batch(page_url: &str, title: &str, links: &[PageLink]) -> LinksBatch {
+    let mut seen = std::collections::HashSet::new();
+    let kept = links
+        .iter()
+        .filter(|l| crate::model::is_download_url(&l.url) && l.url.len() <= 4096)
+        .filter(|l| seen.insert(l.url.clone()))
+        .take(5000)
+        .map(|l| PageLink {
+            url: l.url.clone(),
+            text: l.text.chars().filter(|c| !c.is_control()).take(200).collect(),
+        })
+        .collect();
+    LinksBatch {
+        page_url: page_url.to_string(),
+        title: title.chars().filter(|c| !c.is_control()).take(200).collect(),
+        links: kept,
+    }
+}
+
+fn spawn_links(msg: &Incoming) -> Result<(), String> {
+    let page = msg.page_url.clone().unwrap_or_default();
+    let batch = links_batch(
+        &page,
+        msg.title.as_deref().unwrap_or(""),
+        msg.links.as_deref().unwrap_or(&[]),
+    );
+    if batch.links.is_empty() {
+        return Err("no downloadable links on this page".into());
+    }
+    let dir = crate::model::config_dir().ok_or_else(|| "no config dir".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Clear any batch a previous window never read, so no stale file (and
+    // no stale cookie) is left lying in the config dir.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("links_") && name.ends_with(".json") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let path = dir.join(format!("links_{}.json", chrono::Local::now().timestamp_millis()));
+    let json = serde_json::to_string(&batch).map_err(|e| e.to_string())?;
+    crate::model::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
+    let exe = crate::platform::launch_path().map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--links").arg(&path);
+    // The page's cookie travels with the process, not through the file.
+    if let Some(cookie) = msg.cookie.as_deref() {
+        if !cookie.trim().is_empty() {
+            cmd.env(LINKS_COOKIE_ENV, cookie);
+        }
+    }
+    spawn_detached(cmd);
+    Ok(())
+}
+
+/// Spawn a window that outlives this short-lived host.
+fn spawn_detached(mut cmd: std::process::Command) {
+    // Never hand our stdio to the window: an inherited stdout keeps the
+    // browser's pipe open after this host exits.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        // DETACHED_PROCESS so the window outlives this short-lived host, and
+        // BREAKAWAY_FROM_JOB because Firefox runs native hosts inside a job
+        // object it kills when the host exits: children inherit that job, so a
+        // plain detached dialog was being torn down the moment Firefox closed
+        // our stdin (verified live — Chrome does not use such a job, which is
+        // why only Firefox looked like it did nothing). A job that forbids
+        // breaking away makes the spawn fail, and a plain detached window
+        // still beats none at all.
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
+        if cmd.spawn().is_ok() {
+            return;
+        }
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
+    let _ = cmd.spawn();
 }
 
 #[derive(Debug, Serialize)]
@@ -88,14 +224,170 @@ struct Reply {
     /// ("extension"). The side that owns it wins.
     #[serde(rename = "overlayStyleSource", skip_serializing_if = "Option::is_none")]
     overlay_style_source: Option<String>,
+    /// The app's theme ("light" | "dark" | "system") on pong, so the
+    /// extension's in-page controls match it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
+    /// `{"type":"list"}`: the app's active and recent downloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Vec<serde_json::Value>>,
 }
 
 impl Reply {
     fn ok() -> Self {
-        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, overlay_style: None, overlay_style_source: None }
+        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, overlay_style: None, overlay_style_source: None, theme: None, items: None }
     }
     fn err(e: impl Into<String>) -> Self {
-        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, overlay_style: None, overlay_style_source: None }
+        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, overlay_style: None, overlay_style_source: None, theme: None, items: None }
+    }
+}
+
+/// The popup's Downloads tab: every active row, then the newest finished or
+/// failed ones, with live bytes and speed from the app's progress snapshot.
+fn app_downloads() -> Vec<serde_json::Value> {
+    use crate::model::{DownloadItem, Status};
+    let dir = match crate::model::config_dir() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let items: Vec<DownloadItem> = std::fs::read_to_string(dir.join("queue.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
+        .unwrap_or_default();
+    let live: serde_json::Value = std::fs::read_to_string(dir.join("progress.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let mut rows: Vec<&DownloadItem> = items.iter().collect();
+    rows.sort_by(|a, b| b.id.cmp(&a.id));
+    let active = |d: &&DownloadItem| matches!(d.status, Status::Downloading | Status::Queued | Status::Paused);
+    let mut out: Vec<&DownloadItem> = rows.iter().copied().filter(active).collect();
+    out.extend(rows.iter().copied().filter(|d| !active(d)).take(15));
+    out.into_iter()
+        .map(|d| {
+            let snap = live.get("items").and_then(|m| m.get(d.id.to_string()));
+            let num = |k: &str| snap.and_then(|s| s.get(k)).and_then(|x| x.as_f64());
+            let (state, error) = match &d.status {
+                Status::Downloading => ("downloading", String::new()),
+                Status::Queued => ("queued", String::new()),
+                Status::Paused => ("paused", String::new()),
+                Status::Completed => ("done", String::new()),
+                Status::Failed(e) => ("failed", e.clone()),
+            };
+            // A finished row's address can still be a live signed CDN link,
+            // so it is not handed back to the extension. Only a row that is
+            // still running needs its URL.
+            let mut row = serde_json::json!({
+                "id": d.id,
+                "name": d.filename,
+                "state": state,
+                "error": error,
+                "total": num("total").map(|t| t as u64).or(d.total_bytes),
+                "done": num("downloaded").map(|t| t as u64).unwrap_or(d.downloaded_bytes),
+                "speed": num("speed").unwrap_or(0.0),
+            });
+            if active(&d) {
+                row["url"] = serde_json::json!(d.url);
+            }
+            row
+        })
+        .collect()
+}
+
+/// The folders a browser-saved file may legitimately come from: the user's
+/// own Downloads folder, and the folder the app downloads into.
+///
+/// A path that arrives from the browser is not trusted on its own, so it
+/// has to sit under one of these roots.
+fn allowed_download_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    let home = std::env::var("USERPROFILE")
+        .ok()
+        .or_else(|| std::env::var("HOME").ok());
+    if let Some(home) = home {
+        let home = std::path::PathBuf::from(home);
+        roots.push(home.join("Downloads"));
+        roots.push(home.join("downloads"));
+    }
+    let save_dir = crate::model::ui_pref_str("save_dir", "");
+    if !save_dir.trim().is_empty() {
+        roots.push(std::path::PathBuf::from(save_dir));
+    }
+    roots
+}
+
+/// Is `path` inside `root`? A prefix match on the whole path is not enough:
+/// "C:\Users\x\Downloads Evil" must not pass as "C:\Users\x\Downloads".
+fn path_is_under(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let p = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let r = root
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase();
+    if r.is_empty() {
+        return false;
+    }
+    p.starts_with(&format!("{r}\\"))
+}
+
+/// A file the extension saved itself ("Download in browser"): list it in the
+/// app as finished. `filename` is the saved file's full path; it must exist.
+fn record_browser_download(msg: &Incoming) -> Result<(), String> {
+    let url = msg.url.clone().filter(|u| u.starts_with("http")).unwrap_or_default();
+    let path = std::path::PathBuf::from(msg.filename.clone().unwrap_or_default());
+    if !path.is_absolute() || !path.is_file() {
+        return Err("the saved file was not found".into());
+    }
+    if !allowed_download_roots().iter().any(|r| path_is_under(&path, r)) {
+        return Err("the saved file is not in a download folder".into());
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).ok_or("no file name")?;
+    let dir = path.parent().map(|d| d.to_string_lossy().to_string()).ok_or("no folder")?;
+    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let mut item = crate::model::DownloadItem::new(0, if url.is_empty() { format!("file:///{}", path.display()) } else { url }, name, dir, 1);
+    item.total_bytes = Some(len);
+    item.downloaded_bytes = len;
+    item.referer = msg.page_url.clone().unwrap_or_default();
+    item.description = "Downloaded in the browser".into();
+    match crate::model::record_finished(&mut item) {
+        crate::model::AppendResult::Error(e) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Queue a pause/resume/cancel order for the app (the same cmd.json the
+/// progress windows use).
+fn app_control(id: Option<u64>, action: &str) -> Result<(), String> {
+    let allowed = ["pause", "resume", "cancel", "pause_all", "resume_all"];
+    if !allowed.contains(&action) {
+        return Err("unknown action".into());
+    }
+    let p = crate::model::config_dir().ok_or("no config dir")?.join("cmd.json");
+    let _guard = crate::model::fs_lock("cmd");
+    if !_guard.owned() {
+        return Err("the app is busy; retry".into());
+    }
+    let mut v: serde_json::Value = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    let arr = v.as_array_mut().ok_or("cmd file unreadable")?;
+    let mut o = serde_json::json!({ "action": action });
+    if let Some(id) = id {
+        o["id"] = serde_json::json!(id);
+    }
+    arr.push(o);
+    let json = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    crate::model::atomic_write(&p, json.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// The app theme as the extension understands it.
+fn app_theme() -> String {
+    match crate::model::ui_pref_str("theme", "system").as_str() {
+        "light" => "light".to_string(),
+        "dark" | "black" => "dark".to_string(),
+        _ => "system".to_string(),
     }
 }
 
@@ -108,7 +400,10 @@ fn queued_urls(urls: &[String]) -> Vec<String> {
     if !_guard.owned() { return Vec::new(); }
     let items: Vec<crate::model::DownloadItem> = crate::model::config_dir()
         .and_then(|d| std::fs::read_to_string(d.join("queue.json")).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+        // Strip a BOM: a queue.json written by another tool can start with
+        // one, and serde_json refuses the whole file then. `app_downloads`
+        // strips it too, so both readers agree on what is queued.
+        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
         .unwrap_or_default();
     urls.iter()
         .filter(|u| items.iter().any(|d| &d.url == *u))
@@ -133,6 +428,10 @@ pub struct InboxItem {
     /// speak with the same voice (optional: older extensions omit it).
     #[serde(default, alias = "userAgent")]
     pub user_agent: Option<String>,
+    /// Captured request headers (credentials: kept in the private inbox,
+    /// never on a command line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     pub mime: Option<String>,
     #[serde(default)]
@@ -183,9 +482,15 @@ fn read_message() -> HostFrame {
         return HostFrame::Eof; // clean close
     }
     if len > 4 * 1024 * 1024 {
-        // Length prefix is corrupt; the stream cannot be resynced, so the
-        // only honest action is to exit rather than misparse everything.
-        return HostFrame::Eof;
+        // Bigger than any real request. The length itself is valid framing,
+        // so skip exactly that many bytes and keep serving: exiting dropped
+        // every later capture on this port. Only a stream that ends early
+        // (a corrupt prefix) closes the host.
+        let skipped = std::io::copy(&mut std::io::stdin().take(len as u64), &mut std::io::sink());
+        return match skipped {
+            Ok(n) if n == len as u64 => HostFrame::Bad(format!("message too large ({len} bytes)")),
+            _ => HostFrame::Eof,
+        };
     }
     let mut buf = vec![0u8; len];
     if std::io::stdin().read_exact(&mut buf).is_err() {
@@ -206,6 +511,26 @@ fn write_message(reply: &Reply) {
         let _ = out.write_all(&data);
         let _ = out.flush();
     }
+}
+
+/// Keep only headers the engine may replay, with sane sizes. The extension
+/// already filters; this is the trust boundary, so filter again.
+fn replayable_headers(
+    headers: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let kept: std::collections::BTreeMap<String, String> = headers?
+        .iter()
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .filter(|(k, v)| {
+            crate::engine::replayable_header(k)
+                && k.len() <= 64
+                && !v.is_empty()
+                && v.len() <= 4096
+                && !v.contains(['\r', '\n'])
+        })
+        .take(20)
+        .collect();
+    (!kept.is_empty()).then_some(kept)
 }
 
 fn queue_download(msg: &Incoming) -> Result<bool, String> {
@@ -237,6 +562,7 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         referer,
         cookie: msg.cookie.clone().filter(|s| !s.trim().is_empty()),
         user_agent: msg.user_agent.clone().filter(|s| !s.trim().is_empty()),
+        headers: replayable_headers(msg.headers.as_ref()),
         mime: msg.mime.clone().filter(|s| !s.trim().is_empty()),
         size: msg.size.filter(|s| *s > 0),
         pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
@@ -282,9 +608,20 @@ fn spawn_confirm(msg: &Incoming) {
     if let Some(f) = msg.filename.clone().filter(|s| !s.trim().is_empty()) {
         cmd.arg("--filename").arg(f);
     }
-    if let Some(r) = msg.page_url.clone().filter(|s| !s.trim().is_empty()) {
-        cmd.arg("--referer").arg(r);
-    } else if let Some(r) = msg.referer.clone().filter(|s| !s.trim().is_empty()) {
+    // The engine reads this as both the Referer and "the page the media came
+    // from" (YouTube fresh-link retry, social page fallback), so the page
+    // wins over an origin-only Referer ("https://www.youtube.com/"). A
+    // Referer with a real path is an embedded player's page, which the CDN
+    // checks (sending the article URL instead got 403s): that one wins.
+    let page = msg.page_url.clone().filter(|s| !s.trim().is_empty());
+    let captured = msg.referer.clone().filter(|s| !s.trim().is_empty());
+    let has_path = |u: &str| reqwest::Url::parse(u).map(|x| x.path() != "/" && !x.path().is_empty()).unwrap_or(false);
+    let pick = match (page, captured) {
+        (Some(p), Some(r)) if r != p && has_path(&r) => Some(r),
+        (Some(p), _) => Some(p),
+        (None, r) => r,
+    };
+    if let Some(r) = pick {
         cmd.arg("--referer").arg(r);
     }
     // The dialog claims credentials from the owner-only inbox.
@@ -307,26 +644,7 @@ fn spawn_confirm(msg: &Incoming) {
     if let Some(d) = msg.dur.filter(|s| *s > 0) {
         cmd.arg("--dur").arg(d.to_string());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        // DETACHED_PROCESS so the dialog outlives this short-lived host, and
-        // BREAKAWAY_FROM_JOB because Firefox runs native hosts inside a job
-        // object it kills when the host exits: children inherit that job, so a
-        // plain detached dialog was being torn down the moment Firefox closed
-        // our stdin (verified live — Chrome does not use such a job, which is
-        // why only Firefox looked like it did nothing). A job that forbids
-        // breaking away makes the spawn fail, and a plain detached dialog
-        // still beats no dialog at all.
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
-        if cmd.spawn().is_ok() {
-            return;
-        }
-        cmd.creation_flags(DETACHED_PROCESS);
-    }
-    let _ = cmd.spawn();
+    spawn_detached(cmd);
 }
 
 /// Entry point when launched with `--native-host`. Never returns normally.
@@ -348,6 +666,8 @@ pub fn run() -> eframe::Result<()> {
                 urls: None,
                 overlay_style: None,
                 overlay_style_source: None,
+                theme: Some(app_theme()),
+                items: None,
             }),
             "prefs" => {
                 // What the app currently wants the extension to draw. The
@@ -361,6 +681,8 @@ pub fn run() -> eframe::Result<()> {
                     urls: None,
                     overlay_style: Some(crate::model::overlay_style()),
                     overlay_style_source: Some(crate::model::overlay_style_source()),
+                    theme: Some(app_theme()),
+                    items: None,
                 });
             }
             "setOverlayStyle" => {
@@ -388,6 +710,8 @@ pub fn run() -> eframe::Result<()> {
                     urls: Some(hits),
                     overlay_style: None,
                     overlay_style_source: None,
+                    theme: None,
+                    items: None,
                 });
             }
             "download" => {
@@ -419,6 +743,29 @@ pub fn run() -> eframe::Result<()> {
                     Err(e) => write_message(&Reply::err(e)),
                 }
             }
+            "list" => write_message(&Reply {
+                kind: "list".into(),
+                version: None,
+                queued: None,
+                error: None,
+                urls: None,
+                overlay_style: None,
+                overlay_style_source: None,
+                theme: None,
+                items: Some(app_downloads()),
+            }),
+            "record" => match record_browser_download(&msg) {
+                Ok(()) => write_message(&Reply::ok()),
+                Err(e) => write_message(&Reply::err(e)),
+            },
+            "control" => match app_control(msg.id, msg.action.as_deref().unwrap_or("")) {
+                Ok(()) => write_message(&Reply::ok()),
+                Err(e) => write_message(&Reply::err(e)),
+            },
+            "links" => match spawn_links(&msg) {
+                Ok(()) => write_message(&Reply::ok()),
+                Err(e) => write_message(&Reply::err(e)),
+            },
             _ => write_message(&Reply::err("unknown message")),
             }
         }
@@ -439,6 +786,73 @@ mod media_tests {
         assert!(stored.audio_expected);
         let old: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://cdn.example.org/video.mp4"}"#).unwrap();
         assert!(!old.audio_expected);
+        assert!(old.headers.is_none());
+    }
+
+    #[test]
+    fn captured_headers_keep_only_replayable_tokens() {
+        let msg: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://cdn.example.org/v",
+            "headers":{"Origin":"https://site.example","authorization":"Bearer t","x-token":"1",
+                       "x-client-data":"variations","Range":"bytes=0-","host":"evil","x-bad":"a\r\nb: c"}}"#).unwrap();
+        let kept = replayable_headers(msg.headers.as_ref()).unwrap();
+        assert_eq!(kept.keys().cloned().collect::<Vec<_>>(), ["authorization", "origin", "x-token"]);
+        assert!(replayable_headers(None).is_none());
+        let none = std::collections::BTreeMap::from([("cookie".to_string(), "a=b".to_string())]);
+        assert!(replayable_headers(Some(&none)).is_none());
+    }
+
+    #[test]
+    fn page_links_keep_only_unique_web_urls() {
+        let msg: Incoming = serde_json::from_str(r#"{"type":"links","pageUrl":"https://site.example/dir/",
+            "links":[{"url":"https://site.example/a.mp4","text":"A\u0007 video"},
+                     {"url":"https://site.example/a.mp4","text":"again"},
+                     {"url":"javascript:alert(1)"},{"url":"file:///c:/x"},
+                     {"url":"http://other.example/b.zip"}]}"#).unwrap();
+        let b = links_batch("https://site.example/dir/", "", msg.links.as_deref().unwrap());
+        assert_eq!(b.links.len(), 2);
+        assert_eq!(b.links[0].text, "A video");
+        assert_eq!(b.links[1].url, "http://other.example/b.zip");
+    }
+
+    /// The page's cookie must never reach the disk: the batch file carries
+    /// the links only, and the cookie travels with the process.
+    #[test]
+    fn the_links_batch_never_carries_the_cookie() {
+        let msg: Incoming = serde_json::from_str(r#"{"type":"links","pageUrl":"https://site.example/dir/",
+            "cookie":"session=secret-value",
+            "links":[{"url":"https://site.example/a.mp4","text":"A video"}]}"#).unwrap();
+        let b = links_batch(
+            "https://site.example/dir/",
+            "",
+            msg.links.as_deref().unwrap(),
+        );
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(!json.contains("secret-value"), "the cookie reached the batch file: {json}");
+        assert!(!json.contains("cookie"), "the batch file still has a cookie field: {json}");
+    }
+
+    /// A path that arrives from the browser is only accepted when it really
+    /// is inside a download folder. A folder that merely starts with the
+    /// same characters is not one.
+    #[test]
+    fn a_browser_path_must_sit_inside_a_download_folder() {
+        let root = std::path::Path::new(r"C:\Users\tester\Downloads");
+        assert!(path_is_under(
+            std::path::Path::new(r"C:\Users\tester\Downloads\clip.mp4"),
+            root
+        ));
+        assert!(path_is_under(
+            std::path::Path::new(r"C:\Users\tester\Downloads\tv\clip.mp4"),
+            root
+        ));
+        // "Downloads Evil" is a different folder.
+        assert!(!path_is_under(
+            std::path::Path::new(r"C:\Users\tester\Downloads Evil\clip.mp4"),
+            root
+        ));
+        assert!(!path_is_under(std::path::Path::new(r"C:\Windows\System32\clip.mp4"), root));
+        // The root itself is not a file inside it.
+        assert!(!path_is_under(root, root));
     }
 
     /// The capture carries the browser's own User-Agent: the extension sends

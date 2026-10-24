@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Send to Download Craft",
-  "version": "0.9.7.3",
+"version": "0.9.8.1",
   "description": "Automatically sends downloads to your Download Craft download manager.",
   "permissions": [
     "nativeMessaging",
     "contextMenus",
     "downloads",
+    "downloads.open",
     "storage",
     "scripting",
     "tabs",
@@ -21,6 +22,9 @@
   "background": {
     "scripts": [
       "rank.js",
+      "streams.js",
+      "mp4merge.js",
+      "browserdl.js",
       "background.js"
     ]
   },
@@ -36,6 +40,29 @@
       ],
       "all_frames": true,
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "page-relay.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "page-hook.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "action": {

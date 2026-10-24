@@ -354,6 +354,9 @@ struct SettingsApp {
     ytdlp: Option<crate::engine::YtdlpInfo>,
     ytdlp_msg: String,
     ytdlp_busy: bool,
+    /// The app's own JavaScript runtime (Deno) being installed: the answer
+    /// is the installed path or the reason it failed.
+    deno_rx: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
     ytdlp_rx: Option<
         std::sync::mpsc::Receiver<(
             String,
@@ -366,6 +369,8 @@ struct SettingsApp {
     ffmpeg: Option<crate::engine::FfmpegInfo>,
     ffmpeg_msg: String,
     ffmpeg_busy: bool,
+    /// The tools install (run on the yt-dlp channel) is writing ffmpeg.
+    ffmpeg_installing: bool,
     ffmpeg_rx: Option<std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)>>,
     /// Which plugin cards are expanded (yt-dlp starts open, like the concept).
     plugins_open: [bool; 2],
@@ -381,6 +386,14 @@ struct SettingsApp {
     /// Appearance cards (the concept opens both by default).
     open_theme: bool,
     open_window: bool,
+    /// Browser Integration cards (Chromium family, Firefox) expanded.
+    browser_open: [bool; 2],
+    /// Native host registered per browser, asked when the pane first opens
+    /// (and again after a repair).
+    host_status: Option<Vec<(&'static str, bool)>>,
+    /// Updates page cards expanded.
+    open_updates: bool,
+    open_version: bool,
 }
 
 /// Probe the helper, and optionally re-download it first, off the UI thread.
@@ -424,6 +437,27 @@ fn ffmpeg_probe(
     rx
 }
 
+/// Status plus a latest-release check (and in-place update of the app's own
+/// copy), off the UI thread.
+fn ytdlp_update_probe(
+) -> std::sync::mpsc::Receiver<(String, crate::engine::YtdlpInfo, crate::engine::FfmpegInfo)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let msg = crate::engine::ytdlp_update_check_blocking();
+        let _ = tx.send((msg, crate::engine::ytdlp_info(), crate::engine::ffmpeg_info()));
+    });
+    rx
+}
+
+fn ffmpeg_update_probe() -> std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let msg = crate::engine::ffmpeg_update_check_blocking();
+        let _ = tx.send((msg, crate::engine::ffmpeg_info()));
+    });
+    rx
+}
+
 /// The native "open file" dialog, for picking a yt-dlp executable.
 fn pick_executable() -> Option<std::path::PathBuf> {
     pick_tool("yt-dlp")
@@ -459,8 +493,17 @@ fn install_one(browser: &str) -> String {
 
 /// Entry point for `--settings`.
 pub fn run() -> eframe::Result<()> {
+    // `--pane <n>` opens a page directly (e.g. 2 = Plugins).
+    let args: Vec<String> = std::env::args().collect();
+    let pane = args
+        .iter()
+        .position(|a| a == "--pane")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|p| *p < PANES.len())
+        .unwrap_or(0);
     let app = SettingsApp {
-        pane: 0,
+        pane,
         s: load(),
         centered: false,
         notice: String::new(),
@@ -470,10 +513,12 @@ pub fn run() -> eframe::Result<()> {
         ytdlp: None,
         ytdlp_msg: String::new(),
         ytdlp_busy: false,
+        deno_rx: None,
         ytdlp_rx: None,
         ffmpeg: None,
         ffmpeg_msg: String::new(),
         ffmpeg_busy: false,
+        ffmpeg_installing: false,
         ffmpeg_rx: None,
         plugins_open: [true, false],
         open_storage: false,
@@ -484,6 +529,10 @@ pub fn run() -> eframe::Result<()> {
         open_archives: false,
         open_theme: true,
         open_window: true,
+        browser_open: [true, false],
+        host_status: None,
+        open_updates: true,
+        open_version: true,
     };
     // Separate OS window (own process via `--settings`): never embedded in
     // the main GUI. 640 wide is the concept's window width.
@@ -528,13 +577,38 @@ impl eframe::App for SettingsApp {
             crate::tray::set_titlebar_dark(crate::app::theme_is_dark(ctx, &self.s.theme));
             self.theme_applied = resolved;
         }
+        // Come to the front while placing: opened from the main window, the
+        // new process otherwise stayed behind it (as the complete dialog did).
+        if !self.centered {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         if !self.centered && crate::model::center_window(ctx, egui::vec2(640.0, 520.0)) {
             self.centered = true;
         }
-        // The helper's status is asked for when the pane is first opened.
+        // The helpers' status is asked for when the pane is first opened,
+        // together with a check against their latest releases (the app's own
+        // copies are updated in place; the user's copies are only reported).
         if self.pane == PANE_YTDLP && self.ytdlp.is_none() && self.ytdlp_rx.is_none() {
-            self.ytdlp_rx = Some(ytdlp_probe(false));
+            self.ytdlp_rx = Some(ytdlp_update_probe());
             self.ytdlp_busy = true;
+            if self.ffmpeg_rx.is_none() {
+                self.ffmpeg_rx = Some(ffmpeg_update_probe());
+                self.ffmpeg_busy = true;
+            }
+        }
+        if let Some(rx) = &self.deno_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.deno_rx = None;
+                self.ytdlp_msg = match res {
+                    Ok(_) => "JavaScript runtime installed (Deno) — YouTube's player challenges are solved now.".into(),
+                    Err(e) => format!("Could not install the JavaScript runtime: {e}"),
+                };
+                // Re-read the status so the Runtime chip shows it.
+                if self.ytdlp_rx.is_none() {
+                    self.ytdlp_rx = Some(ytdlp_probe(false));
+                    self.ytdlp_busy = true;
+                }
+            }
         }
         if let Some(rx) = &self.ytdlp_rx {
             if let Ok((msg, info, ffmpeg)) = rx.try_recv() {
@@ -545,6 +619,7 @@ impl eframe::App for SettingsApp {
                 self.ffmpeg = Some(ffmpeg);
                 self.ytdlp_rx = None;
                 self.ytdlp_busy = false;
+                self.ffmpeg_installing = false;
             }
         }
         if let Some(rx) = &self.ffmpeg_rx {
@@ -606,7 +681,7 @@ impl eframe::App for SettingsApp {
                 foot_ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
                 if button(&mut foot_ui, "Save", false).clicked() {
                     let saved=save(&self.s);
-                    if saved {self.ytdlp_rx=Some(ytdlp_probe(false));self.ytdlp_busy=true;}
+                    if saved && self.ytdlp_rx.is_none() {self.ytdlp_rx=Some(ytdlp_probe(false));self.ytdlp_busy=true;}
                     self.notice = if saved {
                         "Saved ✓ (the main app picks it up live)".to_string()
                     } else {
@@ -650,7 +725,7 @@ impl eframe::App for SettingsApp {
 
         // The plugin probe runs on a worker thread: keep repainting while it
         // is pending so its answer appears without a mouse move.
-        if self.ytdlp_busy {
+        if self.ytdlp_busy || self.ffmpeg_busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
@@ -759,6 +834,9 @@ fn hint(ui: &mut Ui, s: &str) {
 }
 
 /// 11 px secondary paragraph.
+///
+/// The extension-setup steps use this: they are instructions, not hints, so
+/// they read a step louder than a muted line of explanation.
 fn para(ui: &mut Ui, s: &str) {
     wrapped(ui, s, reg(11.0), tok().text2);
 }
@@ -2796,7 +2874,36 @@ impl SettingsApp {
                             runtime_note(ui, rt);
                         }
 
-                        ui.hyperlink_to("Install a JavaScript runtime", "https://github.com/yt-dlp/yt-dlp/wiki/EJS#step-1-install-a-supported-javascript-runtime");
+                        // One click installs a portable Deno into the app's own
+                        // tools folder (like yt-dlp itself): no web page, no
+                        // installer, no PATH changes.
+                        let installing = self.deno_rx.is_some();
+                        let own = crate::engine::deno_local_path().map(|p| p.is_file()).unwrap_or(false);
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let label = if own {
+                                "Update JavaScript runtime"
+                            } else if rt.is_some() {
+                                "Install app's own runtime"
+                            } else {
+                                "Install JavaScript runtime"
+                            };
+                            let b = ui.add_enabled_ui(!installing, |ui| btn_icon(ui, "\u{e2c4}", label, rt.is_none() && !own)).inner;
+                            if b.on_hover_text("Downloads a portable Deno (about 45 MB) next to yt-dlp — nothing else to set up").clicked() {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(crate::engine::deno_install_blocking().map_err(|e| format!("{e:#}")));
+                                });
+                                self.deno_rx = Some(rx);
+                                self.ytdlp_msg = "Installing the JavaScript runtime (Deno)…".into();
+                            }
+                            if installing {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            } else if own {
+                                txt(ui, "✓ Installed (app's own copy)", reg(10.0), pl().success);
+                            }
+                        });
                         if !msg.is_empty() {
                             ui.add_space(7.0);
                             wrapped(ui, msg.as_str(), reg(10.0), t.accent);
@@ -2818,26 +2925,57 @@ impl SettingsApp {
             if set_custom.is_none() {
                 self.s.ytdlp_source = src.to_string();
                 // Keep the old switch truthful for anything still reading it,
-                // then re-ask so the status line matches the new choice.
+                // then re-ask so the status line matches the new choice. The
+                // probe reads ui.json, so the choice is committed first (as
+                // the ffmpeg card does); otherwise it described the old one
+                // until Save.
                 self.s.ytdlp_prefer_path = src == "path";
-                self.ytdlp_rx = Some(ytdlp_probe(false));
-                self.ytdlp_busy = true;
-                self.ytdlp_msg.clear();
+                crate::model::ui_pref_set_str("ytdlp_source", src);
+                self.run_ytdlp_job(|| ytdlp_probe(false));
             }
         }
         if let Some(p) = set_custom {
             self.s.ytdlp_custom_path = p;
             self.s.ytdlp_source = "custom".to_string();
             self.s.ytdlp_prefer_path = false;
-            self.ytdlp_rx = Some(ytdlp_probe(false));
-            self.ytdlp_busy = true;
-            self.ytdlp_msg.clear();
+            crate::model::ui_pref_set_str("ytdlp_source", "custom");
+            crate::model::ui_pref_set_str("ytdlp_custom_path", &self.s.ytdlp_custom_path);
+            self.run_ytdlp_job(|| ytdlp_probe(false));
         }
         if redownload {
-            self.ytdlp_rx = Some(ytdlp_probe(true));
-            self.ytdlp_busy = true;
-            self.ytdlp_msg.clear();
+            self.run_ytdlp_job(|| ytdlp_probe(true));
         }
+    }
+
+    /// Start a yt-dlp card job unless one still runs: replacing its receiver
+    /// dropped that job's result ("Updated yt-dlp X → Y") and cleared the
+    /// busy state while it was still writing the executable.
+    fn run_ytdlp_job(
+        &mut self,
+        job: impl FnOnce() -> std::sync::mpsc::Receiver<(String, crate::engine::YtdlpInfo, crate::engine::FfmpegInfo)>,
+    ) {
+        if self.ytdlp_rx.is_some() {
+            self.ytdlp_msg = "Still finishing the previous step — try again in a moment.".to_string();
+            return;
+        }
+        self.ytdlp_rx = Some(job());
+        self.ytdlp_busy = true;
+        self.ytdlp_msg.clear();
+    }
+
+    /// Same for the ffmpeg card; the tools install (which runs on the yt-dlp
+    /// channel) also writes ffmpeg, so it blocks these too.
+    fn run_ffmpeg_job(
+        &mut self,
+        job: impl FnOnce() -> std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)>,
+    ) {
+        if self.ffmpeg_rx.is_some() || self.ffmpeg_installing {
+            self.ffmpeg_msg = "Still finishing the previous step — try again in a moment.".to_string();
+            return;
+        }
+        self.ffmpeg_rx = Some(job());
+        self.ffmpeg_busy = true;
+        self.ffmpeg_msg.clear();
     }
 
     /// ffmpeg: the concept's second card, closed by default — with real
@@ -3021,6 +3159,9 @@ impl SettingsApp {
 
                         ui.add_enabled_ui(!self.ytdlp_busy,|ui| {
                             ui.horizontal_wrapped(|ui| {
+                                // Same gaps as the action row below (these
+                                // buttons were drawn touching each other).
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                                 if crate::helpers::install_supported() && button(ui,"Download tools",true).clicked(){install=true;}
                                 if button(ui,"Choose FFmpeg…",false).clicked(){custom_pick=pick_tool("FFmpeg");}
                                 if button(ui,"Check again",false).clicked(){recheck=true;}
@@ -3074,9 +3215,7 @@ impl SettingsApp {
             if set_custom.is_none() {
                 self.s.ffmpeg_source = src.to_string();
                 crate::model::ui_pref_set_str("ffmpeg_source", src);
-                self.ffmpeg_rx = Some(ffmpeg_probe(false));
-                self.ffmpeg_busy = true;
-                self.ffmpeg_msg.clear();
+                self.run_ffmpeg_job(|| ffmpeg_probe(false));
             }
         }
         if let Some(p) = set_custom {
@@ -3084,21 +3223,16 @@ impl SettingsApp {
             self.s.ffmpeg_custom_path = p;
             crate::model::ui_pref_set_str("ffmpeg_source", "custom");
             crate::model::ui_pref_set_str("ffmpeg_custom_path", &self.s.ffmpeg_custom_path);
-            self.ffmpeg_rx = Some(ffmpeg_probe(false));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
         }
-        if install {
+        if install && self.ytdlp_rx.is_none() && self.ffmpeg_rx.is_none() {
             self.s.ffmpeg_source = "managed".to_string();
             crate::model::ui_pref_set_str("ffmpeg_source", "managed");
-            self.ytdlp_rx = Some(ffmpeg_install_probe());
-            self.ytdlp_busy = true;
-            self.ytdlp_msg.clear();
+            self.ffmpeg_installing = true;
+            self.run_ytdlp_job(ffmpeg_install_probe);
         }
         if recheck {
-            self.ffmpeg_rx = Some(ffmpeg_probe(false));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
         }
         if let Some(path) = custom_pick {
             let path = path.to_string_lossy().into_owned();
@@ -3106,18 +3240,14 @@ impl SettingsApp {
             self.s.ffmpeg_custom_path = path.clone();
             crate::model::ui_pref_set_str("ffmpeg_source", "custom");
             crate::model::ui_pref_set_str("ffmpeg_custom_path", &path);
-            self.ffmpeg_rx = Some(ffmpeg_probe(false));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
         }
         if clear_custom {
             self.s.ffmpeg_source = "path".to_string();
             self.s.ffmpeg_custom_path.clear();
             crate::model::ui_pref_set_str("ffmpeg_source", "path");
             crate::model::ui_pref_set_str("ffmpeg_custom_path", "");
-            self.ffmpeg_rx = Some(ffmpeg_probe(false));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
         }
         if redownload {
             // Re-download means "use the copy this app keeps up to date", so
@@ -3125,21 +3255,30 @@ impl SettingsApp {
             // ui.json, not this form's unsaved state).
             self.s.ffmpeg_source = "managed".to_string();
             crate::model::ui_pref_set_str("ffmpeg_source", "managed");
-            self.ffmpeg_rx = Some(ffmpeg_probe(true));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(true));
         }
     }
 
-    // ---------- Browser Integration ----------
+    // ---------- Browser Integration (one card per extension, like Plugins) ----------
     fn pane_browser(&mut self, ui: &mut Ui) {
         let t = tok();
         h2(ui, "Browser Integration");
-        para(
+        hint(
             ui,
-            "The extension hands downloads to this app. It is loaded from disk — nothing is published to a web store.",
+            "The extension catches videos and downloads; the app's connection repairs itself on every launch.",
         );
+        ui.add_space(12.0);
+        if self.host_status.is_none() {
+            self.host_status = Some(
+                ["chrome", "edge", "brave", "opera", "firefox"]
+                    .iter()
+                    .map(|b| (*b, crate::app::native_host_status(b)))
+                    .collect(),
+            );
+        }
+        self.browser_card(ui, 0);
         ui.add_space(10.0);
+        self.browser_card(ui, 1);
 
         // ---- Video overlay ----
         h2(ui, "Video overlay");
@@ -3268,8 +3407,138 @@ impl SettingsApp {
             }
         });
         if !self.browser_msg.is_empty() {
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             wrapped(ui, self.browser_msg.as_str(), reg(10.0), t.muted);
+        }
+    }
+
+    /// Card 0: Chrome, Edge, Brave and Opera (one Chromium extension).
+    /// Card 1: Firefox.
+    fn browser_card(&mut self, ui: &mut Ui, idx: usize) {
+        let t = tok();
+        let firefox = idx == 1;
+        let browsers: &[(&str, &str)] = if firefox {
+            &[("firefox", "Firefox")]
+        } else {
+            &[("chrome", "Chrome"), ("edge", "Edge"), ("brave", "Brave"), ("opera", "Opera")]
+        };
+        let status = self.host_status.clone().unwrap_or_default();
+        let connected = browsers
+            .iter()
+            .filter(|(k, _)| status.iter().any(|(b, ok)| b == k && *ok))
+            .count();
+        let open = self.browser_open[idx];
+        let (glyph, brand, name) = if firefox {
+            ("\u{e80b}", Color32::from_rgb(0xff, 0x8a, 0x3d), "Firefox")
+        } else {
+            ("\u{e87b}", t.accent, "Chrome · Edge · Brave · Opera")
+        };
+        let pill = if connected > 0 { "connected" } else { "not set up" };
+        let meta = format!("{connected} of {} linked", browsers.len());
+        let w = ui.available_width();
+        let mut want_open = open;
+        let mut repair: Option<&'static str> = None;
+        let mut open_folder = false;
+        let mut copy_id = false;
+        let edge = if open { blend(t.border, t.accent, 0.5) } else { t.border };
+        egui::Frame::new()
+            .fill(t.card)
+            .stroke(Stroke::new(1.0_f32, edge))
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::ZERO)
+            .show(ui, |ui| {
+                ui.set_width(w);
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let inner = ui.max_rect();
+                if plugin_head(ui, inner.width(), glyph, brand, name, pill, &meta, open).clicked() {
+                    want_open = !open;
+                }
+                if !open {
+                    return;
+                }
+                let y = ui.cursor().top();
+                ui.painter().hline(
+                    inner.left()..=inner.right(),
+                    y,
+                    Stroke::new(1.0_f32, blend(t.card, t.border, 0.6)),
+                );
+                egui::Frame::new()
+                    .inner_margin(egui::Margin { left: 13, right: 13, top: 12, bottom: 16 })
+                    .show(ui, |ui| {
+                        ui.set_width(inner.width() - 26.0);
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                        sec_head(ui, "Extension");
+                        wrapped(
+                            ui,
+                            if firefox {
+                                "about:debugging → This Firefox → Load Temporary Add-on, then pick manifest.json in this folder (or install the .xpi)."
+                            } else {
+                                "chrome://extensions → turn on Developer mode → Load unpacked, then pick this folder. The same folder works in Edge, Brave and Opera."
+                            },
+                            reg(10.0),
+                            t.text2,
+                        );
+                        if !firefox {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("ID  {}", crate::app::EXTENSION_ID))
+                                        .font(egui::FontId::monospace(9.0))
+                                        .color(t.muted),
+                                )
+                                .selectable(true),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                            if btn_icon(ui, "\u{e2c7}", "Open extension folder", true).clicked() {
+                                open_folder = true;
+                            }
+                            if !firefox && btn_icon(ui, "\u{e14d}", "Copy extension ID", false).clicked() {
+                                copy_id = true;
+                            }
+                        });
+                        ui.add_space(12.0);
+                        sec_head(ui, "Connection to the app");
+                        for (key, label) in browsers {
+                            let ok = status.iter().any(|(b, s)| b == key && *s);
+                            loc_status(
+                                ui,
+                                &if ok {
+                                    format!("{label} — linked to Download Craft")
+                                } else {
+                                    format!("{label} — not linked yet")
+                                },
+                                !ok,
+                            );
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                            for (key, label) in browsers {
+                                if btn_icon(ui, "\u{e869}", &format!("Repair {label}"), false).clicked() {
+                                    repair = Some(*key);
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        hint(ui, "Repair re-registers the app for that browser; restart the browser afterwards.");
+                    });
+            });
+        self.browser_open[idx] = want_open;
+        if open_folder {
+            match crate::platform::extension_directory(firefox) {
+                Ok(dir) => crate::app::open_path(&dir, false),
+                Err(e) => self.browser_msg = e,
+            }
+        }
+        if copy_id {
+            ui.ctx().copy_text(crate::app::EXTENSION_ID.to_string());
+            self.browser_msg = "Extension ID copied.".to_string();
+        }
+        if let Some(b) = repair {
+            self.browser_msg = install_one(b);
+            self.host_status = None; // re-check on the next frame
         }
     }
 
@@ -3356,21 +3625,42 @@ impl SettingsApp {
     fn pane_updates(&mut self, ui: &mut Ui) {
         let t = tok();
         h2(ui, "Updates");
-        checkbox(
-            ui,
-            &mut self.s.update_check_on,
-            "Check for updates on launch",
-            14.0,
-            12.0,
-            true,
-        );
+        hint(ui, "Download Craft itself, and the helpers it keeps for you.");
         ui.add_space(10.0);
-        wrapped(
-            ui,
-            "Checks GitHub releases; never downloads automatically.",
-            reg(11.0),
-            t.muted,
-        );
+
+        let mut open_updates = self.open_updates;
+        let mut check = self.s.update_check_on;
+        card(ui, "Download Craft", Some(&format!("v{}", crate::model::APP_VERSION)), &mut open_updates, |ui| {
+            switch_row(
+                ui,
+                "update_check_on",
+                &mut check,
+                "Check for updates on launch",
+                "Asks GitHub for a newer release; never downloads one by itself.",
+            );
+        });
+        self.open_updates = open_updates;
+        self.s.update_check_on = check;
+
+        let mut open_version = self.open_version;
+        let mut go_plugins = false;
+        card(ui, "Helpers", None, &mut open_version, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+            wrapped(
+                ui,
+                "yt-dlp and ffmpeg are checked against their latest releases whenever Plugins opens; the copies this app keeps are updated in place, your own copies are only reported.",
+                reg(9.5),
+                t.muted,
+            );
+            ui.add_space(2.0);
+            if btn_icon(ui, "\u{e9b0}", "Open Plugins", false).clicked() {
+                go_plugins = true;
+            }
+        });
+        self.open_version = open_version;
+        if go_plugins {
+            self.pane = PANE_YTDLP;
+        }
     }
 }
 

@@ -46,6 +46,11 @@ pub enum Commands {
     Helpers {
         #[arg(long)] install_ytdlp: bool,
         #[arg(long)] install_ffmpeg: bool,
+        /// Install the app's own JavaScript runtime (portable Deno) for yt-dlp
+        #[arg(long)] install_runtime: bool,
+        /// Compare with the latest releases and update the app's own copies
+        /// (what Settings → Plugins does when opened)
+        #[arg(long)] update: bool,
     },
     /// Register this app as a browser's native messaging host
     RegisterBrowser { browser:String },
@@ -154,6 +159,7 @@ fn opts_for(item: &DownloadItem, limit_bps: u64) -> EngineOpts {
     o.max_retries = item.eff_retries(o.max_retries);
     o.referer = item.referer.clone();
     o.cookie = item.cookie.clone();
+    o.captured_headers = crate::engine::CapturedHeaders::for_url(&item.url, &item.extra_headers);
     o.username = item.username.clone();
     o.password = item.password.clone();
     o.expected_sha256 = item.checksum_sha256.clone();
@@ -171,9 +177,15 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::Helpers {install_ytdlp,install_ffmpeg} => {
+        Commands::Helpers {install_ytdlp,install_ffmpeg,install_runtime,update} => {
             if install_ytdlp {crate::engine::ytdlp_refresh_blocking()?;}
             if install_ffmpeg {crate::helpers::install_ffmpeg()?;}
+            if install_runtime {crate::engine::deno_install_blocking()?;}
+            if update {
+                for line in [crate::engine::ytdlp_update_check_blocking(),crate::engine::ffmpeg_update_check_blocking()] {
+                    if !line.is_empty() {eprintln!("{line}");}
+                }
+            }
             let yt=crate::engine::ytdlp_info();let ff=crate::engine::ffmpeg_info();
             println!("{}",serde_json::json!({"yt_dlp":yt.path,"yt_dlp_version":yt.version,"yt_dlp_managed":yt.managed,"ffmpeg":ff.path,"ffmpeg_version":ff.version,"ffprobe":ff.probe_path,"ffmpeg_managed":ff.managed,"js_runtime":yt.js_runtime}));
             Ok(())
@@ -227,7 +239,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
+            let id = crate::model::next_queue_id(&queue_path(), &items);
             let mut item = DownloadItem::new(id, url, fname.clone(), dir, connections);
             item.checksum_sha256 = csum;
             item.overwrite_existing = overwrite;
@@ -346,7 +358,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             for line in data.lines() {
                 let t = line.trim().trim_matches(|c| c == '"' || c == '\'');
                 if is_download_url(t) && !items.iter().any(|d| d.url == t) {
-                    let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
+                    let id = crate::model::next_queue_id(&queue_path(), &items);
                     let dir = dirs::download_dir()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());

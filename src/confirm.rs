@@ -55,18 +55,18 @@ fn claim_inbox_at(path:&std::path::Path,url:&str) -> Option<crate::native_host::
 }
 
 #[derive(Debug, Default)]
-struct UiPrefs {
-    save_dir: String,
-    connections: usize,
-    category_folders: bool,
-    user_agent: String,
-    proxy_url: String,
-    timeout_secs: u64,
-    rename_template: String,
-    folder_rules: Vec<crate::model::FolderRule>,
+pub(crate) struct UiPrefs {
+    pub(crate) save_dir: String,
+    pub(crate) connections: usize,
+    pub(crate) category_folders: bool,
+    pub(crate) user_agent: String,
+    pub(crate) proxy_url: String,
+    pub(crate) timeout_secs: u64,
+    pub(crate) rename_template: String,
+    pub(crate) folder_rules: Vec<crate::model::FolderRule>,
 }
 
-fn load_prefs() -> UiPrefs {
+pub(crate) fn load_prefs() -> UiPrefs {
     let mut p = UiPrefs {
         connections: 8,
         category_folders: true,
@@ -178,6 +178,8 @@ struct ConfirmApp {
     description: String,
     referer: String,
     cookie: String,
+    /// Captured request headers of this browser capture (from the inbox).
+    headers: std::collections::BTreeMap<String, String>,
     pair_url: String,
     pair_mime: String,
     /// Page/media MIME from the extension (first hint for naming when the
@@ -195,6 +197,12 @@ struct ConfirmApp {
     folder_rules: Vec<crate::model::FolderRule>,
     probing: bool,
     probe_size: Option<u64>,
+    /// Size the browser measured in its own session (`--size`): what a
+    /// refused off-session re-probe falls back to instead of "—".
+    browser_size: Option<u64>,
+    /// The name the dialog made up itself (no `--filename`), while the user
+    /// has not changed it: a server/title name may replace exactly that.
+    auto_name: Option<String>,
     probe_rx: Option<Receiver<(Option<u64>, Option<String>)>>,
     rt: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     centered: bool,
@@ -519,7 +527,11 @@ impl ConfirmApp {
             timeout_secs: self.timeout_secs,
             proxy_url: self.proxy_url.clone(),
             referer,
+            // The browser session claimed from the inbox: without it a
+            // login-gated file probes as 403 or as the login page's size.
+            cookie: self.cookie.clone(),
             quality_pref,
+            captured_headers: engine::CapturedHeaders::for_url(&url, &self.headers),
             ..Default::default()
         };
         rt.spawn(async move {
@@ -527,6 +539,11 @@ impl ConfirmApp {
                 Ok(client) => {
                     let (mut total, _, ctype, mut disp) =
                         engine::probe(&client, &opts, &url).await;
+                    // A playlist's length is its text, not the video: show
+                    // the duration instead (as IDM does for streams).
+                    if engine::is_stream_manifest(&url, ctype.as_deref(), &page_mime) {
+                        total = None;
+                    }
                     let is_page = ctype
                         .as_deref()
                         .map(|c| c.contains("text/html"))
@@ -638,6 +655,7 @@ impl ConfirmApp {
         // The captured browser agent travels with the row, so a resumed
         // download still looks like the browser that captured it.
         item.user_agent = self.user_agent.clone();
+        item.extra_headers = self.headers.clone();
         item.description = self.description.trim().to_string();
         // Browser-measured size (extension HEAD/Range in the real session):
         // keep it so the engine and progress UI know the total even when a
@@ -658,15 +676,18 @@ impl ConfirmApp {
             crate::model::AppendResult::AlreadyQueued(id) => {
                 // Not an error. The URL is already in the list; if the user
                 // asked to start it we wake that row, so this is never a dead
-                // end. Stay open so the notice is actually read.
-                self.notice = if start {
-                    format!("Already in the queue (#{id}) — starting it.")
-                } else {
-                    format!("Already in the queue (#{id}).")
+                // end. Stay open so the notice is actually read. The notice
+                // names what really happens to the row.
+                use crate::model::Status;
+                self.notice = match crate::model::queued_status(id) {
+                    Some(Status::Completed) => format!("Already downloaded (#{id}) — see Finished."),
+                    Some(Status::Downloading) => format!("Already downloading (#{id})."),
+                    _ if start => {
+                        self.wake_targets(&[id]);
+                        format!("Already in the queue (#{id}) — starting it.")
+                    }
+                    _ => format!("Already in the queue (#{id})."),
                 };
-                if start {
-                    self.wake_targets(&[id]);
-                }
                 return;
             }
             crate::model::AppendResult::Error(e) => {
@@ -686,55 +707,71 @@ impl ConfirmApp {
     /// Point the main window at rows that already exist, so the user is
     /// taken to the running transfer instead of starting a second one.
     fn focus_targets(&self, targets: &[u64]) {
-        let Some(p) = wake_path() else {
-            return;
-        };
-        let _guard = crate::model::fs_lock("wake");
-        if !_guard.owned() {
-            return;
-        }
-        if let Ok(json) =
-            serde_json::to_string_pretty(&serde_json::json!({ "focus": targets }))
-        {
-            let _ = atomic_write(&p, json.as_bytes());
-        }
-        std::thread::spawn(|| {
-            if !main_app_running() {
-                launch_main_app();
-            }
-        });
+        wake_focus(targets);
     }
 
     /// Ask the main app to start these ids (consumed on its next poll, or at
     /// startup when we launch it below).
-    fn wake_targets(&self, targets: &[u64]) {        if let Some(p) = wake_path() {
-            let _guard = crate::model::fs_lock("wake");
-            if !_guard.owned() { return; }
-            let mut ids: Vec<u64> = std::fs::read_to_string(&p)
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("start").cloned())
-                .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
-                .unwrap_or_default();
-            for id in targets {
-                if !ids.contains(id) {
-                    ids.push(*id);
-                }
-            }
-            if let Ok(json) =
-                serde_json::to_string_pretty(&serde_json::json!({ "start": ids }))
-            {
-                let _ = atomic_write(&p, json.as_bytes());
+    fn wake_targets(&self, targets: &[u64]) {
+        wake_ids(targets);
+    }
+}
+
+/// Ask the main app to start these ids (consumed on its next poll, or at
+/// startup when we launch it below).
+pub(crate) fn wake_ids(targets: &[u64]) {
+    wake_requests(targets, targets);
+}
+
+/// Point the main window at rows that already exist, so the user is taken
+/// to the running transfer instead of starting a second one.
+pub(crate) fn wake_focus(targets: &[u64]) {
+    wake_requests(&[], targets);
+}
+
+/// Write the "start" and "focus" requests into wake.json in one go.
+///
+/// The two arrays are different requests — start these queued rows, focus
+/// these running rows — but they share one file, and the main window reads
+/// both keys from it. Two independent writers would lose whichever request
+/// came second, so there is exactly one writer here.
+fn wake_requests(start: &[u64], focus: &[u64]) {
+    if let Some(p) = wake_path() {
+        let _guard = crate::model::fs_lock("wake");
+        if !_guard.owned() { return; }
+        let mut obj: serde_json::Value = std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut start_ids: Vec<u64> = obj.get("start").cloned()
+            .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
+            .unwrap_or_default();
+        let mut focus_ids: Vec<u64> = obj.get("focus").cloned()
+            .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
+            .unwrap_or_default();
+        for id in start {
+            if !start_ids.contains(id) {
+                start_ids.push(*id);
             }
         }
-        // tasklist + cold-start spawn can take seconds (debug builds
-        // especially) — never block the dialog on it; close at once.
-        std::thread::spawn(|| {
-            if !main_app_running() {
-                launch_main_app();
+        for id in focus {
+            if !focus_ids.contains(id) {
+                focus_ids.push(*id);
             }
-        });
+        }
+        obj["start"] = serde_json::json!(start_ids);
+        obj["focus"] = serde_json::json!(focus_ids);
+        if let Ok(json) = serde_json::to_string_pretty(&obj) {
+            let _ = atomic_write(&p, json.as_bytes());
+        }
     }
+    // tasklist + cold-start spawn can take seconds (debug builds
+    // especially) — never block the dialog on it; close at once.
+    std::thread::spawn(|| {
+        if !main_app_running() {
+            launch_main_app();
+        }
+    });
 }
 
 /// Entry point for `--confirm-download`. Never returns normally
@@ -775,11 +812,12 @@ pub fn run() -> eframe::Result<()> {
         std::process::exit(2);
     }
     let page_mime = get("--mime").filter(|s| !s.trim().is_empty()).unwrap_or_default();
-    let filename = get("--filename")
-        .filter(|f| !f.trim().is_empty())
-        .unwrap_or_else(|| {
-            crate::model::filename_from_url_with_mime(&url, Some(page_mime.as_str()))
-        });
+    // `get` consumes the flag, so read it once.
+    let caller_name = get("--filename").filter(|f| !f.trim().is_empty());
+    let named_by_caller = caller_name.is_some();
+    let filename = caller_name.unwrap_or_else(|| {
+        crate::model::filename_from_url_with_mime(&url, Some(page_mime.as_str()))
+    });
     let referer = get("--referer").unwrap_or_default();
     let mut cookie = get("--cookie").unwrap_or_default();
     let pair_url = get("--pair-url").filter(|s| s.starts_with("http")).unwrap_or_default();
@@ -788,7 +826,9 @@ pub fn run() -> eframe::Result<()> {
     // Browser-measured size (menu HEAD/Range): trust it, skip probing.
     let known_size: Option<u64> = get("--size")
         .and_then(|s| s.parse::<u64>().ok())
-        .filter(|s| *s > 0);
+        .filter(|s| *s > 0)
+        // An older extension sends a playlist's text length as its size.
+        .filter(|_| !engine::is_stream_manifest(&url, None, &page_mime));
     // Browser-known media duration in seconds (best-effort badge).
     let duration_secs: u64 = get("--dur")
         .and_then(|s| s.parse::<u64>().ok())
@@ -797,6 +837,7 @@ pub fn run() -> eframe::Result<()> {
 
     // Claim the inbox entry first so the main window won't prompt too.
     let mut browser_user_agent = String::new();
+    let mut headers = std::collections::BTreeMap::new();
     if let Some(item)=claim_inbox(url.trim()) {
         // The native host leaves credentials in the private inbox, not the
         // process command line where other local users can inspect them.
@@ -804,6 +845,7 @@ pub fn run() -> eframe::Result<()> {
         // The browser's own agent comes with the capture: a site that
         // checks the browser only answers that browser.
         browser_user_agent = item.user_agent.unwrap_or_default();
+        headers = item.headers.unwrap_or_default();
     }
 
     let prefs = load_prefs();
@@ -812,7 +854,7 @@ pub fn run() -> eframe::Result<()> {
     // its file present) is reported up front. A dead row (failed, or finished
     // with the file gone) is refreshed by the capture instead, so the buttons
     // never dead-end on a stale "already in queue".
-    let initial_notice = match crate::model::queued_entry(url.trim()) {
+    let initial_notice = match crate::model::queued_entry(url.trim(), &quality_pref) {
         Some((id, false)) => format!("Already in the queue (#{id})."),
         _ => String::new(),
     };
@@ -826,15 +868,19 @@ pub fn run() -> eframe::Result<()> {
     // Take the next slot of the cascade before the window is built: the
     // position depends on it.
     let slot = crate::window::take_cascade_slot();
+    let start_name = crate::model::apply_rename_template(&prefs.rename_template, &engine::sanitize_filename(&filename), url.trim());
     let mut app = ConfirmApp {
+        auto_name: (!named_by_caller).then(|| start_name.clone()),
+        browser_size: known_size,
         url: url.trim().to_string(),
-        filename: crate::model::apply_rename_template(&prefs.rename_template, &engine::sanitize_filename(&filename), url.trim()),
+        filename: start_name,
         category,
         remember_path: prefs.category_folders,
         save_base: prefs.save_dir,
         description: String::new(),
         referer,
         cookie,
+        headers,
         pair_url,
         pair_mime,
         page_mime,
@@ -964,12 +1010,17 @@ impl eframe::App for ConfirmApp {
         if let Some(rx) = self.probe_rx.as_ref() {
             while let Ok((sz, nm)) = rx.try_recv() {
                 self.probing = false;
-                self.probe_size = sz;
+                // A refused re-probe (off-session 403) must not erase the
+                // size the browser measured in its own session.
+                self.probe_size = sz.or(self.browser_size);
                 if let Some(n) = nm {
-                    // Prefer the server/video title when our name is a bare
-                    // URL guess (or a last-resort fallback whose timestamp
-                    // drifted since dialog open).
-                    if self.filename == filename_from_url(&self.url)
+                    // Prefer the server/video title while our name is still a
+                    // guess we made (or a last-resort fallback whose timestamp
+                    // drifted since dialog open) — never over a name the
+                    // extension chose or the user typed.
+                    let untouched_guess = self.auto_name.as_deref() == Some(self.filename.as_str());
+                    if untouched_guess
+                        || self.filename == filename_from_url(&self.url)
                         || crate::model::is_fallback_filename(&self.filename)
                     {
                         self.filename = crate::model::apply_rename_template(
@@ -978,6 +1029,9 @@ impl eframe::App for ConfirmApp {
                             &self.url,
                         );
                         self.category = category_of(&self.filename).to_string();
+                        if untouched_guess {
+                            self.auto_name = Some(self.filename.clone());
+                        }
                     }
                 }
             }
@@ -1188,6 +1242,9 @@ impl eframe::App for ConfirmApp {
                         format!("{} • {}", format_dur(self.duration_secs), format_bytes(sz))
                     }
                     Some(sz) => format_bytes(sz),
+                    // Streams (HLS/DASH) have no size until assembled; the
+                    // duration is the useful fact, as IDM shows it.
+                    None if self.duration_secs > 0 => format_dur(self.duration_secs),
                     None => "—".to_string(),
                 }
             };
@@ -1226,10 +1283,20 @@ impl eframe::App for ConfirmApp {
                 "Filename",
                 false,
             );
-            let r_b = ui.interact(refr_btn, egui::Id::new("popup-refresh"), egui::Sense::click());
-            let g_b = ui.interact(gear_btn, egui::Id::new("popup-gear"), egui::Sense::click());
-            icon_btn(&p, refr_btn, r_b.hovered(), DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
-            icon_btn(
+            let r_b = ui
+                .interact(refr_btn, egui::Id::new("popup-refresh"), egui::Sense::click())
+                .on_hover_text("Check the size and file name again");
+            let g_b = ui
+                .interact(gear_btn, egui::Id::new("popup-gear"), egui::Sense::click())
+                .on_hover_text(if self.show_adv {
+                    "Hide more options"
+                } else {
+                    "More options: category, description, referer, cookie"
+                });
+            // Square field-surface buttons, so they read as part of the
+            // filename row (bare glyphs looked like stray icons).
+            icon_btn_box(&p, refr_btn, r_b.hovered(), DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
+            icon_btn_box(
                 &p,
                 gear_btn,
                 g_b.hovered(),

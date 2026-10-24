@@ -63,6 +63,9 @@ function barHarness(opts) {
   const innerWidth=o.innerWidth||1280, innerHeight=o.innerHeight||800;
   const measure=o.measure||((s)=>s.length*7);
   const docListeners={},pillHosts=[],sent=[];
+  // The bar's drag listens on the window, so the harness has to carry the
+  // window's listeners and let an event reach them.
+  const winListeners={};
   const fired={click:0,keydown:0};
   const dom={
     createElement:(t)=>{
@@ -80,7 +83,7 @@ function barHarness(opts) {
   };
   const context={
     document:dom,
-    window:{innerWidth,innerHeight,addEventListener(){},getComputedStyle:()=>({visibility:'visible'})},
+    window:{innerWidth,innerHeight,addEventListener:(type,fn)=>{(winListeners[type]=winListeners[type]||[]).push(fn);},getComputedStyle:()=>({visibility:'visible'})},
     location:{hostname:"example.com",href:"https://example.com/watch"},
     chrome:{runtime:{lastError:null,sendMessage:(m,cb)=>{sent.push(m);if(cb)cb({ok:true});}}},
   };
@@ -99,6 +102,12 @@ function barHarness(opts) {
     const ev=makeEvent(type,extra);
     if(type==='click'&&typeof node.onclick==='function')node.onclick(ev);
     for(const fn of (node.listeners[type]||[]))fn(ev);
+    if(!ev.stopped) {
+      // A pointer event bubbles up to the window before it reaches the
+      // document. The bar's drag listens there, so the drag keeps working
+      // when the pointer leaves the button.
+      for(const fn of (winListeners[type]||[]))fn(ev);
+    }
     if(!ev.stopped) {
       for(const fn of (docListeners[type]||[])){fired[type]=(fired[type]||0)+1;fn(ev);}
     }

@@ -1496,7 +1496,7 @@ fn cell_text(
 /// Widths come from `shaped` so the measurement matches what is drawn for the
 /// scripts egui cannot shape itself, and the cut lands on grapheme boundaries:
 /// slicing a Bengali consonant away from its matra leaves a dangling mark.
-fn truncate_to_width(
+pub(crate) fn truncate_to_width(
     p: &egui::Painter,
     text: &str,
     font: egui::FontId,
@@ -1607,6 +1607,23 @@ fn toggle_hidden_col(hidden: &mut Vec<SortCol>, col: SortCol) {
         }
         None => hidden.push(col),
     }
+}
+
+/// New widths while the divider between `left` and `right` is dragged by
+/// `dx`: the divider follows the pointer, so one side grows by what the other
+/// loses. Name takes whatever room the others leave, so its own width is
+/// never stored - only its neighbour changes.
+fn divider_widths(left: SortCol, right: SortCol, start_l: f32, start_r: f32, dx: f32) -> Vec<(SortCol, f32)> {
+    const MAX: f32 = 900.0;
+    if left == SortCol::Name {
+        return vec![(right, (start_r - dx).clamp(col_min(right), MAX))];
+    }
+    if right == SortCol::Name {
+        return vec![(left, (start_l + dx).clamp(col_min(left), MAX))];
+    }
+    // Both fixed: the move is limited by whichever side hits its minimum.
+    let dx = dx.clamp(col_min(left) - start_l, start_r - col_min(right));
+    vec![(left, start_l + dx), (right, start_r - dx)]
 }
 
 /// Uniform toolbar metrics: every action button shares one height.
@@ -1803,7 +1820,7 @@ struct ActiveTask {
     last_bytes: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SortCol {
     Name,
     Size,
@@ -1891,7 +1908,8 @@ enum HitKind {
     Row(u64),
     HdrCol(SortCol),
     HdrCheck,
-    ResizeCol(SortCol),
+    /// The divider between a column and its right neighbour.
+    ResizeCol(SortCol, SortCol),
     CtxItem(RowAct, u64),
     Btn(ButtonId),
     Check(CheckId),
@@ -1910,11 +1928,15 @@ enum HitKind {
 
 /// Active manual divider drag: table column resize (window edges are the
 /// OS's job now that the app uses native decorations).
+#[derive(Clone, Copy)]
 enum ResizeCap {
+    /// Dragging the divider between `col` and its right neighbour `right`.
     Col {
         col: SortCol,
+        right: SortCol,
         start_x: f32,
         start_w: f32,
+        start_right: f32,
     },
 }
 
@@ -2211,6 +2233,9 @@ pub struct CraftApp {
     drop_menu: Option<u8>,
     finish_open: bool,
     resize_cap: Option<ResizeCap>,
+    /// The press that is down (or just released) began on a column divider:
+    /// its release must not also count as a click that sorts the column.
+    col_drag_used: bool,
     slider_cap: Option<SliderCap>,
     // Add-dialog advanced fields (kept on self so manual buttons in
     // process_hits can commit without dialog locals).
@@ -2218,6 +2243,13 @@ pub struct CraftApp {
     add_cookie: String,
     /// The browser's own User-Agent from the capture, if it sent one.
     add_user_agent: String,
+    /// Captured request headers of the browser capture being added (not
+    /// editable; consumed by the next commit).
+    add_headers: std::collections::BTreeMap<String, String>,
+    /// Details dialog "Start at" text while it is being typed, per row id:
+    /// only a complete HH:MM is saved to the row, so reloading the field
+    /// from the row every frame threw away each keystroke of "02:30".
+    det_start_draft: (u64, String),
     add_user: String,
     add_pass: String,
     /// Preferred quality from the extension menu (used by the size probe so
@@ -2379,10 +2411,13 @@ impl CraftApp {
             drop_menu: None,
             finish_open: false,
             resize_cap: None,
+            col_drag_used: false,
             slider_cap: None,
             add_referer: String::new(),
             add_cookie: String::new(),
             add_user_agent: String::new(),
+            add_headers: std::collections::BTreeMap::new(),
+            det_start_draft: (u64::MAX, String::new()),
             add_user: String::new(),
             add_pass: String::new(),
             add_quality: String::new(),
@@ -2470,7 +2505,10 @@ impl CraftApp {
             } else {
                 None
             };
-            if total.unwrap_or(0) == 0 {
+            // A fragmented stream has no size until it is done; the row may
+            // still hold an estimate from before, which must not come back.
+            let fragmented = task.shared.frag_count.load(Ordering::SeqCst) > 0;
+            if total.unwrap_or(0) == 0 && !fragmented {
                 total = row.and_then(|d| d.total_bytes);
             }
             let mut downloaded = task.shared.downloaded.load(Ordering::SeqCst);
@@ -2495,6 +2533,10 @@ impl CraftApp {
                     "phase": self.phases.get(id).cloned().unwrap_or_default(),
                     "resolution": resolution,
                     "parts": parts,
+                    "fragments": [
+                        task.shared.frag_index.load(Ordering::SeqCst),
+                        task.shared.frag_count.load(Ordering::SeqCst),
+                    ],
                 }),
             );
         }
@@ -2905,6 +2947,7 @@ impl CraftApp {
                 self.add_file.clear();
                 self.add_checksum.clear();
                 self.add_quality.clear();
+                self.clear_add_credentials();
                 self.show_add = true;
             }
             2 => {
@@ -3312,6 +3355,10 @@ impl CraftApp {
                 Ok(client) => {
                     let (mut total, _, ctype, mut disp) =
                         crate::engine::probe(&client, &opts, &url).await;
+                    // A playlist's length is its text, never the video size.
+                    if crate::engine::is_stream_manifest(&url, ctype.as_deref(), "") {
+                        total = None;
+                    }
                     // Page URLs (YouTube watch / generic video pages) answer
                     // HEAD with HTML and no length → resolve the media stream
                     // first so the dialog shows the real size + title (IDM-style).
@@ -4117,7 +4164,8 @@ impl CraftApp {
 
     /// Recompute the live scheduler cap from speed windows (P3.4).
     /// u64::MAX = no window active (per-download caps apply as usual).
-    fn refresh_speed_limit(&self) {        let v = if self.speed_windows_on {
+    fn refresh_speed_limit(&self) {
+        let window = if self.speed_windows_on {
             let now = chrono::Local::now();
             let now_min = (now.format("%H").to_string().parse::<u16>().unwrap_or(0)) * 60
                 + now.format("%M").to_string().parse::<u16>().unwrap_or(0);
@@ -4125,9 +4173,19 @@ impl CraftApp {
                 .iter()
                 .find(|w| w.active_at(now_min))
                 .map(|w| w.limit_kbps * 1024)
-                .unwrap_or(u64::MAX)
+                .filter(|v| *v > 0)
         } else {
-            u64::MAX
+            None
+        };
+        // The global limit travels live too: tasks start without a frozen
+        // copy of it, so changing it (progress window, slider, Unlimited)
+        // reaches downloads already running instead of only the next ones.
+        let global = Some(self.speed_limit_kbps * 1024).filter(|v| *v > 0);
+        let v = match (global, window) {
+            (Some(g), Some(w)) => g.min(w),
+            (Some(g), None) => g,
+            (None, Some(w)) => w,
+            (None, None) => u64::MAX, // no cap at all
         };
         self.speed_limit_live.store(v, Ordering::SeqCst);
     }
@@ -4288,9 +4346,32 @@ impl CraftApp {
         let fname = filename
             .filter(|f| !f.trim().is_empty())
             .unwrap_or_else(|| filename_from_url(&url));
-        let fname = crate::model::apply_rename_template(&self.rename_template, &fname, &url);
+        let mut fname = crate::model::apply_rename_template(&self.rename_template, &fname, &url);
         let dir = self.save_dir_for(&fname);
-        let dest = std::path::Path::new(&dir).join(&fname);
+        let mut dest = std::path::Path::new(&dir).join(&fname);
+        // A row that is running or paused keeps its download: a different
+        // link that wants the same file name gets a numbered name instead.
+        // Taking it over swapped the URL and deleted partial files mid-transfer.
+        if let Some(pos) = crate::model::find_dest_clash(&self.downloads, &dest) {
+            let busy = self.tasks.contains_key(&self.downloads[pos].id)
+                || matches!(self.downloads[pos].status, Status::Downloading | Status::Paused);
+            if busy && self.downloads[pos].url != url {
+                let free = crate::model::conflict_free_dest(&dest);
+                let taken = |p: &std::path::Path| self.downloads.iter().any(|d| d.dest_path() == p);
+                let mut n = 1;
+                let mut cand = free;
+                while taken(&cand) && n < 1000 {
+                    let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    let ext = dest.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+                    cand = std::path::Path::new(&dir).join(format!("{stem} ({n}){ext}"));
+                    n += 1;
+                }
+                if let Some(name) = cand.file_name() {
+                    fname = name.to_string_lossy().to_string();
+                }
+                dest = cand;
+            }
+        }
         // Same file, fresh URL (re-capture): refresh in place instead of a
         // colliding duplicate (two tasks on one dest fail loudly and can
         // corrupt resume state across different URLs).
@@ -4394,15 +4475,22 @@ impl CraftApp {
             it.speed_bps = 0.0;
             if matches!(it.status, Status::Completed) {
                 it.cookie.clear();
+                it.extra_headers.clear();
             }
         }
         // Union with foreign additions made since our last sync (confirm /
         // basket / CLI). Our own deletions stay deleted: ids we have ever
         // seen but no longer hold are dropped, unknown ids are merged in.
         if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(&data) {
+            if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(data.trim_start_matches('\u{feff}')) {
                 for it in disk {
-                    if items.iter().any(|d| d.id == it.id || d.url == it.url) {
+                    // Same row = same id, or same URL at the same quality: one
+                    // page queued at 1080p and 720p is two downloads.
+                    if items.iter().any(|d| {
+                        d.id == it.id
+                            || (d.url == it.url
+                                && crate::model::same_quality(&d.quality_pref, &it.quality_pref))
+                    }) {
                         continue;
                     }
                     if self.known_ids.contains(&it.id) {
@@ -4447,6 +4535,12 @@ impl CraftApp {
     /// Parse queue items tolerantly: one bad entry (schema drift, partial
     /// write) must not nuke the whole queue. Returns (good, had_bad).
     fn parse_queue_items(data: &str) -> (Vec<DownloadItem>, bool) {
+        // A BOM (Notepad/PowerShell saves) made the whole queue unreadable:
+        // it loaded empty and the next save wrote "[]" over it.
+        let data = data.trim_start_matches('\u{feff}');
+        if data.trim().is_empty() {
+            return (Vec::new(), false);
+        }
         if let Ok(items) = serde_json::from_str::<Vec<DownloadItem>>(data) {
             return (items, false);
         }
@@ -4521,6 +4615,8 @@ impl CraftApp {
         // slot, so a start while one is already open never stacks duplicates,
         // while a window the user closed comes straight back on Retry.
         Self::spawn_progress(id);
+        // The live limit is the task's only cap: make it current first.
+        self.refresh_speed_limit();
         let item = self.downloads[idx].clone();
         let shared = Arc::new(SharedState::new());
         if let Some(t) = item.total_bytes {
@@ -4534,7 +4630,9 @@ impl CraftApp {
         let dest = item.dest_path();
         let conns = item.connections;
         let opts = EngineOpts {
-            speed_limit_bps: self.speed_limit_kbps * 1024,
+            // The global limit is applied live through `global_limit` (see
+            // refresh_speed_limit), not frozen into the task at start.
+            speed_limit_bps: 0,
             timeout_secs: item.eff_timeout(self.timeout_secs),
             max_retries: item.eff_retries(self.max_retries),
             user_agent: if !item.user_agent.trim().is_empty() {
@@ -4548,6 +4646,7 @@ impl CraftApp {
             },
             referer: item.referer.clone(),
             cookie: item.cookie.clone(),
+            captured_headers: crate::engine::CapturedHeaders::for_url(&item.url, &item.extra_headers),
             username: item.username.clone(),
             password: item.password.clone(),
             proxy_url: self.proxy_url.clone(),
@@ -4615,6 +4714,10 @@ impl CraftApp {
                 .downloads
                 .iter()
                 .filter(|d| matches!(d.status, Status::Queued))
+                // A Queued row whose task still runs (a refresh re-queued it)
+                // is not startable: `start` returns without changing it, and
+                // picking it again looped forever and froze the window.
+                .filter(|d| !self.tasks.contains_key(&d.id))
                 // Queue v2: a row scheduled for later waits even when a slot
                 // is free, and priority decides who goes first.
                 .filter(|d| crate::model::start_at_due(&d.start_at, chrono::Local::now()))
@@ -4774,8 +4877,16 @@ impl CraftApp {
         self.save_queue();
     }
 
+    /// Checked rows the user can see. A row checked under another filter or
+    /// search stays checked but is not acted on: toolbar Delete removed rows
+    /// the current view was hiding.
     fn selected_ids(&self) -> Vec<u64> {
-        self.downloads.iter().filter(|d| d.selected).map(|d| d.id).collect()
+        let visible: std::collections::HashSet<u64> = self.visible_ids().into_iter().collect();
+        self.downloads
+            .iter()
+            .filter(|d| d.selected && visible.contains(&d.id))
+            .map(|d| d.id)
+            .collect()
     }
 
     fn start_queue(&mut self) {
@@ -4790,7 +4901,14 @@ impl CraftApp {
             .filter(|d| matches!(d.status, Status::Paused))
             .map(|d| d.id)
             .collect();
-        for id in ids {
+        // A paused row whose task is alive already holds its slot: resuming
+        // it costs nothing. Checking the cap first left every download that
+        // Stop All paused stuck (their tasks fill the slots).
+        let (live, idle): (Vec<u64>, Vec<u64>) = ids.into_iter().partition(|id| self.tasks.contains_key(id));
+        for id in live {
+            self.resume(id);
+        }
+        for id in idle {
             if self.tasks.len() >= cap {
                 break;
             }
@@ -4897,7 +5015,11 @@ impl CraftApp {
                     // still arriving, so a stalled transfer cannot show a rate
                     // frozen at its last value.
                     let reported = task.shared.speed_bps.load(Ordering::SeqCst) as f64;
-                    d.speed_bps = if delta > 0.0 && reported > 0.0 {
+                    // A paused transfer has no speed, whatever its last
+                    // in-flight bytes did.
+                    d.speed_bps = if task.shared.paused.load(Ordering::SeqCst) {
+                        0.0
+                    } else if delta > 0.0 && reported > 0.0 {
                         reported
                     } else if d.speed_bps <= 0.0 {
                         raw
@@ -4967,8 +5089,15 @@ impl CraftApp {
                         .map(|m| m.len())
                         .unwrap_or(0);
                     let adaptive = d.pair_url.starts_with("http");
+                    // A merge the engine finished (both legs at their servers'
+                    // own lengths, file muxed) is done even when the expected
+                    // total was a little off: a Facebook reel failed with
+                    // "got 3.22 MB of 3.23 MB" while every byte had arrived.
+                    let merged_ok = adaptive
+                        && landed > 0
+                        && task.shared.succeeded.load(Ordering::SeqCst);
                     let complete = match d.total_bytes {
-                        Some(t) if adaptive => t > 0 && dl >= t,
+                        Some(t) if adaptive => (t > 0 && dl >= t) || merged_ok,
                         Some(t) => t > 0 && dl >= t && landed >= t,
                         // unknown size: only a clean end WITH bytes counts
                         None => !cancelled && dl > 0,
@@ -4989,6 +5118,7 @@ impl CraftApp {
                     } else if task_can_complete(&task.shared, complete || file_done) {
                         d.status = Status::Completed;
                         d.cookie.clear();
+                        d.extra_headers.clear();
                         // The file on disk is the truth. A retried or merged
                         // transfer can end with a byte counter that claims more
                         // than the file holds, and a probe's size can be an
@@ -5255,20 +5385,29 @@ impl CraftApp {
         };
         let mut keep: Vec<crate::native_host::InboxItem> = Vec::new();
         let mut next: Option<crate::native_host::InboxItem> = None;
+        // Already queued = same URL at the same quality (another quality of
+        // one page is a new download).
+        let queued = |i: &crate::native_host::InboxItem, downloads: &[DownloadItem]| {
+            let q = i.quality.as_deref().unwrap_or("");
+            downloads.iter().any(|d| d.url == i.url && crate::model::same_quality(&d.quality_pref, q))
+        };
         for i in items.into_iter() {
             if next.is_none()
                 && is_download_url(&i.url)
-                && !self.downloads.iter().any(|d| d.url == i.url)
+                && !queued(&i, &self.downloads)
                 && age_secs(&i.received_at) >= CONFIRM_GRACE_SECS
             {
                 next = Some(i);
             } else if is_download_url(&i.url)
-                && !self.downloads.iter().any(|d| d.url == i.url)
+                && (!queued(&i, &self.downloads) || age_secs(&i.received_at) < CONFIRM_GRACE_SECS)
             {
                 // Young (dialog likely opening) or a later old entry: keep.
+                // A young entry for an already-queued row is kept too: it
+                // carries the re-capture's fresh cookie/headers, which its
+                // dialog claims to refresh a failed row.
                 keep.push(i);
             }
-            // Invalid URLs and already-queued duplicates are dropped.
+            // Invalid URLs and old already-queued duplicates are dropped.
         }
         // Cap the inbox (newest first by received_at) so a stuck producer
         // can't grow it without bound.
@@ -5306,6 +5445,7 @@ impl CraftApp {
         // The browser's own agent travels with the capture: a site that
         // checks the browser only answers that browser.
         let user_agent = item.user_agent.unwrap_or_default();
+        self.add_headers = item.headers.unwrap_or_default();
         if self.captured_media.len() >= 200 { self.captured_media.clear(); }
         self.captured_media.insert(url.clone(), (item.dur.unwrap_or(0), item.audio_expected));
         let size = item.size;
@@ -5348,17 +5488,44 @@ impl CraftApp {
         };
         let (items, _) = Self::parse_queue_items(&data);
         for mut it in items {
-            if self
-                .downloads
-                .iter()
-                .any(|d| d.id == it.id || d.url == it.url)
-            {
+            // A row we hold that another process re-queued (a dialog refreshed
+            // a failed/finished row with a fresh capture, the CLI re-queued
+            // it): take the disk version. Skipping it kept the stale status,
+            // so its start order did nothing and our next save undid it.
+            if let Some(pos) = self.downloads.iter().position(|d| d.id == it.id) {
+                let local = &self.downloads[pos];
+                // Only rows another process may refresh: failed, finished with
+                // the file gone, or paused without a task. A row this window
+                // just completed (file present) is never reverted by a disk
+                // copy its own save has not overwritten yet.
+                let refreshable = match &local.status {
+                    Status::Failed(_) => true,
+                    Status::Completed => !local.dest_path().exists(),
+                    Status::Paused => true,
+                    _ => false,
+                };
+                let refreshed_elsewhere = matches!(it.status, Status::Queued)
+                    && refreshable
+                    && !self.tasks.contains_key(&it.id);
+                if refreshed_elsewhere {
+                    let selected = local.selected;
+                    it.speed_bps = 0.0;
+                    it.selected = selected;
+                    self.downloads[pos] = it;
+                }
+                continue;
+            }
+            if self.downloads.iter().any(|d| {
+                d.url == it.url && crate::model::same_quality(&d.quality_pref, &it.quality_pref)
+            }) {
                 continue;
             }
             // Foreign entry for a file we already track (fresh capture):
-            // refresh the local entry instead of a colliding duplicate.
+            // refresh the local entry instead of a colliding duplicate — but
+            // never a row with a live task (its download would be hijacked).
             if let Some(pos) =
                 crate::model::find_dest_clash(&self.downloads, &it.dest_path())
+                    .filter(|p| !self.tasks.contains_key(&self.downloads[*p].id))
             {
                 let local = &mut self.downloads[pos];
                 if local.url != it.url {
@@ -5415,12 +5582,20 @@ impl CraftApp {
         }
         self.merge_queue_from_disk();
         for id in ids {
-            let ready = self.downloads.iter().any(|d| {
-                d.id == id && matches!(d.status, Status::Queued) && !self.tasks.contains_key(&id)
-            });
-            if ready {
-                self.queue_running = true;
-                self.start(id);
+            let status = self.downloads.iter().find(|d| d.id == id).map(|d| d.status.clone());
+            match status {
+                Some(Status::Queued) if !self.tasks.contains_key(&id) => {
+                    self.queue_running = true;
+                    self.start(id);
+                }
+                // A dialog that found the row Paused asks to start it: resume,
+                // or its "starting it" notice promised something that never
+                // happened.
+                Some(Status::Paused) => {
+                    self.queue_running = true;
+                    self.resume(id);
+                }
+                _ => {}
             }
         }
         if !focus.is_empty() {
@@ -5600,6 +5775,31 @@ pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
 
 #[cfg(not(windows))]
 pub(crate) fn install_native_host(browser: &str) -> Result<String,String> { crate::platform::install_native_host(browser) }
+
+/// Whether `browser` has this app registered as its native host: the
+/// registration exists and its manifest file is still on disk.
+#[cfg(windows)]
+pub(crate) fn native_host_status(browser: &str) -> bool {
+    let mut rc = std::process::Command::new("reg");
+    rc.args(["query", native_host_key(browser), "/ve"]);
+    quiet(&mut rc);
+    let Ok(out) = rc.output() else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    // "(Default)    REG_SZ    C:\…\chrome.json"
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.split("REG_SZ").nth(1).map(|p| p.trim().to_string()))
+        .is_some_and(|p| std::path::Path::new(&p).is_file())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn native_host_status(browser: &str) -> bool {
+    crate::platform::native_host_directory(browser)
+        .map(|d| d.join("com.download_craft.json").is_file())
+        .unwrap_or(false)
+}
 
 /// Registry key for a Chromium-family / Firefox native host (HKCU, no admin).
 /// Opera / Brave / Vivaldi share the Chromium layout with vendor keys.
@@ -6772,22 +6972,35 @@ impl eframe::App for CraftApp {
                             self.hits.push((HitKind::HdrCol(*col), r));
                             if ci + 1 < cols.len() {
                                 // Divider grab strip on the column's right edge
-                                // (`.resizer`), a hairline until hovered.
+                                // (`.resizer`): a faint line always, so it can
+                                // be found, and an accent bar while hovered or
+                                // dragged.
                                 let zr = egui::Rect::from_min_size(
-                                    egui::pos2(r.max.x - 3.5, r.min.y),
-                                    egui::vec2(7.0, HDR_H),
+                                    egui::pos2(r.max.x - 4.0, r.min.y),
+                                    egui::vec2(8.0, HDR_H),
                                 );
-                                if self.man.hover(&zr) {
+                                let dragging = matches!(self.resize_cap,
+                                    Some(ResizeCap::Col { col: c, .. }) if c == *col);
+                                if self.man.hover(&zr) || dragging {
                                     ui.painter().rect_filled(
                                         egui::Rect::from_min_size(
-                                            egui::pos2(r.max.x - 1.5, r.min.y + 6.0),
-                                            egui::vec2(3.0, HDR_H - 12.0),
+                                            egui::pos2(r.max.x - 1.5, r.min.y + 5.0),
+                                            egui::vec2(3.0, HDR_H - 10.0),
                                         ),
                                         1.5,
                                         pl().primary,
                                     );
+                                } else {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(r.max.x - 0.5, r.min.y + 8.0),
+                                            egui::vec2(1.0, HDR_H - 16.0),
+                                        ),
+                                        0.0,
+                                        pl().card_bd,
+                                    );
                                 }
-                                self.hits.push((HitKind::ResizeCol(*col), zr));
+                                self.hits.push((HitKind::ResizeCol(*col, cols[ci + 1]), zr));
                             }
                         }
                     });
@@ -7972,7 +8185,10 @@ impl eframe::App for CraftApp {
                     let mut desc = item.description.clone();
                     let mut user = item.username.clone();
                     let mut pass = item.password.clone();
-                    let mut start_at = item.start_at.clone();
+                    if self.det_start_draft.0 != item.id {
+                        self.det_start_draft = (item.id, item.start_at.clone());
+                    }
+                    let mut start_at = self.det_start_draft.1.clone();
                     let mut sum = self.det_sum.clone();
                     let mut referer = item.referer.clone();
 
@@ -8500,6 +8716,7 @@ impl eframe::App for CraftApp {
                         });
 
                     // Persist the live edits (one write per changed field).
+                    self.det_start_draft.1 = start_at.clone();
                     let mut dirty = false;
                     if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
                         if d.description != desc {
@@ -9012,6 +9229,17 @@ impl CraftApp {
         }
     }
 
+    /// A manually opened Add dialog starts without the last browser
+    /// capture's session: its cookie, referer, captured headers and login
+    /// would otherwise be sent to whatever URL is typed next.
+    fn clear_add_credentials(&mut self) {
+        self.add_referer.clear();
+        self.add_cookie.clear();
+        self.add_headers.clear();
+        self.add_user.clear();
+        self.add_pass.clear();
+    }
+
     /// Manual dialog/toast button dispatcher (driven by process_hits).
     /// Validate + queue the Add dialog contents (shared by Add/Download).
     fn commit_add(&mut self, download: bool) {
@@ -9033,7 +9261,11 @@ impl CraftApp {
         let existing = self
             .downloads
             .iter()
-            .position(|d| d.url == self.add_url.trim());
+            // Same download = same URL at the same quality (one page at
+            // 1080p and 720p is two files), as everywhere else.
+            .position(|d| {
+                d.url == self.add_url.trim() && crate::model::same_quality(&d.quality_pref, &self.add_quality)
+            });
         if let Some(pos) = existing {
             let dead = match &self.downloads[pos].status {
                 Status::Failed(_) => true,
@@ -9077,6 +9309,9 @@ impl CraftApp {
         item.cookie = self.add_cookie.clone();
         // The captured browser agent travels with the row.
         item.user_agent = self.add_user_agent.clone();
+        // Captured headers belong to that one capture: never reuse them for
+        // a later manual add.
+        item.extra_headers = std::mem::take(&mut self.add_headers);
         item.username = self.add_user.clone();
         item.password = self.add_pass.clone();
         item.checksum_sha256 = csum;
@@ -9114,6 +9349,7 @@ impl CraftApp {
         self.add_file.clear();
         self.add_checksum.clear();
         self.add_quality.clear();
+        self.clear_add_credentials();
         if download {
             self.queue_running = true;
             self.start(id);
@@ -9558,17 +9794,22 @@ impl CraftApp {
     /// Match recorded hit rects (reverse = topmost first) against manual
     /// pointer state and dispatch. The single place anything "clicks".
     fn process_hits(&mut self, ctx: &egui::Context) {
-        // Active divider drag continuation (movement, not clicks).
+        // A divider drag is over once the button is up and its release frame
+        // (which still holds the capture) has passed.
+        if self.resize_cap.is_none() && !self.man.down_left() {
+            self.col_drag_used = false;
+        }
         // Active divider drag continues here (movement, not clicks).
         if let Some(cap) = self.resize_cap.take() {
             match cap {
-                ResizeCap::Col { col, start_x, start_w } => {
+                ResizeCap::Col { col, right, start_x, start_w, start_right } => {
                     if self.man.down_left() {
                         if let Some(p) = self.man.pos() {
-                            let nw = (start_w + (p.x - start_x)).clamp(col_min(col), 900.0);
-                            self.col_w.insert(col, nw);
+                            for (c, w) in divider_widths(col, right, start_w, start_right, p.x - start_x) {
+                                self.col_w.insert(c, w);
+                            }
                         }
-                        self.resize_cap = Some(ResizeCap::Col { col, start_x, start_w });
+                        self.resize_cap = Some(cap);
                     } else {
                         self.save_ui_state();
                     }
@@ -9624,7 +9865,7 @@ impl CraftApp {
                     HitKind::RowCheck(id) => format!("check:#{id}"),
                     HitKind::HdrCol(c) => format!("hdr:{}", c.key()),
                     HitKind::HdrCheck => "hdrcheck".to_string(),
-                    HitKind::ResizeCol(c) => format!("rz:{}", c.key()),
+                    HitKind::ResizeCol(c, _) => format!("rz:{}", c.key()),
                     HitKind::MenuBtn(m) => format!("menu:{m}"),
                     HitKind::MenuItem(a) => format!("menuitem:{a}"),
                     HitKind::CtxItem(_, id) => format!("ctx:#{id}"),
@@ -9654,6 +9895,7 @@ impl CraftApp {
                                 self.add_file.clear();
                                 self.add_checksum.clear();
                                 self.add_quality.clear();
+                                self.clear_add_credentials();
                                 // A link picked up from the clipboard is
                                 // pre-filled here: the lit Add URL button is
                                 // the only affordance (no banner row).
@@ -9819,7 +10061,7 @@ impl CraftApp {
                     }
                 }
                 HitKind::HdrCol(c) => {
-                    if clk {
+                    if clk && !self.col_drag_used {
                         if self.sort_col == c {
                             self.sort_asc = !self.sort_asc;
                         } else {
@@ -9854,16 +10096,19 @@ impl CraftApp {
                         }
                     }
                 }
-                HitKind::ResizeCol(c) => {
+                HitKind::ResizeCol(c, right) => {
                     if hov {
                         zone_cursor = Some(egui::CursorIcon::ResizeColumn);
                     }
                     if self.man.press_started_in(&rect) {
                         if let Some(p) = self.man.pos() {
+                            self.col_drag_used = true;
                             self.resize_cap = Some(ResizeCap::Col {
                                 col: c,
+                                right,
                                 start_x: p.x,
                                 start_w: col_w_of(&self.col_w, c),
+                                start_right: col_w_of(&self.col_w, right),
                             });
                         }
                     }
@@ -9981,6 +10226,21 @@ fn task_can_complete(shared: &SharedState, bytes_landed: bool) -> bool {
 }
 #[cfg(test)]
 mod audit_completion_tests {
+    #[test]
+    fn column_dividers_follow_the_pointer() {
+        use super::{divider_widths, col_min, SortCol};
+        // Name | Size: Name takes the rest, so only Size changes, and
+        // dragging right gives Name more room.
+        assert_eq!(divider_widths(SortCol::Name, SortCol::Size, 300.0, 90.0, 20.0), vec![(SortCol::Size, 70.0)]);
+        // Size | Status: one grows by what the other loses (sum unchanged).
+        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, 15.0);
+        assert_eq!(w, vec![(SortCol::Size, 105.0), (SortCol::Status, 95.0)]);
+        // Never below a minimum on either side.
+        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, 500.0);
+        assert_eq!(w[1], (SortCol::Status, col_min(SortCol::Status)));
+        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, -500.0);
+        assert_eq!(w[0], (SortCol::Size, col_min(SortCol::Size)));
+    }
     use super::*;
     #[test]
     fn validation_failure_never_becomes_completed_from_full_byte_count() {

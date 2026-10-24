@@ -125,13 +125,22 @@ pub struct DownloadItem {
     pub referer: String,
     #[serde(default)]
     pub cookie: String,
-    /// The browser's own User-Agent, when the capture carried one.
+/// The browser's own User-Agent, when the capture carried one.
     ///
     /// A site that checks the browser (a Cloudflare browser check, for
     /// one) only answers the browser that solved it, so the captured
     /// agent travels with the row. Empty = use the app's own setting.
     #[serde(default)]
     pub user_agent: String,
+    /// Origin / Authorization / x-* headers the browser player sent with the
+    /// captured media (see engine::CapturedHeaders). Cleared on completion
+    /// like the cookie.
+    ///
+    /// Never written to disk: `Authorization` is a bearer token, and a
+    /// queue.json on disk is a file another program can read. The headers
+    /// live in memory for the transfer and are dropped when it ends.
+    #[serde(default, skip)]
+    pub extra_headers: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub username: String,
     #[serde(default)]
@@ -211,7 +220,8 @@ impl DownloadItem {
             selected: false,
             referer: String::new(),
             cookie: String::new(),
-            user_agent: String::new(),
+user_agent: String::new(),
+            extra_headers: std::collections::BTreeMap::new(),
             username: String::new(),
             password: String::new(),
             resumable: false,
@@ -763,6 +773,14 @@ pub fn is_valid_sha256(s: &str) -> bool {
     t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Compute the SHA-256 hex digest of a byte slice.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
 /// Compute the SHA-256 hex digest of a file (streamed, low memory).
 pub fn sha256_of_file(path: &std::path::Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
@@ -990,11 +1008,40 @@ fn entry_is_dead(d: &DownloadItem) -> bool {
 
 /// Look up a queued URL. Returns `(id, dead)`; `dead` mirrors what
 /// `append_to_queue` would do with a fresh capture of the same URL.
-pub fn queued_entry(url: &str) -> Option<(u64, bool)> {
+pub fn queued_entry(url: &str, quality: &str) -> Option<(u64, bool)> {
     let path = config_dir()?.join("queue.json");
     let items = read_queue_items(&path).ok()?;
-    let d = items.into_iter().find(|d| d.url == url)?;
+    let d = items.into_iter().find(|d| d.url == url && same_quality(&d.quality_pref, quality))?;
     Some((d.id, entry_is_dead(&d)))
+}
+
+/// Status of queue row `id`, as the queue file has it.
+pub fn queued_status(id: u64) -> Option<Status> {
+    let path = config_dir()?.join("queue.json");
+    read_queue_items(&path).ok()?.into_iter().find(|d| d.id == id).map(|d| d.status)
+}
+
+/// Two requests for one page URL are the same download only at the same
+/// quality: a YouTube watch page queued at 1080p and again at 720p is two
+/// files.
+pub fn same_quality(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// `dest`, or "name (n).ext" when another queued row (or a file on disk)
+/// already owns that path.
+fn dest_free_of_queue(items: &[DownloadItem], dest: &std::path::Path) -> std::path::PathBuf {
+    let taken = |p: &std::path::Path| p.exists() || items.iter().any(|d| d.dest_path() == p);
+    if !taken(dest) {
+        return dest.to_path_buf();
+    }
+    let parent = dest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "download".to_string());
+    let ext = dest.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (1..1000)
+        .map(|n| parent.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !taken(p))
+        .unwrap_or_else(|| dest.to_path_buf())
 }
 
 /// Append an item to the shared queue file with a fresh id (used by the
@@ -1013,6 +1060,48 @@ pub fn append_to_queue(item: &mut DownloadItem) -> AppendResult {
     append_to_queue_at(&path, item)
 }
 
+/// Add a download that already finished elsewhere (the browser extension's
+/// "Download in browser") as a Completed row, so it shows in the app's list
+/// with Open file / Open folder. A row for the same file is not added twice.
+pub fn record_finished(item: &mut DownloadItem) -> AppendResult {
+    let _guard = fs_lock("queue");
+    if !_guard.owned() { return AppendResult::Error("Queue is busy; retry shortly".into()); }
+    let path = match config_dir() {
+        Some(d) => d.join("queue.json"),
+        None => return AppendResult::Error("no config directory".to_string()),
+    };
+    let mut items = match read_queue_items(&path) {
+        Ok(v) => v,
+        Err(e) => return AppendResult::Error(e),
+    };
+    if let Some(d) = items.iter().find(|d| d.dest_path() == item.dest_path()) {
+        return AppendResult::AlreadyQueued(d.id);
+    }
+    item.id = next_queue_id(&path, &items);
+    item.status = Status::Completed;
+    items.push(item.clone());
+    match write_queue(&path, &items) {
+        Ok(()) => AppendResult::Added(item.id),
+        Err(e) => AppendResult::Error(e),
+    }
+}
+
+/// Next queue id. Ids are never reused, even after the newest row is
+/// removed: the main window treats an id it has seen disappear as deleted
+/// and silently drops a later row that reuses it (a dialog's "starting it"
+/// then started nothing). A high-water mark beside the queue file keeps the
+/// counter moving. Callers must hold the queue lock.
+pub fn next_queue_id(queue_path: &std::path::Path, items: &[DownloadItem]) -> u64 {
+    let mark = queue_path.with_extension("lastid");
+    let last = std::fs::read_to_string(&mark)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let id = items.iter().map(|d| d.id).max().unwrap_or(0).max(last) + 1;
+    let _ = std::fs::write(&mark, id.to_string());
+    id
+}
+
 /// Path-injected core of `append_to_queue` (unit-tested without touching the
 /// real queue). Callers must hold the queue lock.
 fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> AppendResult {
@@ -1020,28 +1109,50 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         Ok(v) => v,
         Err(e) => return AppendResult::Error(e),
     };
-    if let Some(pos) = items.iter().position(|d| d.url == item.url) {
+    if let Some(pos) = items.iter().position(|d| d.url == item.url && same_quality(&d.quality_pref, &item.quality_pref)) {
         // Same URL again. Reuse the row unless it is dead (failed, or finished
         // with the file gone) — then refresh it so "Start Download" always
         // works instead of dead-ending on "already in queue".
         if !entry_is_dead(&items[pos]) {
             return AppendResult::AlreadyQueued(items[pos].id);
         }
-        let id = items[pos].id;
-        let created = items[pos].created_at;
-        items[pos].downloaded_bytes = 0;
-        if item.total_bytes.is_some() {
-            items[pos].total_bytes = item.total_bytes;
-        }
-        items[pos].speed_bps = 0.0;
-        items[pos].status = Status::Queued;
-        items[pos].created_at = created;
-        let dp = items[pos].dest_path();
-        drop_resume_state(&dp);
+        // The fresh capture's data replaces the dead row's (only identity and
+        // queue settings stay): keeping the old cookie/headers/referer — the
+        // very ones that expired — made the retry fail the same way.
+        let old = &items[pos];
+        drop_resume_state(&old.dest_path());
+        let mut fresh = item.clone();
+        fresh.id = old.id;
+        fresh.created_at = old.created_at;
+        fresh.priority = old.priority;
+        fresh.start_at = old.start_at.clone();
+        fresh.downloaded_bytes = 0;
+        fresh.speed_bps = 0.0;
+        fresh.status = Status::Queued;
+        fresh.selected = false;
+        let id = fresh.id;
+        item.id = id;
+        items[pos] = fresh;
         return match write_queue(path, &items) {
             Ok(()) => AppendResult::Added(id),
             Err(e) => AppendResult::Error(e),
         };
+    }
+    // Another quality of the same page wanting the same file name gets its
+    // own name instead of taking over that row.
+    if let Some(pos) = find_dest_clash(&items, &item.dest_path()) {
+        // A different download (another quality, or another URL while that
+        // row is running or paused) gets its own name. Taking over an active
+        // row swapped its URL and deleted its partial files mid-transfer.
+        let active = matches!(items[pos].status, Status::Downloading | Status::Paused);
+        if (items[pos].url == item.url && !same_quality(&items[pos].quality_pref, &item.quality_pref))
+            || (active && items[pos].url != item.url)
+        {
+            let free = dest_free_of_queue(&items, &item.dest_path());
+            if let Some(name) = free.file_name() {
+                item.filename = name.to_string_lossy().to_string();
+            }
+        }
     }
     if let Some(pos) = find_dest_clash(&items, &item.dest_path()) {
         let id = items[pos].id;
@@ -1053,6 +1164,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         items[pos].save_dir = item.save_dir.clone();
         items[pos].referer = std::mem::take(&mut item.referer);
         items[pos].cookie = std::mem::take(&mut item.cookie);
+        items[pos].extra_headers = std::mem::take(&mut item.extra_headers);
         items[pos].username = std::mem::take(&mut item.username);
         items[pos].password = std::mem::take(&mut item.password);
         let checksum_changed = items[pos].checksum_sha256 != item.checksum_sha256;
@@ -1085,7 +1197,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
             Err(e) => AppendResult::Error(e),
         };
     }
-    let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
+    let id = next_queue_id(path, &items);
     item.id = id;
     item.status = Status::Queued;
     items.push(item.clone());
@@ -1398,6 +1510,52 @@ mod tests {
     }
 
     #[test]
+    fn other_quality_of_one_page_is_its_own_download() {
+        let dir = std::env::temp_dir().join("dc_append_quality_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("queue.json");
+        std::fs::write(&p, "[]").unwrap();
+        let page = "https://www.youtube.com/watch?v=x";
+        let item = |q: &str| {
+            let mut d = DownloadItem::new(0, page.into(), "Video.mp4".into(), dir.to_string_lossy().into(), 8);
+            d.quality_pref = q.into();
+            d
+        };
+        assert_eq!(append_to_queue_at(&p, &mut item("1080p")), AppendResult::Added(1));
+        // Same page, other quality, same suggested name: a second row with
+        // its own file, never "already queued" or a takeover of row 1.
+        assert_eq!(append_to_queue_at(&p, &mut item("720p")), AppendResult::Added(2));
+        let items = read_queue_items(&p).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].quality_pref, "1080p");
+        assert_eq!(items[0].filename, "Video.mp4");
+        assert_eq!(items[1].filename, "Video (1).mp4");
+        // The same quality again is still a duplicate.
+        assert_eq!(append_to_queue_at(&p, &mut item("720P")), AppendResult::AlreadyQueued(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removed_ids_are_never_reused() {
+        let dir = std::env::temp_dir().join("dc_append_ids_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("queue.json");
+        std::fs::write(&p, "[]").unwrap();
+        let item = |n: &str| DownloadItem::new(0, format!("https://e.com/{n}"), n.into(), dir.to_string_lossy().into(), 8);
+        assert_eq!(append_to_queue_at(&p, &mut item("a.zip")), AppendResult::Added(1));
+        assert_eq!(append_to_queue_at(&p, &mut item("b.zip")), AppendResult::Added(2));
+        // The newest row is removed (CLI `remove`, main window delete)…
+        let mut items = read_queue_items(&p).unwrap();
+        items.retain(|d| d.id != 2);
+        write_queue(&p, &items).unwrap();
+        // …and the next capture must not inherit its id.
+        assert_eq!(append_to_queue_at(&p, &mut item("c.zip")), AppendResult::Added(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn corrupt_queue_is_never_wiped() {
         let dir = std::env::temp_dir().join("dc_append_corrupt_test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1600,6 +1758,22 @@ mod tests {
         // conflict_free_dest returns input when nothing exists
         let p = std::path::Path::new("no_such_dir_xyz/no_such_file.bin");
         assert_eq!(conflict_free_dest(p), p.to_path_buf());
+    }
+
+    #[test]
+    fn a_magnet_is_never_a_download_url() {
+        // A magnet goes to the cloud provider panel, which turns it into an
+        // ordinary HTTPS address. It must never reach the download queue,
+        // and it must never reach the Links window: upstream's `links_batch`
+        // filters through `is_download_url`, so a magnet can never be
+        // picked there either.
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        assert!(is_magnet(magnet));
+        assert!(!is_download_url(magnet));
+        assert!(!is_download_url("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=file"));
+        assert!(!is_download_url("MAGNET:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"));
+        // A plain http address is still a download URL.
+        assert!(is_download_url("https://example.test/video.mp4"));
     }
 
     #[test]

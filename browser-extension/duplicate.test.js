@@ -37,7 +37,7 @@ function linkHarness() {
   let replayed=0,prevented=0;
   const anchor={href:'https://example.com/file.zip',hasAttribute:()=>true,getAttribute:()=>null,
     click(){const e=event();listener(e);if(!e.prevented)replayed++;}};
-  const event=()=>({button:0,target:{closest:()=>anchor},preventDefault(){this.prevented=true;prevented++;},stopImmediatePropagation(){}});
+  const event=()=>({button:0,isTrusted:true,target:{closest:()=>anchor},preventDefault(){this.prevented=true;prevented++;},stopImmediatePropagation(){}});
   return {calls,replies,click:()=>listener(event()),replayed:()=>replayed,prevented:()=>prevented};
 }
 test('repeated archive clicks do not open multiple native prompts during handoff',()=>{
