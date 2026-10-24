@@ -952,10 +952,7 @@ fn final_err(msg: String) -> anyhow::Error {
 fn http_status_err(url: &str, e: reqwest::Error) -> anyhow::Error {
     let status = e.status();
     if status == Some(reqwest::StatusCode::FORBIDDEN) {
-        if url.contains("googlevideo.com")
-            || url.contains("youtube.com")
-            || url.contains("youtu.be")
-        {
+        if url.contains("googlevideo.com") || is_youtube_video_page(url) {
             return final_err(
                 "YouTube refused this link (403) — stream links expire and are locked to the browser session that created them: replay the video, reopen the ⬇ Download this video menu for a fresh quality row, and download that (progressive ≤720p saves as one ready file)".to_string(),
             );
@@ -1261,6 +1258,51 @@ pub fn normalize_media_url(url: &str) -> String {
 
 fn is_youtube_page(url: &str) -> bool {
     url.contains("youtube.com") || url.contains("youtu.be")
+}
+
+/// A caption file YouTube serves itself.
+///
+/// The caption endpoint (`/api/timedtext`) hands out a WebVTT when it is
+/// asked for one (`fmt=vtt`), and its URL carries the video's id (`v=`) —
+/// so every YouTube-shaped test calls it a page, and resolving it as one
+/// downloads the VIDEO the captions belong to instead of the captions.
+pub fn is_youtube_caption_url(url: &str) -> bool {
+    let low = url.to_ascii_lowercase();
+    if !(low.contains("youtube.com") || low.contains("youtu.be")) {
+        return false;
+    }
+    if low.contains("/api/timedtext") {
+        return true;
+    }
+    // A caption URL names its own format: fmt=vtt, srt, srv3, ttml, json3.
+    match low.split_once('?') {
+        Some((_, query)) => query.split('&').any(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            k.eq_ignore_ascii_case("fmt")
+                && matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "vtt" | "srt" | "srv1" | "srv2" | "srv3" | "ttml" | "json3"
+                )
+        }),
+        None => false,
+    }
+}
+
+/// A YouTube *page* is a video to resolve. A YouTube *file* — the caption
+/// endpoint above — is a file to download as it is.
+pub fn is_youtube_video_page(url: &str) -> bool {
+    (url.contains("youtube.com") || url.contains("youtu.be")) && !is_youtube_caption_url(url)
+}
+
+/// Does this URL have to be resolved into a media stream before it can be
+/// downloaded?
+///
+/// An HTML page is a page. A YouTube link is a video page, so the app
+/// resolves it to the stream instead of saving the HTML. A caption file is
+/// neither: it is downloaded as it is.
+pub fn needs_resolve(url: &str, content_type: Option<&str>) -> bool {
+    content_type.map(|c| c.contains("text/html")).unwrap_or(false)
+        || is_youtube_video_page(url)
 }
 
 /// Verify a finished file against an expected SHA-256 hex digest.
@@ -4453,7 +4495,10 @@ async fn download_inner(
         .unwrap_or(false);
     // On YouTube hosts always resolve first: the probe alone is
     // meaningless there (walls, page variants), the page/API decides.
-    let is_yt = url.contains("youtube.com") || url.contains("youtu.be");
+    // The caption endpoint is the exception: it serves a WebVTT file, not
+    // a page, and its URL carries the video's id — resolving it would
+    // download the video the captions belong to instead of the captions.
+    let is_yt = is_youtube_video_page(&url);
     // YouTube gates its 1080p+ streams behind the browser-only SABR protocol:
     // to any non-browser client they hand out roughly their first minute and
     // then 403 forever (verified live — changed headers, the row's own
@@ -9174,6 +9219,43 @@ async fn download_range_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A YouTube caption URL is a FILE, not a video page.
+    ///
+    /// The caption endpoint hands out a WebVTT when it is asked for one, and
+    /// its URL carries the video's id (`v=`) — so every YouTube-shaped test
+    /// calls it a page. Resolving it as one downloads the VIDEO the captions
+    /// belong to instead of the captions.
+    #[test]
+    fn a_youtube_caption_url_is_a_file_not_a_page() {
+        let cap = "https://www.youtube.com/api/timedtext?v=abc123&ei=x&caps=&asr=1\
+                   &opi=112&exp=yb&hl=en&ip=0.0.0.0&ipbits=0&expire=1&sparams=ip,ipbits,\
+                   expire,v,ei,caps,opi,expire&signature=sig&key=yt8&kind=asr&lang=en&fmt=vtt";
+        assert!(is_youtube_caption_url(cap), "a caption URL must be a file");
+        assert!(!is_youtube_video_page(cap), "a caption URL must not be resolved");
+        assert!(
+            !needs_resolve(cap, Some("text/vtt")),
+            "a caption file is downloaded as it is, never resolved into the video"
+        );
+        // The same URL without the caption format is still the caption
+        // endpoint: the path says what it is.
+        assert!(is_youtube_caption_url(
+            "https://www.youtube.com/api/timedtext?v=abc123&lang=en"
+        ));
+        assert!(is_youtube_caption_url(
+            "https://www.youtube.com/api/timedtext?v=abc123&fmt=srt"
+        ));
+        // A video page is still a page.
+        assert!(is_youtube_video_page("https://www.youtube.com/watch?v=abc123"));
+        assert!(is_youtube_video_page("https://youtu.be/abc123"));
+        assert!(is_youtube_video_page("https://www.youtube.com/embed/abc123"));
+        assert!(is_youtube_video_page("https://www.youtube.com/shorts/abc123"));
+        assert!(needs_resolve("https://www.youtube.com/watch?v=abc123", None));
+        assert!(needs_resolve("https://example.org/watch", Some("text/html")));
+        assert!(!needs_resolve("https://example.org/clip.mp4", Some("video/mp4")));
+        assert!(!is_youtube_video_page("https://vimeo.com/1"));
+        assert!(!is_youtube_caption_url("https://example.org/sub.vtt"));
+    }
 
     #[test]
     fn sanitize_names() {

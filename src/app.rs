@@ -3481,12 +3481,7 @@ impl CraftApp {
                     // Page URLs (YouTube watch / generic video pages) answer
                     // HEAD with HTML and no length → resolve the media stream
                     // first so the dialog shows the real size + title (IDM-style).
-                    let is_page = ctype
-                        .as_deref()
-                        .map(|c| c.contains("text/html"))
-                        .unwrap_or(false)
-                        || url.contains("youtube.com")
-                        || url.contains("youtu.be");
+                    let is_page = crate::engine::needs_resolve(&url, ctype.as_deref());
                     if total.is_none() && is_page {
                         let shared =
                             std::sync::Arc::new(crate::engine::SharedState::new());

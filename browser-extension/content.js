@@ -220,6 +220,37 @@
     } catch (e) { return ""; }
   }
 
+  // ---- YouTube caption tracks ----
+  // The caption tracks a YouTube page offers.
+  //
+  // The URL is YouTube's own caption endpoint. It is asked for as a plain
+  // WebVTT (`fmt=vtt`) so the app can save it as a file — and it has to
+  // STAY that endpoint: the URL carries the video's id, so the app has to
+  // recognise it as a caption file and never resolve it into the video.
+  function ytCaptionTracks(pr) {
+    const subs = [];
+    try {
+      const list = pr.captions && pr.captions.playerCaptionsTracklistRenderer
+        && pr.captions.playerCaptionsTracklistRenderer.captionTracks;
+      for (const c of (list || []).slice(0, 8)) {
+        const u = String((c && c.baseUrl) || "");
+        if (!/^https?:\/\//i.test(u)) continue;
+        const nm = (c.name && (c.name.simpleText
+          || (c.name.runs && c.name.runs[0] && c.name.runs[0].text))) || c.languageCode || "sub";
+        // YouTube already says "(auto-generated)" — don't stack "(auto)" on
+        // top of it, just normalize the label to a short one.
+        const short = String(nm).replace(/\s*\([^)]*\bauto[^)]*\)\s*/i, "").trim() || c.languageCode || "sub";
+        subs.push({
+          url: /[?&]fmt=/i.test(u) ? u : u + "&fmt=vtt",
+          label: `${short}${c.kind === "asr" ? " (auto)" : ""}`,
+          lang: c.languageCode || "",
+        });
+      }
+    } catch (e) { /* captions are optional */ }
+    return subs;
+  }
+  // ---- end YouTube caption tracks ----
+
   function ytStreams() {
     const id = ytVideoId();
     if (!id) return null;
@@ -355,25 +386,7 @@
     // Subtitle tracks (VTT): shown as "Other Files" chips in the panel and
     // sent to the app as plain file downloads — the timedtext URL is a
     // normal https GET, and `fmt=vtt` yields a straight .vtt file.
-    const subs = [];
-    try {
-      const list = pr.captions && pr.captions.playerCaptionsTracklistRenderer
-        && pr.captions.playerCaptionsTracklistRenderer.captionTracks;
-      for (const c of (list || []).slice(0, 8)) {
-        const u = String((c && c.baseUrl) || "");
-        if (!/^https?:\/\//i.test(u)) continue;
-        const nm = (c.name && (c.name.simpleText
-          || (c.name.runs && c.name.runs[0] && c.name.runs[0].text))) || c.languageCode || "sub";
-        // YouTube already says "(auto-generated)" — don't stack "(auto)" on
-        // top of it, just normalize the label to a short one.
-        const short = String(nm).replace(/\s*\([^)]*\bauto[^)]*\)\s*/i, "").trim() || c.languageCode || "sub";
-        subs.push({
-          url: /[?&]fmt=/i.test(u) ? u : u + "&fmt=vtt",
-          label: `${short}${c.kind === "asr" ? " (auto)" : ""}`,
-          lang: c.languageCode || "",
-        });
-      }
-    } catch (e) { /* captions are optional */ }
+    const subs = ytCaptionTracks(pr);
     return { videoId: id, title, thumb: ytThumb(pr, id), streams, videoOnly, audio, sizes, subs };
   }
 

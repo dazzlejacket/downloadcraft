@@ -544,12 +544,7 @@ impl ConfirmApp {
                     if engine::is_stream_manifest(&url, ctype.as_deref(), &page_mime) {
                         total = None;
                     }
-                    let is_page = ctype
-                        .as_deref()
-                        .map(|c| c.contains("text/html"))
-                        .unwrap_or(false)
-                        || url.contains("youtube.com")
-                        || url.contains("youtu.be");
+                    let is_page = engine::needs_resolve(&url, ctype.as_deref());
                     if total.is_none() && is_page {
                         let shared =
                             std::sync::Arc::new(engine::SharedState::new());
