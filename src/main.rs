@@ -9,6 +9,7 @@ mod basket;
 mod cli;
 mod complete;
 mod confirm;
+mod debrid;
 mod dm;
 mod engine;
 mod fonts;
