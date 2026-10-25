@@ -73,3 +73,17 @@ cargo test --manifest-path vendor/unrar/Cargo.toml
 ```
 
 The reader's own test suite needs its `data/` directory, which is included.
+
+On Windows the reader's native library calls into `advapi32` and `crypt32`
+(the registry, the token APIs and the crypto API). The app's own build already
+links those two libraries; the reader's standalone build does not, so it fails
+to link on its own. Link them explicitly to run the suite there:
+
+```
+$env:RUSTFLAGS = '-C link-arg=advapi32.lib -C link-arg=crypt32.lib'
+cargo test --manifest-path vendor/unrar/Cargo.toml --lib --tests
+```
+
+Its 28 unit and integration tests pass that way. The doc-tests still fail to
+link on Windows, because `rustdoc` does not pass the link arguments on to the
+binary it builds for them.
