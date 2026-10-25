@@ -12316,6 +12316,78 @@ mod platform_helper_tests {
     }
 }
 
+/// Where the helper is told to write its output.
+///
+/// The helper is given a bare file name for `-o` and the folder for it in
+/// `-P home:`; real yt-dlp joins the two. The Unix-only helper tests rely on
+/// that, so the contract is pinned here where every platform runs it: a
+/// change to either half must break a test on Windows too, not only on the
+/// runners that carry the helper tests.
+#[cfg(test)]
+mod helper_output_contract_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_helper_is_told_where_to_write_its_output() {
+        let dir = std::env::temp_dir().join(format!("dc-helper-contract-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("clip.mp4");
+        // The fake only records what it was told; it writes no media, so the
+        // download itself fails. The arguments are what this test is about.
+        #[cfg(windows)]
+        let exe = {
+            let exe = dir.join("helper.cmd");
+            std::fs::write(&exe, "@echo off\r\necho %* > \"%~dp0args.txt\"\r\n").unwrap();
+            exe
+        };
+        #[cfg(unix)]
+        let exe = {
+            use std::os::unix::fs::PermissionsExt;
+            let exe = dir.join("helper.sh");
+            std::fs::write(
+                &exe,
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args.txt\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            exe
+        };
+        let _ = download_with_ytdlp(
+            &exe,
+            "https://example.com/media",
+            &dest,
+            1,
+            &EngineOpts::default(),
+            &Arc::new(SharedState::new()),
+        )
+        .await;
+        let text = std::fs::read_to_string(dir.join("args.txt")).expect("the helper must have run");
+        let (home, parts) = ytdlp_dirs(&dest);
+        assert!(
+            text.contains(&format!("home:{}", home.display())),
+            "the folder for the file must travel in -P home: {text}"
+        );
+        assert!(
+            text.contains(&format!("temp:{}", parts.display())),
+            "the parts folder must travel in -P temp: {text}"
+        );
+        assert!(
+            !text.contains(&dest.display().to_string()),
+            "-o must carry a bare file name, not a path: {text}"
+        );
+        #[cfg(unix)]
+        {
+            let lines: Vec<&str> = text.lines().collect();
+            let at = lines.iter().position(|l| *l == "-o").expect("-o must be given");
+            assert_eq!(lines[at + 1], "clip.mp4");
+        }
+        #[cfg(windows)]
+        assert!(text.contains("-o clip.mp4"), "-o must carry a bare file name: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod audit_cookie_tests {
     use super::*;
@@ -12336,6 +12408,9 @@ mod audit_cookie_tests {
     }
 }
 
+/// The helper tests run the fake the way a real yt-dlp would: it is given a
+/// bare file name for `-o` and the folder for it in `-P home:`, and joins the
+/// two. `helper_output_contract_tests` pins that contract on every platform.
 #[cfg(all(test, unix))]
 mod audit_helper_tests {
     use super::*;
@@ -12359,7 +12434,7 @@ mod audit_helper_tests {
         // `--print` makes yt-dlp quiet; without `--progress` the window showed
         // 0 B until the end. The fake refuses to run without the flag.
         let temp=Temp::new();let dest=temp.0.join("clip.mp4");
-        let exe=temp.script("import sys,pathlib,json\nif '--progress' not in sys.argv: sys.exit(3)\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_suffix('.mp4')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
+        let exe=temp.script("import sys,pathlib,json\nif '--progress' not in sys.argv: sys.exit(3)\np=(pathlib.Path(next((a[5:] for a in sys.argv if a.startswith('home:')),'.'))/sys.argv[sys.argv.index('-o')+1]).with_suffix('.mp4')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
         download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(),b"video bytes");
     }
@@ -12367,12 +12442,12 @@ mod audit_helper_tests {
     async fn exact_reported_output_is_used_and_neighboring_files_are_untouched() {
         let temp=Temp::new();let dest=temp.0.join("clip.mp4");
         let neighbor=temp.0.join("clip-notes.txt");std::fs::write(&neighbor,b"keep me").unwrap();
-        let exe=temp.script("import sys,pathlib,json\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_suffix('.mkv')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
+        let exe=temp.script("import sys,pathlib,json\np=(pathlib.Path(next((a[5:] for a in sys.argv if a.startswith('home:')),'.'))/sys.argv[sys.argv.index('-o')+1]).with_suffix('.mkv')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
         download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(),b"video bytes");
         assert_eq!(std::fs::read(&neighbor).unwrap(),b"keep me");
         std::fs::remove_file(&dest).unwrap();
-        let exe=temp.script("import sys,pathlib,json\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_name('clip-notes.txt')\nprint('dcfile@'+json.dumps(str(p)))");
+        let exe=temp.script("import sys,pathlib,json\np=(pathlib.Path(next((a[5:] for a in sys.argv if a.startswith('home:')),'.'))/sys.argv[sys.argv.index('-o')+1]).with_name('clip-notes.txt')\nprint('dcfile@'+json.dumps(str(p)))");
         assert!(download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.is_err());
         assert!(!dest.exists());assert_eq!(std::fs::read(&neighbor).unwrap(),b"keep me");
     }
