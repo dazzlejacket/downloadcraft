@@ -7,6 +7,16 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-22.04
+    env:
+      # The vendored UnRAR sources ask the compiler which CPU features the
+      # machine has. Clang answers that with a reference to libgcc's
+      # __cpu_model, and the zig toolchain that builds the glibc-2.28
+      # packages has no libgcc, so the link failed with "undefined symbol:
+      # __cpu_model". "No features" is what a compiler answers for a CPU
+      # without them: UnRAR then uses its own AES and copy routines, which
+      # give the same archive a little more slowly. The native Linux build
+      # links libgcc through the gcc driver and does not need this.
+      CXXFLAGS_x86_64-unknown-linux-gnu: "-D__builtin_cpu_supports(x)=0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
