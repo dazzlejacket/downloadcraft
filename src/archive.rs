@@ -962,6 +962,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dest);
     }
 
+    /// UnRAR reports the name of the next volume of a set through a callback.
+    /// The reader used to copy a fixed 2048 elements out of that buffer, and
+    /// the buffer only holds the name: the copy ran past the end of the
+    /// string and, when the memory behind it was not mapped, killed the
+    /// process with an access violation. The fault only shows up on a volume
+    /// switch, and only when the heap happens to be laid out that way, so the
+    /// set is unpacked again and again to give it a chance to appear.
+    #[test]
+    fn a_multipart_rar_is_unpacked_over_and_over_without_faulting() {
+        let archive = fixture("rar5-normal-32mb-txt-png-1mb-pw-test.part1.rar");
+        for round in 0..20 {
+            let dest = scratch(&format!("rarmulti-{round}"));
+            let mut progress = |_p: ExtractProgress| true;
+            let mut opts = options(&dest);
+            opts.password = Some("test".to_string());
+            let out = extract(&archive, &opts, &mut progress)
+                .unwrap_or_else(|e| panic!("round {round}: the rar set must be readable: {e:?}"));
+            assert_eq!(out.files, 2, "round {round}: both parts are unpacked");
+            assert!(dest.join("text.txt").is_file());
+            assert!(dest.join("photo.jpg").is_file());
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+    }
+
     #[test]
     fn a_file_that_is_already_there_is_kept() {
         let dest = scratch("keep");

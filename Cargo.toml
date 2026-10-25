@@ -43,3 +43,12 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [target.'cfg(unix)'.dependencies]
 shlex = "2"
+
+# The RAR reader is used from a local copy instead of crates.io. Upstream
+# copies a fixed 2048 elements out of the buffer UnRAR uses to report the
+# next volume of a multi-volume set. That buffer only holds the name, so the
+# copy runs past its end and can walk into an unmapped page, which killed the
+# app with an access violation while unpacking a multipart RAR. The local
+# copy copies the name up to its terminator instead. See vendor/unrar/PATCH-NOTES.md.
+[patch.crates-io]
+unrar = { path = "vendor/unrar" }
