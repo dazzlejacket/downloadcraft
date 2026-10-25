@@ -17,8 +17,8 @@ let next =
 ```
 
 `WideCString::from_ptr_truncate` does not stop at the first nul. It takes a
-slice of `len` elements and copies all of them, so this reads 4 KB starting at
-the name.
+slice of `len` elements and copies all of them, so this reads 2048 elements
+starting at the name: 4 KB on Windows, 8 KB elsewhere.
 
 The pointer UnRAR passes for the notification is `NextName.data()`, the buffer
 of its own `std::wstring`. That buffer is only as long as the name — a path of
@@ -26,23 +26,31 @@ a few hundred bytes — so the copy reads past its end. When the memory behind
 the name happens to be unmapped, the read faults and the process dies with an
 access violation (`0xC0000005`) inside the C++ runtime.
 
-The patched code copies the name up to its terminator instead:
+The patched code measures the name first and then copies only that much:
 
 ```rust
 let next = unsafe {
+    let base = p1 as *const native::WCHAR;
     let mut len = 0usize;
-    while len < 2048 && *((p1 as *const u16).add(len)) != 0 {
-        len += 1;
+    if !base.is_null() {
+        while len < MAX_VOLUME_NAME_CHARS && *base.add(len) != 0 {
+            len += 1;
+        }
     }
-    let slice = std::slice::from_raw_parts(p1 as *const u16, len);
-    widestring::WideCString::from_vec_truncate(slice.to_vec())
+    widestring::WideCString::from_ptr_truncate(base as *const _, len)
 };
 ```
 
-`UnRAR`'s own ask-the-caller path (`DllVolChange`) passes a buffer of 2048
-elements, so reading that much would have been safe there; the notification
-path (`DllVolNotify`) passes the short string, and that is the one that was
-read out of bounds.
+`native::WCHAR` is the platform `wchar_t`, which is what UnRAR's
+`std::wstring` holds: 16 bit on Windows, 32 bit elsewhere. `WideCString` is
+`U16CString` on Windows and `U32CString` everywhere else, so the copy lets
+`WideCString`'s own signature pick the element type and the two always agree.
+The measurement stops at the first nul, so the copy never reads past the name.
+
+`UnRAR`'s own ask-the-caller path (`DllVolChange`) passes a buffer of
+`MAXPATHSIZE` (65536) elements, so reading a fixed amount would have been safe
+there; the notification path (`DllVolNotify`) passes the short string, and that
+is the one that was read out of bounds.
 
 ## Why it is not in the app
 

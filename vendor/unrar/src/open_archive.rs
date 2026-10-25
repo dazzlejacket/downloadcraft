@@ -496,6 +496,11 @@ impl ProcessMode for Test {
     fn process_data(_: &mut Self::Output, _: &[u8]) {}
 }
 
+/// The largest number of characters that is read from a volume name handed
+/// over by UnRAR. UnRAR never produces a longer name, and the limit keeps a
+/// malformed buffer from being read without end.
+const MAX_VOLUME_NAME_CHARS: usize = 2048;
+
 struct Internal<M: ProcessMode> {
     marker: std::marker::PhantomData<M>,
 }
@@ -520,14 +525,22 @@ impl<M: ProcessMode> Internal<M> {
                 // name walks into whatever follows it and can land on an
                 // unmapped page, which kills the process. The upstream code
                 // copied 2048 elements, which is 4 KB past a name that is
-                // usually a few hundred bytes long.
+                // usually a few hundred bytes long (8 KB off Windows, where
+                // a `wchar_t` is twice as wide).
+                //
+                // `native::WCHAR` is the platform `wchar_t`, which is what
+                // UnRAR's `std::wstring` holds: 16 bit on Windows and 32 bit
+                // everywhere else. `WideCString` follows the same rule, so
+                // let its own signature pick the element type of the copy.
                 let next = unsafe {
+                    let base = p1 as *const native::WCHAR;
                     let mut len = 0usize;
-                    while len < 2048 && *((p1 as *const u16).add(len)) != 0 {
-                        len += 1;
+                    if !base.is_null() {
+                        while len < MAX_VOLUME_NAME_CHARS && *base.add(len) != 0 {
+                            len += 1;
+                        }
                     }
-                    let slice = std::slice::from_raw_parts(p1 as *const u16, len);
-                    widestring::WideCString::from_vec_truncate(slice.to_vec())
+                    widestring::WideCString::from_ptr_truncate(base as *const _, len)
                 };
                 user_data.1 = Some(next);
                 match p2 {
